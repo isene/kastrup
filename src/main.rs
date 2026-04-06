@@ -10,6 +10,21 @@ use crust::{Crust, Pane, Input};
 use crust::style;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::mpsc as std_mpsc;
+
+/// Background DB write operations (fire-and-forget from main thread)
+enum DbWriteOp {
+    MarkRead(i64),
+    MarkUnread(i64),
+    ToggleStar(i64),
+    DeleteMessages(Vec<i64>),
+    UpdateFolder(i64, String, serde_json::Value),
+    UpdateLabels(i64, String),
+    UpdateMetadata(i64, String),
+    SyncMaildirFlag(serde_json::Value, i64),
+    SetSetting(String, String),
+    Execute(String, Vec<String>), // raw SQL with string params
+}
 
 use config::Config;
 use database::{Database, Filters};
@@ -179,6 +194,7 @@ struct App {
     // Background poller
     poller: Option<poller::Poller>,
     poller_rx: Option<std::sync::mpsc::Receiver<poller::PollerEvent>>,
+    write_tx: std_mpsc::Sender<DbWriteOp>,
 
     // Help state
     showing_help: bool,
@@ -197,6 +213,38 @@ fn main() {
     let width = config.pane_width;
     let border = config.border_style;
     let (top, left, right, bottom) = create_panes(cols, rows, width, border, &config);
+
+    // Spawn background DB writer thread
+    let (write_tx, write_rx) = std_mpsc::channel::<DbWriteOp>();
+    let writer_db = db.clone();
+    std::thread::spawn(move || {
+        while let Ok(op) = write_rx.recv() {
+            match op {
+                DbWriteOp::MarkRead(id) => { writer_db.mark_as_read(id); }
+                DbWriteOp::MarkUnread(id) => { writer_db.mark_as_unread(id); }
+                DbWriteOp::ToggleStar(id) => { writer_db.toggle_star(id); }
+                DbWriteOp::DeleteMessages(ids) => { writer_db.delete_messages(&ids); }
+                DbWriteOp::UpdateFolder(id, folder, meta) => { writer_db.update_message_folder(id, &folder, &meta); }
+                DbWriteOp::UpdateLabels(id, json) => {
+                    let conn = writer_db.conn.lock().unwrap();
+                    let _ = conn.execute("UPDATE messages SET labels = ? WHERE id = ?", rusqlite::params![json, id]);
+                }
+                DbWriteOp::UpdateMetadata(id, json) => {
+                    let conn = writer_db.conn.lock().unwrap();
+                    let _ = conn.execute("UPDATE messages SET metadata = ? WHERE id = ?", rusqlite::params![json, id]);
+                }
+                DbWriteOp::SyncMaildirFlag(metadata, id) => {
+                    sync_maildir_seen_flag_bg(&metadata, &writer_db, id);
+                }
+                DbWriteOp::SetSetting(key, val) => { writer_db.set_setting(&key, &val); }
+                DbWriteOp::Execute(sql, params) => {
+                    let conn = writer_db.conn.lock().unwrap();
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+                    let _ = conn.execute(&sql, param_refs.as_slice());
+                }
+            }
+        }
+    });
 
     let mut app = App {
         top, left, right, bottom,
@@ -233,6 +281,7 @@ fn main() {
         section_collapsed: HashMap::new(),
         poller: None,
         poller_rx: None,
+        write_tx,
         showing_help: false,
         help_extended: false,
     };
@@ -291,12 +340,25 @@ fn main() {
                     let view = app.current_view.clone();
                     app.switch_to_view(&view);
                 }
-                // Periodic DB refresh every 30s (catches messages synced by Heathrow)
-                if app.last_db_refresh.elapsed().as_secs() >= 5 {
+                // Periodic DB refresh (skip when showing inline images)
+                if !app.showing_image && app.last_db_refresh.elapsed().as_secs() >= 5 {
                     app.last_db_refresh = std::time::Instant::now();
-                    app.stats_cache = None; // Invalidate stats
+                    app.stats_cache = None;
+                    let saved_index = app.index;
+                    let saved_id = app.filtered_messages.get(app.index).map(|m| m.id);
                     let view = app.current_view.clone();
                     app.switch_to_view(&view);
+                    // Restore position: try by message ID first, then by index
+                    if let Some(id) = saved_id {
+                        if let Some(pos) = app.filtered_messages.iter().position(|m| m.id == id) {
+                            app.index = pos;
+                        } else {
+                            app.index = saved_index.min(app.filtered_messages.len().saturating_sub(1));
+                        }
+                    } else {
+                        app.index = saved_index.min(app.filtered_messages.len().saturating_sub(1));
+                    }
+                    app.render_all();
                 }
             }
         }
@@ -583,6 +645,18 @@ impl App {
             }
         };
 
+        // Set terminal window title
+        let title_name = match self.current_view.as_str() {
+            "A" => "All".to_string(),
+            "N" => "New".to_string(),
+            "S" => "Sources".to_string(),
+            "*" => "Starred".to_string(),
+            v => self.views.iter().find(|vw| vw.key_binding.as_deref() == Some(v))
+                .map(|vw| format!("{} {}", v, vw.name))
+                .unwrap_or_else(|| format!("View {}", v)),
+        };
+        Crust::set_title(&format!("Kastrup - {}", title_name));
+
         // Capitalize sort label
         let sort_cap = {
             let mut c = self.sort_order.chars();
@@ -735,8 +809,8 @@ impl App {
 
         // Sender (15 chars max)
         let sender_display = msg.sender_name.as_deref().unwrap_or(&msg.sender);
-        let sender_truncated = truncate_str(sender_display, 15);
-        let sender_padded = format!("{:<15}", sender_truncated);
+        let sender_truncated = truncate_str(sender_display, 14);
+        let sender_padded = format!("{:<14} ", sender_truncated); // 14 chars + always 1 space gap
 
         // Subject fills remaining width
         let subject = msg.subject.as_deref().unwrap_or("");
@@ -792,7 +866,10 @@ impl App {
         if let Some(msg) = msg_ref {
             if !msg.read && !msg.is_header && msg.id > 0 {
                 let id = msg.id;
-                self.db.mark_as_read(id);
+                let metadata = msg.metadata.clone();
+                // Fire-and-forget: DB write + maildir flag sync on background thread
+                let _ = self.write_tx.send(DbWriteOp::MarkRead(id));
+                let _ = self.write_tx.send(DbWriteOp::SyncMaildirFlag(metadata, id));
                 self.browsed_ids.insert(id);
                 // Update in-memory state
                 if let Some(m) = self.filtered_messages.iter_mut().find(|m| m.id == id) {
@@ -969,7 +1046,9 @@ impl App {
             let html = msg.html_content.as_deref()
                 .or_else(|| if msg.content.trim_start().starts_with('<') { Some(msg.content.as_str()) } else { None });
             if let Some(html) = html {
-                let html_img_count = html.matches("<img").count();
+                let html_img_count = extract_image_urls(html).iter()
+                    .filter(|u| u.starts_with("http"))
+                    .count();
                 if html_img_count > 0 {
                     let label = if html_img_count == 1 { "1 image".to_string() } else { format!("{} images", html_img_count) };
                     lines.push(style::fg(&format!("{}, press V to view", label), tc.feedback_ok));
@@ -1233,6 +1312,14 @@ impl App {
         self.current_view = key.to_string();
         self.in_source_view = false;
         self.index = 0;
+
+        // Restore per-view thread mode from DB settings
+        let mode_key = format!("thread_mode_{}", key);
+        match self.db.get_setting(&mode_key).as_deref() {
+            Some("threaded") => { self.show_threaded = true; self.group_by_folder = false; }
+            Some("folders") => { self.show_threaded = true; self.group_by_folder = true; }
+            _ => { self.show_threaded = false; self.group_by_folder = false; } // "flat" or unset
+        }
 
         let mut filters = Filters::default();
 
@@ -1735,6 +1822,10 @@ impl App {
             self.group_by_folder = false;
             self.set_feedback("View mode: Flat", tc.feedback_ok);
         }
+        // Persist per-view thread mode
+        let mode = if self.group_by_folder { "folders" } else if self.show_threaded { "threaded" } else { "flat" };
+        let mode_key = format!("thread_mode_{}", self.current_view);
+        self.db.set_setting(&mode_key, mode);
         self.index = 0;
         self.rebuild_display();
         self.render_all();
@@ -1926,10 +2017,27 @@ impl App {
     fn purge_deleted(&mut self) {
         if self.delete_marked.is_empty() { return; }
         let ids: Vec<i64> = self.delete_marked.iter().copied().collect();
-        self.db.delete_messages(&ids);
+
+        // Delete maildir files from disk (add T flag = Trashed, then remove)
+        for &id in &ids {
+            if let Some(msg) = self.filtered_messages.iter().find(|m| m.id == id) {
+                if let Some(file) = msg.metadata.get("maildir_file").and_then(|v| v.as_str()) {
+                    let path = std::path::Path::new(file);
+                    if path.exists() {
+                        // Move to trash or just delete
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
+        }
+
+        let _ = self.write_tx.send(DbWriteOp::DeleteMessages(ids.clone()));
         let count = ids.len();
         self.delete_marked.clear();
         self.filtered_messages.retain(|m| !ids.contains(&m.id));
+        if self.show_threaded {
+            self.display_messages.retain(|m| !ids.contains(&m.id));
+        }
         if self.index >= self.filtered_messages.len() {
             self.index = self.filtered_messages.len().saturating_sub(1);
         }
@@ -4208,7 +4316,7 @@ impl App {
         self.right.full_refresh();
         if self.right.border { self.right.border_refresh(); }
 
-        // If multiple images, use montage to composite (if available), otherwise show first
+        // If multiple images, use montage to composite (if available)
         let display_path = if paths.len() > 1 {
             let composite = cache_dir.join("composite.png");
             let cols = (paths.len() as f64).sqrt().ceil() as usize;
@@ -4218,12 +4326,12 @@ impl App {
                 .arg(composite.to_str().unwrap_or("/tmp/composite.png"))
                 .status();
             if result.map(|s| s.success()).unwrap_or(false) && composite.exists() {
-                composite.to_string_lossy().to_string()
+                Some(composite.to_string_lossy().to_string())
             } else {
-                paths[0].clone()
+                None
             }
         } else {
-            paths[0].clone()
+            None
         };
 
         self.image_display = Some(display);
@@ -4232,7 +4340,26 @@ impl App {
             let img_y = self.right.y + 1;
             let img_w = self.right.w.saturating_sub(2);
             let img_h = self.right.h.saturating_sub(2);
-            disp.show(&display_path, img_x, img_y, img_w, img_h);
+
+            if let Some(ref composite) = display_path {
+                // Show composited image
+                disp.show(composite, img_x, img_y, img_w, img_h);
+            } else if paths.len() == 1 {
+                // Single image
+                disp.show(&paths[0], img_x, img_y, img_w, img_h);
+            } else {
+                // Multiple images, no montage: show each image in equal vertical slices
+                let n = paths.len() as u16;
+                let per_h = img_h / n;
+                for (i, path) in paths.iter().enumerate() {
+                    let i16 = i as u16;
+                    let y = img_y + i16 * per_h;
+                    let h = if i == paths.len() - 1 { img_h - i16 * per_h } else { per_h };
+                    if h > 0 {
+                        disp.show(path, img_x, y, img_w, h);
+                    }
+                }
+            }
         }
         self.showing_image = true;
     }
@@ -4702,6 +4829,57 @@ fn home_dir() -> std::path::PathBuf {
     std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
+/// Sync the Seen (S) flag to a maildir file on disk.
+/// Maildir flags are in the filename: `unique:2,FLAGS` where S=Seen, F=Flagged, R=Replied.
+/// If the file is in new/, move to cur/ and add the S flag.
+fn sync_maildir_seen_flag(metadata: &serde_json::Value, db: &database::Database, msg_id: i64) {
+    let Some(file_path) = metadata.get("maildir_file").and_then(|v| v.as_str()) else { return };
+    let path = std::path::Path::new(file_path);
+    if !path.exists() { return; }
+
+    let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+    let parent_name = parent.file_name().and_then(|f| f.to_str()).unwrap_or("");
+
+    let new_filename = if filename.contains(":2,") {
+        // Already has flags section - add S if not present
+        if filename.contains('S') { return; } // Already seen
+        let (base, flags) = filename.rsplit_once(":2,").unwrap();
+        let mut flag_chars: Vec<char> = flags.chars().collect();
+        flag_chars.push('S');
+        flag_chars.sort(); // Maildir flags must be alphabetically sorted
+        format!("{}:2,{}", base, flag_chars.into_iter().collect::<String>())
+    } else {
+        // No flags section yet - add one
+        format!("{}:2,S", filename)
+    };
+
+    // If in new/, move to cur/
+    let new_parent = if parent_name == "new" {
+        parent.parent().unwrap_or(parent).join("cur")
+    } else {
+        parent.to_path_buf()
+    };
+
+    let new_path = new_parent.join(&new_filename);
+    if std::fs::rename(path, &new_path).is_ok() {
+        // Update the metadata in DB with new file path
+        let mut new_meta = metadata.clone();
+        new_meta["maildir_file"] = serde_json::json!(new_path.to_string_lossy().to_string());
+        let meta_json = serde_json::to_string(&new_meta).unwrap_or_default();
+        let conn = db.conn.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE messages SET metadata = ? WHERE id = ?",
+            rusqlite::params![meta_json, msg_id],
+        );
+    }
+}
+
+/// Background version (called from writer thread)
+fn sync_maildir_seen_flag_bg(metadata: &serde_json::Value, db: &database::Database, msg_id: i64) {
+    sync_maildir_seen_flag(metadata, db, msg_id);
+}
+
 /// Check if a filename has an image extension
 fn is_image_filename(name: &str) -> bool {
     let lower = name.to_lowercase();
@@ -4733,11 +4911,16 @@ fn extract_image_urls(html: &str) -> Vec<String> {
                     else { (' ', 0) };
                 if let Some(end_pos) = rest[start..].find(delim) {
                     let url = &rest[start..start + end_pos];
-                    // Skip tracking pixels, icons, spacers
+                    // Skip tracking pixels, icons, spacers, logos, badges
                     let lower_url = url.to_lowercase();
                     if !lower_url.contains("track") && !lower_url.contains("pixel")
                         && !lower_url.contains("spacer") && !lower_url.contains("beacon")
                         && !lower_url.ends_with(".gif")
+                        && !lower_url.contains("icon") && !lower_url.contains("logo")
+                        && !lower_url.contains("badge") && !lower_url.contains("button")
+                        && !lower_url.contains("social") && !lower_url.contains("facebook")
+                        && !lower_url.contains("linkedin") && !lower_url.contains("twitter")
+                        && !lower_url.contains("instagram")
                     {
                         // Skip small images by checking width/height attrs
                         let tag_lower = tag.to_lowercase();

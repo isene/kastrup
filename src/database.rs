@@ -619,32 +619,38 @@ impl Database {
         );
     }
 
-    /// Insert multiple messages in a single transaction (batch mode)
+    /// Insert multiple messages in a single transaction (batch mode).
+    /// Uses small batches to avoid holding the lock for too long.
     pub fn insert_messages_batch(&self, source_id: i64, msgs: &[crate::sources::MessageData]) {
-        let conn = self.conn.lock().unwrap();
-        let _ = conn.execute("BEGIN", []);
-        for msg in msgs {
-            let labels_json = serde_json::to_string(&msg.labels).unwrap_or_default();
-            let atts_json = serde_json::to_string(&msg.attachments).unwrap_or_default();
-            let meta_json = serde_json::to_string(&msg.metadata).unwrap_or_default();
-            let recipients_json = serde_json::json!([&msg.recipients]).to_string();
-            let cc_json = msg.cc.as_ref().map(|c| serde_json::json!([c]).to_string());
-            let now = now_secs();
-            let _ = conn.execute(
-                "INSERT OR IGNORE INTO messages (source_id, external_id, thread_id, \
-                 sender, sender_name, recipients, cc, subject, content, html_content, \
-                 timestamp, received_at, read, starred, labels, attachments, metadata, folder) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
-                params![
-                    source_id, msg.external_id, msg.thread_id,
-                    msg.sender, msg.sender_name, recipients_json, cc_json,
-                    msg.subject, msg.content, msg.html_content,
-                    msg.timestamp, now,
-                    labels_json, atts_json, meta_json, msg.folder,
-                ],
-            );
+        if msgs.is_empty() { return; }
+        // Insert in chunks of 20 to keep lock hold time short
+        for chunk in msgs.chunks(20) {
+            let conn = self.conn.lock().unwrap();
+            let _ = conn.execute("BEGIN", []);
+            for msg in chunk {
+                let labels_json = serde_json::to_string(&msg.labels).unwrap_or_default();
+                let atts_json = serde_json::to_string(&msg.attachments).unwrap_or_default();
+                let meta_json = serde_json::to_string(&msg.metadata).unwrap_or_default();
+                let recipients_json = serde_json::json!([&msg.recipients]).to_string();
+                let cc_json = msg.cc.as_ref().map(|c| serde_json::json!([c]).to_string());
+                let now = now_secs();
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO messages (source_id, external_id, thread_id, \
+                     sender, sender_name, recipients, cc, subject, content, html_content, \
+                     timestamp, received_at, read, starred, labels, attachments, metadata, folder) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
+                    params![
+                        source_id, msg.external_id, msg.thread_id,
+                        msg.sender, msg.sender_name, recipients_json, cc_json,
+                        msg.subject, msg.content, msg.html_content,
+                        msg.timestamp, now,
+                        labels_json, atts_json, meta_json, msg.folder,
+                    ],
+                );
+            }
+            let _ = conn.execute("COMMIT", []);
+            // Drop lock between chunks so main thread can acquire it
         }
-        let _ = conn.execute("COMMIT", []);
     }
 
     /// Add a new source
