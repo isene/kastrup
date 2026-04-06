@@ -1,0 +1,4798 @@
+mod config;
+mod database;
+mod message;
+mod organizer;
+mod poller;
+mod source;
+mod sources;
+
+use crust::{Crust, Pane, Input};
+use crust::style;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use config::Config;
+use database::{Database, Filters};
+use message::Message;
+
+// --- Folder browser types ---
+
+struct FolderEntry {
+    name: String,
+    full_name: String,
+    depth: usize,
+    has_children: bool,
+    collapsed: bool,
+}
+
+fn discover_maildir_folders(maildir_path: &std::path::Path) -> Vec<String> {
+    let mut folder_names = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(maildir_path) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with('.') || name == "." || name == ".." { continue; }
+            let path = entry.path();
+            if !path.is_dir() { continue; }
+            if !path.join("cur").is_dir() && !path.join("new").is_dir() { continue; }
+            folder_names.push(name[1..].to_string());
+        }
+    }
+    folder_names.sort();
+    folder_names
+}
+
+fn build_folder_tree(folder_names: &[String]) -> serde_json::Map<String, serde_json::Value> {
+    let mut tree = serde_json::Map::new();
+    for name in folder_names {
+        let parts: Vec<&str> = name.split('.').collect();
+        let mut node = &mut tree;
+        for part in parts {
+            if !node.contains_key(part) {
+                node.insert(part.to_string(), serde_json::json!({}));
+            }
+            node = node.get_mut(part).unwrap().as_object_mut().unwrap();
+        }
+    }
+    tree
+}
+
+fn flatten_folder_tree(
+    tree: &serde_json::Map<String, serde_json::Value>,
+    prefix: &str,
+    depth: usize,
+    collapsed: &HashMap<String, bool>,
+) -> Vec<FolderEntry> {
+    let mut result = Vec::new();
+    let mut keys: Vec<&String> = tree.keys().collect();
+    keys.sort();
+    for key in keys {
+        let full_name = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{}.{}", prefix, key)
+        };
+        let children = tree[key].as_object();
+        let has_children = children.map(|c| !c.is_empty()).unwrap_or(false);
+        let is_collapsed = collapsed.get(&full_name).copied().unwrap_or(false);
+
+        result.push(FolderEntry {
+            name: key.clone(),
+            full_name: full_name.clone(),
+            depth,
+            has_children,
+            collapsed: is_collapsed,
+        });
+
+        if has_children && !is_collapsed {
+            if let Some(children) = children {
+                result.extend(flatten_folder_tree(children, &full_name, depth + 1, collapsed));
+            }
+        }
+    }
+    result
+}
+
+// --- Preferences types ---
+
+enum PrefType {
+    Bool(bool),
+    Choice(Vec<&'static str>, String),
+    Text(String),
+    Num(u8, u8, u8), // value, min, max
+}
+
+fn next_pref(p: &mut PrefType) {
+    match p {
+        PrefType::Bool(v) => *v = !*v,
+        PrefType::Choice(opts, v) => {
+            let idx = opts.iter().position(|&o| o == v.as_str()).unwrap_or(0);
+            *v = opts[(idx + 1) % opts.len()].to_string();
+        }
+        PrefType::Num(v, _, max) => *v = if *v >= *max { *max } else { *v + 1 },
+        _ => {}
+    }
+}
+
+fn prev_pref(p: &mut PrefType) {
+    match p {
+        PrefType::Bool(v) => *v = !*v,
+        PrefType::Choice(opts, v) => {
+            let idx = opts.iter().position(|&o| o == v.as_str()).unwrap_or(0);
+            *v = opts[(idx + opts.len() - 1) % opts.len()].to_string();
+        }
+        PrefType::Num(v, min, _) => *v = if *v <= *min { *min } else { *v - 1 },
+        _ => {}
+    }
+}
+
+struct App {
+    top: Pane,
+    left: Pane,
+    right: Pane,
+    bottom: Pane,
+    cols: u16,
+    rows: u16,
+
+    db: Arc<Database>,
+    config: Config,
+    source_type_map: HashMap<i64, String>,
+
+    // Stats cache with TTL
+    stats_cache: Option<(std::time::Instant, (i64, i64, i64))>,
+    last_db_refresh: std::time::Instant,
+
+    // State
+    running: bool,
+    current_view: String,
+    in_source_view: bool,
+    index: usize,
+
+    filtered_messages: Vec<Message>,
+    views: Vec<database::View>,
+    sources_list: Vec<source::Source>,
+
+    sort_order: String,
+    sort_inverted: bool,
+    date_format: String,
+    width: u16,
+    border: u8,
+
+    tagged: HashSet<i64>,
+    delete_marked: HashSet<i64>,
+    browsed_ids: HashSet<i64>,
+
+    folder_collapsed: HashMap<String, bool>,
+    folder_count_cache: HashMap<String, (i64, i64)>,
+
+    feedback_message: Option<(String, u8)>,
+    feedback_expires: Option<std::time::Instant>,
+
+    showing_image: bool,
+    image_display: Option<glow::Display>,
+
+    // Threading state
+    show_threaded: bool,
+    group_by_folder: bool,
+    display_messages: Vec<Message>,
+    section_collapsed: HashMap<String, bool>,
+
+    // Background poller
+    poller: Option<poller::Poller>,
+    poller_rx: Option<std::sync::mpsc::Receiver<poller::PollerEvent>>,
+
+    // Help state
+    showing_help: bool,
+    help_extended: bool,
+}
+
+fn main() {
+    Crust::init();
+    let (cols, rows) = Crust::terminal_size();
+
+    let config = Config::load();
+    let db = Arc::new(Database::new().expect("Failed to open heathrow database"));
+    let source_type_map = db.get_source_type_map();
+    let views = db.get_views();
+
+    let width = config.pane_width;
+    let border = config.border_style;
+    let (top, left, right, bottom) = create_panes(cols, rows, width, border, &config);
+
+    let mut app = App {
+        top, left, right, bottom,
+        cols, rows,
+        db,
+        config,
+        source_type_map,
+        stats_cache: None,
+        last_db_refresh: std::time::Instant::now(),
+        running: true,
+        current_view: "A".to_string(),
+        in_source_view: false,
+        index: 0,
+        filtered_messages: Vec::new(),
+        views,
+        sources_list: Vec::new(),
+        sort_order: "latest".to_string(),
+        sort_inverted: false,
+        date_format: "%b %e".to_string(),
+        width,
+        border,
+        tagged: HashSet::new(),
+        delete_marked: HashSet::new(),
+        browsed_ids: HashSet::new(),
+        folder_collapsed: HashMap::new(),
+        folder_count_cache: HashMap::new(),
+        feedback_message: None,
+        feedback_expires: None,
+        showing_image: false,
+        image_display: None,
+        show_threaded: false,
+        group_by_folder: false,
+        display_messages: Vec::new(),
+        section_collapsed: HashMap::new(),
+        poller: None,
+        poller_rx: None,
+        showing_help: false,
+        help_extended: false,
+    };
+
+    // Apply config defaults
+    app.sort_order = app.config.sort_order.clone();
+    app.sort_inverted = app.config.sort_inverted;
+    app.date_format = app.config.date_format.clone();
+
+    // First-run wizard if database is empty
+    if app.db.is_empty() && app.db.get_sources(false).is_empty() {
+        app.first_run_wizard();
+    }
+
+    // Start background poller
+    let (poller_tx, poller_rx) = std::sync::mpsc::channel();
+    let poller = poller::Poller::start(app.db.clone(), poller_tx);
+    app.poller = Some(poller);
+    app.poller_rx = Some(poller_rx);
+
+    // Load initial view
+    let default_view = app.config.default_view.clone();
+    app.switch_to_view(&default_view);
+    app.render_all();
+
+    while app.running {
+        // Check feedback expiry
+        if let Some(expires) = app.feedback_expires {
+            if std::time::Instant::now() >= expires {
+                app.feedback_message = None;
+                app.feedback_expires = None;
+                app.render_bottom_bar();
+            }
+        }
+
+        let key = Input::getchr(Some(2));
+        match key {
+            Some(k) => app.handle_key(&k),
+            None => {
+                // Check for new messages from poller
+                let mut new_count = 0usize;
+                if let Some(ref rx) = app.poller_rx {
+                    while let Ok(event) = rx.try_recv() {
+                        match event {
+                            poller::PollerEvent::NewMessages(count) => {
+                                new_count += count;
+                            }
+                        }
+                    }
+                }
+                if new_count > 0 {
+                    app.set_feedback(
+                        &format!("{} new message(s)", new_count),
+                        app.config.theme_colors.feedback_ok,
+                    );
+                    let view = app.current_view.clone();
+                    app.switch_to_view(&view);
+                }
+                // Periodic DB refresh every 30s (catches messages synced by Heathrow)
+                if app.last_db_refresh.elapsed().as_secs() >= 5 {
+                    app.last_db_refresh = std::time::Instant::now();
+                    app.stats_cache = None; // Invalidate stats
+                    let view = app.current_view.clone();
+                    app.switch_to_view(&view);
+                }
+            }
+        }
+    }
+
+    Crust::cleanup();
+}
+
+fn create_panes(cols: u16, rows: u16, width: u16, border: u8, config: &Config) -> (Pane, Pane, Pane, Pane) {
+    let top_bg = config.theme_colors.top_bg;
+    let bottom_bg = config.theme_colors.bottom_bg;
+
+    let top = Pane::new(1, 1, cols, 1, 255, top_bg);
+    let bottom = Pane::new(1, rows, cols, 1, 252, bottom_bg);
+
+    let left_w = (cols.saturating_sub(4)) * width / 10;
+    let content_h = rows.saturating_sub(4);
+    let mut left = Pane::new(2, 3, left_w, content_h, 252, 0);
+    let mut right = Pane::new(left_w + 4, 3, cols.saturating_sub(left_w + 4), content_h, 252, 0);
+
+    // Border styles: 0=none, 1=right only, 2=both, 3=left only
+    left.border = matches!(border, 2 | 3);
+    right.border = matches!(border, 1 | 2);
+    if left.border { left.border_refresh(); }
+    if right.border { right.border_refresh(); }
+
+    left.scroll = true;
+    right.scroll = true;
+
+    (top, left, right, bottom)
+}
+
+// --- Key dispatch ---
+
+impl App {
+    fn handle_key(&mut self, key: &str) {
+        if key == "ESC" && self.showing_image {
+            self.clear_inline_image();
+            self.render_message_content();
+            return;
+        }
+
+        if self.in_source_view {
+            self.handle_source_key(key);
+            return;
+        }
+
+        match key {
+            // Navigation
+            "j" | "DOWN" => { self.move_down(); }
+            "k" | "UP" => { self.move_up(); }
+            "h" | "LEFT" => {
+                if self.show_threaded { self.collapse_current(); }
+            }
+            "HOME" => { self.go_first(); }
+            "END" => { self.go_last(); }
+            "PgDOWN" => { self.page_down(); }
+            "PgUP" => { self.page_up(); }
+            "ENTER" => {
+                if self.show_threaded {
+                    if let Some(msg) = self.display_messages.get(self.index) {
+                        if msg.is_header { self.toggle_collapse(); return; }
+                    }
+                }
+                self.open_message();
+            }
+            " " | "SPACE" => {
+                if self.show_threaded { self.toggle_collapse(); }
+            }
+            "n" => { self.next_unread(); }
+            "p" => { self.prev_unread(); }
+            "J" => { self.jump_to_date(); }
+            "G" => { self.cycle_view_mode(); }
+            "{" | "C-UP" => { /* move section - needs threading */ }
+            "}" | "C-DOWN" => { /* move section - needs threading */ }
+
+            // View switching
+            "A" => { self.switch_to_view("A"); }
+            "N" => { self.switch_to_view("N"); }
+            "S" => { self.show_sources(); }
+            "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+                self.switch_to_view(key);
+            }
+            "F1" | "F2" | "F3" | "F4" | "F5" | "F6" | "F7" | "F8" | "F9"
+            | "F10" | "F11" | "F12" => {
+                self.switch_to_view(key);
+            }
+            "F" => { self.show_favorites_browser(); }
+            "L" => { self.load_more(); }
+            "C-R" => { self.refresh_view(); }
+            "C-F" => { self.edit_filter(); }
+            "K" => { self.kill_view(); }
+
+            // Message operations
+            "R" => { self.toggle_read(); }
+            "M" => { self.mark_all_read(); }
+            "*" | "-" => { self.toggle_star(); }
+            "t" => { self.toggle_tag(); }
+            "T" => { self.tag_all_toggle(); }
+            "C-T" => { self.tag_by_regex(); }
+            "d" => { self.toggle_delete_mark(); }
+            "<" => { self.purge_deleted(); }
+            "u" | "U" => { self.unsee_message(); }
+            "S-SPACE" => { self.mark_browsed_as_read(); }
+
+            // Compose / reply
+            "r" => { self.reply(false); }
+            "e" => { self.reply(true); }
+            "g" => { self.reply_all(); }
+            "f" => { self.forward(); }
+            "m" => { self.compose_new(); }
+            "E" => { self.edit_message(); }
+
+            // Attachments / external
+            "v" => { self.view_attachments(); }
+            "V" => { self.toggle_inline_image(); }
+            "x" => { self.open_external(); }
+            "X" => { self.open_in_browser(); }
+
+            // Search / filter
+            "/" => { self.search_prompt(); }
+            "@" => { self.address_book_menu(); }
+
+            // Sort
+            "o" => { self.cycle_sort(); }
+            "i" => { self.toggle_sort_invert(); }
+
+            // Labels / save / misc
+            "l" => { self.label_message(); }
+            "s" => { self.file_message(); }
+            "+" => { self.set_feedback("Favorites not yet implemented", self.config.theme_colors.feedback_warn); }
+            "I" => { self.ai_assistant(); }
+            "Z" => { self.open_in_timely(); }
+
+            // UI
+            "w" => { self.cycle_width(); }
+            "D" => { self.cycle_date_format(); }
+            "c" => { self.set_view_color(); }
+            "P" => { self.show_preferences(); }
+            "?" => {
+                if self.showing_help && !self.help_extended {
+                    self.show_extended_help();
+                    self.help_extended = true;
+                } else if self.showing_help && self.help_extended {
+                    self.showing_help = false;
+                    self.help_extended = false;
+                    self.render_message_content();
+                } else {
+                    self.show_help();
+                    self.showing_help = true;
+                    self.help_extended = false;
+                }
+            }
+            "y" => { self.copy_message_id(); }
+            "Y" => { self.copy_right_pane(); }
+            "B" => { self.show_folder_browser(); }
+            "C-B" => { self.cycle_border(); }
+
+            // Right pane scroll
+            "S-DOWN" => { self.right.linedown(); }
+            "S-UP" => { self.right.lineup(); }
+            "TAB" | "S-RIGHT" => { self.right.pagedown(); }
+            "S-TAB" | "S-LEFT" => { self.right.pageup(); }
+
+            // Resize
+            "RESIZE" => { self.handle_resize(); }
+            "C-L" => { self.force_redraw(); }
+
+            // Quit
+            "q" | "Q" => { self.running = false; }
+
+            _ => {}
+        }
+    }
+
+    fn handle_source_key(&mut self, key: &str) {
+        match key {
+            "ESC" | "q" => {
+                self.in_source_view = false;
+                let v = self.config.default_view.clone();
+                self.switch_to_view(&v);
+            }
+            "j" | "DOWN" => {
+                if self.index < self.sources_list.len().saturating_sub(1) {
+                    self.index += 1;
+                }
+                self.render_source_list();
+                self.render_source_info();
+            }
+            "k" | "UP" => {
+                if self.index > 0 { self.index -= 1; }
+                self.render_source_list();
+                self.render_source_info();
+            }
+            "ENTER" => {
+                // Show messages from selected source
+                if let Some(src) = self.sources_list.get(self.index) {
+                    let sid = src.id;
+                    self.in_source_view = false;
+                    let mut filters = Filters::default();
+                    filters.source_id = Some(sid);
+                    self.filtered_messages = self.db.get_messages(&filters, 500, 0);
+                    for msg in &mut self.filtered_messages {
+                        if let Some(st) = self.source_type_map.get(&msg.source_id) {
+                            msg.source_type = st.clone();
+                        }
+                    }
+                    self.current_view = "S".to_string();
+                    self.index = 0;
+                    self.sort_messages();
+                    self.rebuild_display();
+                    self.render_all();
+                }
+            }
+            // Source-specific operations
+            "a" => { self.add_source(); }
+            "e" => { self.edit_source(); }
+            "d" => { self.delete_source(); }
+            "t" => { self.test_source(); }
+            " " | "SPACE" => { self.toggle_source(); }
+            "c" => { self.set_source_color(); }
+            "p" => { self.set_source_poll_interval(); }
+            "C-R" => { self.refresh_view(); }
+            // Allow view switching from source view
+            "A" | "N" | "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+                self.in_source_view = false;
+                self.switch_to_view(key);
+            }
+            // UI controls pass through
+            "w" => { self.cycle_width(); }
+            "C-B" => { self.cycle_border(); }
+            "D" => { self.cycle_date_format(); }
+            "C-L" => { self.force_redraw(); }
+            "RESIZE" => { self.handle_resize(); }
+            "Y" => { self.copy_right_pane(); }
+            _ => {}
+        }
+    }
+}
+
+// --- Rendering ---
+
+impl App {
+    fn cached_stats(&mut self) -> (i64, i64, i64) {
+        if let Some((time, stats)) = &self.stats_cache {
+            if time.elapsed().as_secs() < 5 {
+                return *stats;
+            }
+        }
+        let stats = self.db.get_stats();
+        self.stats_cache = Some((std::time::Instant::now(), stats));
+        stats
+    }
+
+    fn render_all(&mut self) {
+        self.render_top_bar();
+        if self.in_source_view {
+            self.render_source_list();
+            self.render_source_info();
+        } else {
+            self.render_message_list();
+            self.render_message_content();
+        }
+        self.render_bottom_bar();
+    }
+
+    fn render_top_bar(&mut self) {
+        let (_, unread, _) = self.cached_stats();
+        let total = self.filtered_messages.len() as i64;
+
+        let tc = &self.config.theme_colors;
+        let view_label = match self.current_view.as_str() {
+            "A" => style::fg("All", tc.view_all),
+            "N" => style::fg("New", tc.view_new),
+            "S" => style::fg("Sources", tc.view_sources),
+            "*" => style::fg("Starred", tc.view_starred),
+            v => {
+                // Look for named custom view with key number prefix
+                if let Some(view) = self.views.iter().find(|vw| vw.key_binding.as_deref() == Some(v)) {
+                    format!("{} {}", style::fg(&format!("[{}]", v), tc.hint_fg), style::fg(&view.name, tc.view_custom))
+                } else {
+                    format!("{} {}", style::fg(&format!("[{}]", v), tc.hint_fg), style::fg(&format!("View {}", v), tc.view_custom))
+                }
+            }
+        };
+
+        // Capitalize sort label
+        let sort_cap = {
+            let mut c = self.sort_order.chars();
+            match c.next() {
+                None => String::new(),
+                Some(first) => format!("{}{}", first.to_uppercase(), c.as_str()),
+            }
+        };
+        let sort_arrow = if self.sort_inverted { "\u{2191}" } else { "\u{2193}" };
+        let sort_label = style::fg(&format!(" [{}{}]", sort_cap, sort_arrow), tc.info_fg);
+
+        // Mode indicator
+        let mode = if self.group_by_folder { "Folders" } else if self.show_threaded { "Threaded" } else { "Flat" };
+        let mode_label = style::fg(&format!(" [{}]", mode), tc.hint_fg);
+
+        // Position indicator (use display_messages count in threaded mode)
+        let display_total = if self.show_threaded { self.display_messages.len() as i64 } else { total };
+        let pos_label = if display_total > 0 {
+            style::fg(&format!(" [{}/{}]", self.index + 1, display_total), tc.info_fg)
+        } else {
+            style::fg(" [0/0]", tc.info_fg)
+        };
+
+        let right_info = style::fg(
+            &format!("{} unread / {} msgs", unread, total), tc.info_fg
+        );
+
+        // Build top bar: " Kastrup - [key] ViewName [Sort] [Mode] [pos] ... N unread / T msgs"
+        let prefix = style::fg(" Kastrup - ", tc.prefix_fg);
+        let left_part = format!("{}{}{}{}{}", prefix, view_label, sort_label, mode_label, pos_label);
+        let left_width = crust::display_width(&left_part);
+        let right_width = crust::display_width(&right_info);
+        let padding = if self.cols as usize > left_width + right_width + 1 {
+            " ".repeat(self.cols as usize - left_width - right_width)
+        } else {
+            " ".to_string()
+        };
+
+        self.top.say(&format!("{}{}{}", left_part, padding, right_info));
+    }
+
+    fn render_message_list(&mut self) {
+        let h = self.left.h as usize;
+        let messages = if self.show_threaded {
+            &self.display_messages
+        } else {
+            &self.filtered_messages
+        };
+        if messages.is_empty() {
+            self.left.set_text(&style::fg("  No messages", self.config.theme_colors.no_msg));
+            self.left.ix = 0;
+            self.left.full_refresh();
+            return;
+        }
+
+        // Scrolloff=3: keep 3 lines visible above/below cursor
+        let total = messages.len();
+        let scrolloff: usize = 3;
+        let mut start = self.left.ix;
+        if total <= h {
+            start = 0;
+        } else if self.index < start + scrolloff {
+            start = self.index.saturating_sub(scrolloff);
+        } else if self.index + scrolloff >= start + h {
+            let max_start = total.saturating_sub(h);
+            start = (self.index + scrolloff + 1).saturating_sub(h).min(max_start);
+        }
+
+        let pane_w = self.left.w as usize;
+        let end = (start + h + 5).min(total); // Small buffer for scrolloff
+        let mut lines = Vec::with_capacity(end - start);
+        for i in start..end {
+            let msg = &messages[i];
+            let selected = i == self.index;
+            if msg.is_header {
+                lines.push(self.format_section_header(msg, selected, pane_w));
+            } else {
+                lines.push(self.format_message_line(msg, selected, pane_w));
+            }
+        }
+
+        self.left.set_text(&lines.join("\n"));
+        self.left.ix = 0;
+        self.left.refresh();
+        if self.left.border { self.left.border_refresh(); }
+    }
+
+    fn format_section_header(&self, msg: &Message, selected: bool, pane_w: usize) -> String {
+        let tc = &self.config.theme_colors;
+        let subject = msg.subject.as_deref().unwrap_or("Section");
+        let is_collapsed = msg.thread_id.as_ref()
+            .and_then(|name| self.section_collapsed.get(name))
+            .copied()
+            .unwrap_or(false);
+        let arrow = if is_collapsed { "\u{25B8}" } else { "\u{25BE}" };
+        let unread_mark = if !msg.read {
+            style::fg(" *", tc.unread)
+        } else {
+            String::new()
+        };
+        let (icon, scolor) = source_info(&msg.source_type, tc);
+        let content = format!("{} {} {} [{}]{}",
+            arrow, icon, subject, msg.content, unread_mark);
+        let content_w = crust::display_width(&content);
+        let padding = if pane_w > content_w { " ".repeat(pane_w - content_w) } else { String::new() };
+        let full = format!("{}{}", content, padding);
+
+        if selected {
+            style::underline(&style::bold(&style::fg(&full, scolor)))
+        } else {
+            style::bold(&style::fg(&full, tc.thread))
+        }
+    }
+
+    fn format_message_line(&self, msg: &Message, selected: bool, pane_w: usize) -> String {
+        // N flag
+        let nflag = if !msg.read {
+            style::fg("N", self.config.theme_colors.unread)
+        } else {
+            " ".to_string()
+        };
+
+        // Replied flag
+        let rflag = if msg.replied {
+            style::fg("\u{2190}", self.config.theme_colors.replied)
+        } else {
+            " ".to_string()
+        };
+
+        // Indicator: D > tag > star > attachment > space
+        let ind = if self.delete_marked.contains(&msg.id) {
+            style::fg("D", self.config.theme_colors.delete_mark)
+        } else if self.tagged.contains(&msg.id) {
+            style::fg("\u{2022}", self.config.theme_colors.tag)
+        } else if msg.starred {
+            style::fg("\u{2605}", self.config.theme_colors.star)
+        } else if !msg.attachments.is_empty() {
+            style::fg("\u{208A}", self.config.theme_colors.attach_ind)
+        } else {
+            " ".to_string()
+        };
+
+        // Date
+        let date_str = format_timestamp(msg.timestamp, &self.date_format);
+        let date_padded = format!("{:>6}", &date_str[..date_str.len().min(6)]);
+
+        // Source icon and color
+        let stype = &msg.source_type;
+        let (icon, scolor) = source_info(stype, &self.config.theme_colors);
+
+        // Sender (15 chars max)
+        let sender_display = msg.sender_name.as_deref().unwrap_or(&msg.sender);
+        let sender_truncated = truncate_str(sender_display, 15);
+        let sender_padded = format!("{:<15}", sender_truncated);
+
+        // Subject fills remaining width
+        let subject = msg.subject.as_deref().unwrap_or("");
+        // Calculate available width for subject
+        // "N r I DDDDDD i sender          subject"
+        // 1+1+1+1+6+1+1+1+15+1 = 29 fixed chars
+        let fixed = 29;
+        let subj_w = pane_w.saturating_sub(fixed);
+        let subject_truncated = truncate_str(subject, subj_w);
+
+        let flags = format!("{}{}{}", nflag, rflag, ind);
+
+        // Build content as PLAIN text (no ANSI), color applied in styling step below
+        let content = format!("{} {} {}{}", date_padded, icon, sender_padded, subject_truncated);
+
+        // Pad to full width
+        let flags_w = crust::display_width(&flags);
+        let content_w = crust::display_width(&content);
+        let padding = if pane_w > flags_w + content_w + 1 {
+            " ".repeat(pane_w - flags_w - content_w - 1)
+        } else {
+            String::new()
+        };
+        let full_content = format!("{}{}", content, padding);
+
+        // Apply styling: single color on the full content (no nested ANSI)
+        let color = if self.delete_marked.contains(&msg.id) {
+            self.config.theme_colors.delete_mark
+        } else if self.tagged.contains(&msg.id) {
+            self.config.theme_colors.tag
+        } else if msg.starred {
+            self.config.theme_colors.star
+        } else {
+            scolor
+        };
+
+        if selected {
+            format!("{}{}", flags, style::underline(&style::bold(&style::fg(&full_content, color))))
+        } else if !msg.read {
+            format!("{}{}", flags, style::bold(&style::fg(&full_content, color)))
+        } else {
+            format!("{}{}", flags, style::fg(&full_content, color))
+        }
+    }
+
+    fn render_message_content(&mut self) {
+        // Auto-mark as read when displayed in right pane
+        let msg_ref = if self.show_threaded {
+            self.display_messages.get(self.index)
+        } else {
+            self.filtered_messages.get(self.index)
+        };
+        if let Some(msg) = msg_ref {
+            if !msg.read && !msg.is_header && msg.id > 0 {
+                let id = msg.id;
+                self.db.mark_as_read(id);
+                self.browsed_ids.insert(id);
+                // Update in-memory state
+                if let Some(m) = self.filtered_messages.iter_mut().find(|m| m.id == id) {
+                    m.read = true;
+                }
+                if self.show_threaded {
+                    if let Some(m) = self.display_messages.get_mut(self.index) {
+                        m.read = true;
+                    }
+                }
+                self.stats_cache = None; // Invalidate stats
+            }
+        }
+
+        let messages = if self.show_threaded {
+            &self.display_messages
+        } else {
+            &self.filtered_messages
+        };
+        if messages.is_empty() {
+            self.right.set_text("");
+            self.right.ix = 0;
+            self.right.full_refresh();
+            return;
+        }
+
+        // In threaded mode, if current item is a header, show section info
+        if self.show_threaded {
+            if let Some(m) = messages.get(self.index) {
+                if m.is_header {
+                    let tc = &self.config.theme_colors;
+                    let subj = m.subject.as_deref().unwrap_or("Section");
+                    let mut lines = Vec::new();
+                    lines.push(style::bold(&style::fg(subj, tc.thread)));
+                    lines.push(String::new());
+                    lines.push(format!("{} {}", style::fg("Messages:", tc.header_date), m.content));
+                    let (_, m_scolor) = source_info(&m.source_type, tc);
+                    lines.push(format!("{} {}", style::fg("Type:", tc.header_date),
+                        style::fg(&m.source_type, m_scolor)));
+                    let is_collapsed = m.thread_id.as_ref()
+                        .and_then(|name| self.section_collapsed.get(name))
+                        .copied()
+                        .unwrap_or(false);
+                    lines.push(format!("{} {}", style::fg("State:", tc.header_date),
+                        if is_collapsed { "Collapsed" } else { "Expanded" }));
+                    lines.push(String::new());
+                    lines.push(style::fg("ENTER/Space: Toggle collapse", tc.hint_fg));
+                    lines.push(style::fg("h: Collapse", tc.hint_fg));
+                    self.right.set_text(&lines.join("\n"));
+                    self.right.ix = 0;
+                    self.right.full_refresh();
+                    if self.right.border { self.right.border_refresh(); }
+                    return;
+                }
+            }
+        }
+
+        // Auto-load full content for selected message
+        // In threaded mode, display_messages are clones, so load into filtered_messages
+        // and re-clone if needed
+        if self.show_threaded {
+            if let Some(m) = self.display_messages.get(self.index) {
+                if !m.full_loaded && m.id != 0 {
+                    if let Some((content, html)) = self.db.get_message_content(m.id) {
+                        // Update the display copy
+                        if let Some(dm) = self.display_messages.get_mut(self.index) {
+                            dm.content = content;
+                            dm.html_content = html;
+                            dm.full_loaded = true;
+                        }
+                    }
+                }
+            }
+        } else if !self.filtered_messages[self.index].full_loaded {
+            let msg_id = self.filtered_messages[self.index].id;
+            if let Some((content, html)) = self.db.get_message_content(msg_id) {
+                self.filtered_messages[self.index].content = content;
+                self.filtered_messages[self.index].html_content = html;
+                self.filtered_messages[self.index].full_loaded = true;
+            }
+        }
+
+        let messages = if self.show_threaded {
+            &self.display_messages
+        } else {
+            &self.filtered_messages
+        };
+        let msg = &messages[self.index];
+        let tc = &self.config.theme_colors;
+        let (_, scolor) = source_info(&msg.source_type, tc);
+
+        let mut lines = Vec::new();
+
+        // From
+        let from_display = match &msg.sender_name {
+            Some(name) => format!("{} <{}>", name, msg.sender),
+            None => msg.sender.clone(),
+        };
+        lines.push(format!("{} {}", style::fg("From:", tc.header_from), style::fg(&from_display, tc.header_from)));
+
+        // To (parse JSON recipients)
+        let to_display = parse_json_recipients(&msg.recipients);
+        if !to_display.is_empty() {
+            lines.push(format!("{} {}", style::fg("To:", tc.header_from), style::fg(&to_display, tc.header_from)));
+        }
+
+        // Cc (parse JSON, skip if empty)
+        if let Some(ref cc) = msg.cc {
+            let cc_display = parse_json_recipients(cc);
+            if !cc_display.is_empty() {
+                lines.push(format!("{} {}", style::fg("Cc:", tc.header_from), style::fg(&cc_display, tc.header_from)));
+            }
+        }
+
+        // Subject
+        if let Some(ref subj) = msg.subject {
+            lines.push(format!("{} {}", style::bold(&style::fg("Subject:", tc.header_subj)), style::bold(&style::fg(subj, tc.header_subj))));
+        }
+
+        // Date
+        let full_date = format_timestamp(msg.timestamp, "%Y-%m-%d %H:%M");
+        lines.push(format!("{} {}", style::fg("Date:", tc.header_date), style::fg(&full_date, tc.header_date)));
+
+        // Type
+        lines.push(format!("{} {}", style::fg("Type:", tc.header_date), style::fg(&msg.source_type, scolor)));
+
+        // Labels
+        if !msg.labels.is_empty() {
+            let label_str = msg.labels.iter()
+                .map(|l| format!("[{}]", l))
+                .collect::<Vec<_>>()
+                .join(" ");
+            lines.push(format!("{} {}", style::fg("Labels:", tc.header_label), style::fg(&label_str, tc.header_label)));
+        }
+
+        // Separator
+        lines.push(style::fg(&"\u{2500}".repeat(40), tc.separator));
+
+        // Fix 4: Attachments (separate images from regular attachments)
+        if !msg.attachments.is_empty() {
+            let regular_atts: Vec<_> = msg.attachments.iter()
+                .filter(|a| !is_image_attachment(a))
+                .collect();
+            let image_atts: Vec<_> = msg.attachments.iter()
+                .filter(|a| is_image_attachment(a))
+                .collect();
+
+            if !regular_atts.is_empty() {
+                lines.push(style::bold(&style::fg("Attachments:", tc.attachment)));
+                for (i, att) in regular_atts.iter().enumerate() {
+                    let fname = att["filename"].as_str()
+                        .or_else(|| att["name"].as_str())
+                        .unwrap_or("unknown");
+                    let size = att["size"].as_u64()
+                        .map(|s| format_file_size(s))
+                        .unwrap_or_default();
+                    let size_part = if size.is_empty() { String::new() } else { format!(" ({})", size) };
+                    lines.push(style::fg(&format!("  [{}] {}{}", i + 1, fname, size_part), tc.attachment));
+                }
+                lines.push(style::fg("  Press 'v' to view/save attachments", tc.attachment));
+                lines.push(String::new());
+            }
+
+            if !image_atts.is_empty() {
+                let label = if image_atts.len() == 1 { "1 image".to_string() } else { format!("{} images", image_atts.len()) };
+                lines.push(style::fg(&format!("{}, press V to view", label), tc.feedback_ok));
+                lines.push(String::new());
+            }
+        }
+
+        // Count images from HTML content too (when no image attachments)
+        let has_image_atts = !msg.attachments.is_empty() && msg.attachments.iter().any(|a| is_image_attachment(a));
+        if !has_image_atts {
+            let html = msg.html_content.as_deref()
+                .or_else(|| if msg.content.trim_start().starts_with('<') { Some(msg.content.as_str()) } else { None });
+            if let Some(html) = html {
+                let html_img_count = html.matches("<img").count();
+                if html_img_count > 0 {
+                    let label = if html_img_count == 1 { "1 image".to_string() } else { format!("{} images", html_img_count) };
+                    lines.push(style::fg(&format!("{}, press V to view", label), tc.feedback_ok));
+                    lines.push(String::new());
+                }
+            }
+        }
+
+        // HTML indicator
+        if msg.html_content.is_some() {
+            lines.push(style::fg("HTML mail, press x to open in browser", tc.html_hint));
+            lines.push(String::new());
+        }
+
+        lines.push(String::new());
+
+        // Content: detect HTML and parse it, whether in content or html_content
+        let raw = &msg.content;
+        let content = if let Some(ref html) = msg.html_content {
+            if raw.is_empty() || raw.contains("HTML messages are not support")
+                || raw.contains("not displayed") || raw.trim().len() < 20 {
+                html_to_text(html)
+            } else if raw.trim_start().starts_with('<') && (raw.contains("<html") || raw.contains("<body") || raw.contains("<div") || raw.contains("<table")) {
+                html_to_text(raw)
+            } else {
+                raw.clone()
+            }
+        } else if raw.trim_start().starts_with('<') && (raw.contains("<html") || raw.contains("<body") || raw.contains("<div") || raw.contains("<table")) {
+            html_to_text(raw)
+        } else {
+            raw.clone()
+        };
+        let mut in_signature = false;
+        for line in content.lines() {
+            if line.starts_with("-- ") || line == "--" {
+                in_signature = true;
+            }
+            if in_signature {
+                lines.push(style::fg(line, self.config.theme_colors.sig));
+            } else if line.starts_with(">>>>") {
+                lines.push(style::fg(line, self.config.theme_colors.quote4));
+            } else if line.starts_with(">>>") {
+                lines.push(style::fg(line, self.config.theme_colors.quote3));
+            } else if line.starts_with(">>") {
+                lines.push(style::fg(line, self.config.theme_colors.quote2));
+            } else if line.starts_with('>') {
+                lines.push(style::fg(line, self.config.theme_colors.quote1));
+            } else {
+                lines.push(line.to_string());
+            }
+        }
+
+        self.right.set_text(&lines.join("\n"));
+        self.right.ix = 0;
+        self.right.full_refresh();
+        if self.right.border { self.right.border_refresh(); }
+    }
+
+    fn render_bottom_bar(&mut self) {
+        let version = format!("kastrup v{}", env!("CARGO_PKG_VERSION"));
+        let tc = &self.config.theme_colors;
+        let left = if let Some((ref msg, color)) = self.feedback_message {
+            format!(" {}", style::fg(msg, color))
+        } else {
+            style::fg(
+                " q:Quit | ?:Help | A:All | N:New | 0-9:Views | Space:Fold | t:Tag | T:All | s:Save | B:Browse | F:Fav",
+                tc.hint_fg
+            )
+        };
+        let left_w = crust::display_width(&left);
+        let ver_w = version.len();
+        let pad = (self.cols as usize).saturating_sub(left_w + ver_w + 1);
+        self.bottom.say(&format!("{}{}{}", left, " ".repeat(pad), style::fg(&version, tc.hint_fg)));
+    }
+
+    // --- Source view rendering ---
+
+    fn render_source_list(&mut self) {
+        if self.sources_list.is_empty() {
+            self.left.set_text(&style::fg("  No sources configured", self.config.theme_colors.no_msg));
+            self.left.ix = 0;
+            self.left.full_refresh();
+            return;
+        }
+
+        let stats = self.db.get_source_stats();
+        let mut lines = Vec::new();
+
+        for (i, src) in self.sources_list.iter().enumerate() {
+            let selected = i == self.index;
+            let (icon, scolor) = source_info(&src.plugin_type, &self.config.theme_colors);
+            let (total, unread) = stats.get(&src.id).copied().unwrap_or((0, 0));
+
+            let enabled_mark = if src.enabled { " " } else { "x" };
+            let unread_mark = if unread > 0 {
+                style::fg(&format!(" ({})", unread), self.config.theme_colors.unread)
+            } else {
+                String::new()
+            };
+
+            let line_content = format!(" {} {} {} [{}/{}]{}",
+                enabled_mark, icon, src.name, unread, total, unread_mark
+            );
+
+            if selected {
+                lines.push(style::underline(&style::bold(&style::fg(&line_content, scolor))));
+            } else {
+                lines.push(style::fg(&line_content, scolor));
+            }
+        }
+
+        self.left.set_text(&lines.join("\n"));
+        self.left.ix = 0;
+        self.left.full_refresh();
+    }
+
+    fn render_source_info(&mut self) {
+        if self.sources_list.is_empty() {
+            self.right.set_text("");
+            self.right.ix = 0;
+            self.right.full_refresh();
+            return;
+        }
+
+        let src = &self.sources_list[self.index];
+        let (_, scolor) = source_info(&src.plugin_type, &self.config.theme_colors);
+        let stats = self.db.get_source_stats();
+        let (total, unread) = stats.get(&src.id).copied().unwrap_or((0, 0));
+
+        let tc = &self.config.theme_colors;
+        let mut lines = Vec::new();
+        lines.push(style::bold(&style::fg(&src.name, scolor)));
+        lines.push(String::new());
+        lines.push(format!("{} {}", style::fg("Type:", tc.header_date), style::fg(&src.plugin_type, scolor)));
+        lines.push(format!("{} {}", style::fg("Enabled:", tc.header_date),
+            if src.enabled { style::fg("yes", tc.feedback_ok) } else { style::fg("no", tc.delete_mark) }
+        ));
+        lines.push(format!("{} {} ({} unread)", style::fg("Messages:", tc.header_date), total, unread));
+        lines.push(format!("{} {}s", style::fg("Poll interval:", tc.header_date), src.poll_interval));
+
+        if let Some(ref ts) = src.last_sync {
+            lines.push(format!("{} {}", style::fg("Last sync:", tc.header_date),
+                format_timestamp(*ts, "%Y-%m-%d %H:%M")));
+        }
+        if let Some(ref err) = src.last_error {
+            lines.push(format!("{} {}", style::fg("Last error:", 196), style::fg(err, 196)));
+        }
+
+        lines.push(String::new());
+        lines.push(style::fg("Press ENTER to view messages from this source", tc.hint_fg));
+        lines.push(style::fg("Press ESC to return to message view", tc.hint_fg));
+
+        self.right.set_text(&lines.join("\n"));
+        self.right.ix = 0;
+        self.right.full_refresh();
+    }
+}
+
+// --- Navigation ---
+
+impl App {
+    fn move_down(&mut self) {
+        let limit = if self.in_source_view {
+            self.sources_list.len()
+        } else if self.show_threaded {
+            self.display_messages.len()
+        } else {
+            self.filtered_messages.len()
+        };
+        if limit == 0 { return; }
+        if self.index < limit - 1 {
+            self.index += 1;
+        } else {
+            self.index = 0; // Wrap around
+        }
+        if self.in_source_view {
+            self.render_source_list();
+            self.render_source_info();
+        } else {
+            self.render_message_list();
+            self.render_message_content();
+        }
+    }
+
+    fn move_up(&mut self) {
+        if self.index > 0 {
+            self.index -= 1;
+        } else {
+            // Wrap around
+            let limit = if self.in_source_view {
+                self.sources_list.len()
+            } else if self.show_threaded {
+                self.display_messages.len()
+            } else {
+                self.filtered_messages.len()
+            };
+            if limit > 0 { self.index = limit - 1; }
+        }
+        if self.in_source_view {
+            self.render_source_list();
+            self.render_source_info();
+        } else {
+            self.render_message_list();
+            self.render_message_content();
+        }
+    }
+
+    fn go_first(&mut self) {
+        self.index = 0;
+        self.render_all();
+    }
+
+    fn go_last(&mut self) {
+        let len = if self.show_threaded { self.display_messages.len() } else { self.filtered_messages.len() };
+        self.index = len.saturating_sub(1);
+        self.render_all();
+    }
+
+    fn page_down(&mut self) {
+        let page = self.left.h as usize;
+        let len = if self.show_threaded { self.display_messages.len() } else { self.filtered_messages.len() };
+        self.index = (self.index + page).min(len.saturating_sub(1));
+        self.render_all();
+    }
+
+    fn page_up(&mut self) {
+        let page = self.left.h as usize;
+        self.index = self.index.saturating_sub(page);
+        self.render_all();
+    }
+
+    fn next_unread(&mut self) {
+        let start = self.index + 1;
+        for i in start..self.filtered_messages.len() {
+            if !self.filtered_messages[i].read {
+                self.index = i;
+                self.render_all();
+                return;
+            }
+        }
+        self.set_feedback("No more unread messages", self.config.theme_colors.feedback_info);
+    }
+
+    fn prev_unread(&mut self) {
+        if self.index == 0 { return; }
+        for i in (0..self.index).rev() {
+            if !self.filtered_messages[i].read {
+                self.index = i;
+                self.render_all();
+                return;
+            }
+        }
+        self.set_feedback("No previous unread message", self.config.theme_colors.feedback_info);
+    }
+}
+
+// --- View switching ---
+
+impl App {
+    fn switch_to_view(&mut self, key: &str) {
+        self.current_view = key.to_string();
+        self.in_source_view = false;
+        self.index = 0;
+
+        let mut filters = Filters::default();
+
+        match key {
+            "A" | "N" | "*" => {
+                // Built-in views: reset top_bg to default
+                self.top.bg = self.config.theme_colors.top_bg;
+                match key {
+                    "N" => { filters.is_read = Some(false); }
+                    "*" => { filters.is_starred = Some(true); }
+                    _ => {} // "A" = no filters
+                }
+            }
+            _ => {
+                // Reset top_bg to default first, then override if view specifies
+                self.top.bg = self.config.theme_colors.top_bg;
+
+                // Check custom views from DB
+                if let Some(view) = self.views.iter().find(|v| v.key_binding.as_deref() == Some(key)) {
+                    if let Ok(f) = serde_json::from_str::<serde_json::Value>(&view.filters) {
+                        if let Some(rules) = f["rules"].as_array() {
+                            for rule in rules {
+                                let field = rule["field"].as_str().unwrap_or("");
+                                let value = &rule["value"];
+                                match field {
+                                    "read" => {
+                                        filters.is_read = Some(!value.as_bool().unwrap_or(true));
+                                    }
+                                    "starred" => {
+                                        filters.is_starred = value.as_bool();
+                                    }
+                                    "folder" => {
+                                        filters.folder = value.as_str().map(|s| s.to_string());
+                                    }
+                                    "source_id" => {
+                                        filters.source_id = value.as_i64();
+                                    }
+                                    "sender" => {
+                                        filters.sender_pattern = value.as_str().map(|s| s.to_string());
+                                    }
+                                    "source_type" => {
+                                        filters.source_type = value.as_str().map(|s| s.to_string());
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        // Per-view sort settings
+                        if let Some(so) = f["view_sort_order"].as_str() {
+                            self.sort_order = so.to_string();
+                        }
+                        if let Some(si) = f["view_sort_inverted"].as_bool() {
+                            self.sort_inverted = si;
+                        }
+                        // Per-view top bar background color
+                        if let Some(bg) = f["top_bg"].as_str() {
+                            if let Ok(v) = bg.parse::<u16>() {
+                                self.top.bg = v;
+                            }
+                        } else if let Some(bg) = f["top_bg"].as_u64() {
+                            self.top.bg = bg as u16;
+                        }
+                    }
+                }
+            }
+        }
+
+        let limit = self.config.load_limit;
+        self.filtered_messages = self.db.get_messages(&filters, limit, 0);
+        // Populate source_type for each message
+        for msg in &mut self.filtered_messages {
+            if let Some(st) = self.source_type_map.get(&msg.source_id) {
+                msg.source_type = st.clone();
+            }
+        }
+        self.sort_messages();
+        self.rebuild_display();
+        self.render_all();
+    }
+
+    fn show_sources(&mut self) {
+        self.in_source_view = true;
+        self.current_view = "S".to_string();
+        self.index = 0;
+        self.sources_list = self.db.get_sources(false);
+        self.render_all();
+    }
+}
+
+// --- Folder browser ---
+
+impl App {
+    fn show_folder_browser(&mut self) {
+        self.folder_count_cache.clear();
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let maildir_path = std::path::PathBuf::from(&home).join("Main/Maildir");
+        let folder_names = discover_maildir_folders(&maildir_path);
+
+        let tree = build_folder_tree(&folder_names);
+        let mut display = flatten_folder_tree(&tree, "", 0, &self.folder_collapsed);
+
+        if display.is_empty() {
+            self.set_feedback("No maildir folders found", self.config.theme_colors.feedback_warn);
+            return;
+        }
+
+        let result = self.folder_browser_loop(&mut display, false);
+
+        if let Some(folder) = result {
+            self.open_folder(&folder);
+        } else {
+            self.render_all();
+        }
+    }
+
+    fn show_favorites_browser(&mut self) {
+        self.folder_count_cache.clear();
+        let favorites = self.db.get_favorite_folders();
+        if favorites.is_empty() {
+            self.set_feedback(
+                "No favorite folders. Use + in folder browser to add.",
+                self.config.theme_colors.feedback_warn,
+            );
+            return;
+        }
+
+        let tree = build_folder_tree(&favorites);
+        let mut display = flatten_folder_tree(&tree, "", 0, &self.folder_collapsed);
+
+        let result = self.folder_browser_loop(&mut display, true);
+
+        if let Some(folder) = result {
+            self.open_folder(&folder);
+        } else {
+            self.render_all();
+        }
+    }
+
+    fn folder_browser_loop(
+        &mut self,
+        display: &mut Vec<FolderEntry>,
+        is_favorites: bool,
+    ) -> Option<String> {
+        let mut idx = 0usize;
+        let favorites = self.db.get_favorite_folders();
+        let mut fav_set: HashSet<String> = favorites.into_iter().collect();
+        let tc = self.config.theme_colors.clone();
+
+        loop {
+            if display.is_empty() {
+                self.set_feedback("No folders to display", tc.feedback_warn);
+                return None;
+            }
+
+            // Render left pane
+            let h = self.left.h as usize;
+            let mut lines = Vec::new();
+            for (i, f) in display.iter().enumerate() {
+                let indent = "  ".repeat(f.depth);
+                let arrow = if f.has_children {
+                    if f.collapsed {
+                        style::fg("\u{25B8} ", tc.hint_fg)
+                    } else {
+                        style::fg("\u{25BE} ", tc.hint_fg)
+                    }
+                } else {
+                    "  ".to_string()
+                };
+                let star = if fav_set.contains(&f.full_name) {
+                    style::fg("* ", tc.star)
+                } else {
+                    "  ".to_string()
+                };
+
+                if i == idx {
+                    lines.push(format!(
+                        "{}{}{}{}{}",
+                        style::fg("\u{2192} ", tc.unread),
+                        indent,
+                        arrow,
+                        star,
+                        style::underline(&style::bold(&style::fg(&f.name, 255)))
+                    ));
+                } else {
+                    lines.push(format!(
+                        "  {}{}{}{}",
+                        indent,
+                        arrow,
+                        star,
+                        style::fg(&f.name, tc.hint_fg)
+                    ));
+                }
+            }
+
+            // Scrolloff
+            let total = display.len();
+            let scrolloff = 3usize;
+            let mut start = self.left.ix;
+            if total <= h {
+                start = 0;
+            } else if idx < start + scrolloff {
+                start = idx.saturating_sub(scrolloff);
+            } else if idx + scrolloff >= start + h {
+                start = (idx + scrolloff + 1)
+                    .saturating_sub(h)
+                    .min(total.saturating_sub(h));
+            }
+
+            self.left.set_text(&lines.join("\n"));
+            self.left.ix = start;
+            self.left.full_refresh();
+            if self.left.border {
+                self.left.border_refresh();
+            }
+
+            // Render right pane: folder info
+            if let Some(f) = display.get(idx) {
+                let (total_msgs, unread) = self
+                    .folder_count_cache
+                    .entry(f.full_name.clone())
+                    .or_insert_with(|| self.db.folder_message_count(&f.full_name))
+                    .clone();
+                let mut info = Vec::new();
+                info.push(style::bold(&style::fg(
+                    &format!("FOLDER: {}", f.full_name),
+                    tc.unread,
+                )));
+                info.push(String::new());
+                info.push(format!(
+                    "{} {}",
+                    style::fg("Messages:", tc.src_email),
+                    style::fg(&total_msgs.to_string(), tc.src_email)
+                ));
+                let unread_color = if unread > 0 { tc.attachment } else { tc.hint_fg };
+                info.push(format!(
+                    "{} {}",
+                    style::fg("Unread:", unread_color),
+                    style::fg(&unread.to_string(), unread_color)
+                ));
+                info.push(String::new());
+                info.push(style::fg("Enter/l: Open folder", tc.hint_fg));
+                info.push(style::fg("h/l: Collapse/Expand", tc.hint_fg));
+                info.push(style::fg("Space: Toggle collapse", tc.hint_fg));
+                info.push(style::fg("+: Toggle favorite", tc.hint_fg));
+                info.push(style::fg("F: Switch to favorites", tc.hint_fg));
+                info.push(style::fg("ESC/q: Return", tc.hint_fg));
+                self.right.set_text(&info.join("\n"));
+                self.right.ix = 0;
+                self.right.full_refresh();
+                if self.right.border {
+                    self.right.border_refresh();
+                }
+            }
+
+            // Top bar
+            let title = if is_favorites { "Favorites" } else { "Folder Browser" };
+            let title_color = if is_favorites { tc.unread } else { tc.view_sources };
+            self.top.say(&format!(
+                "{}{}{}",
+                style::fg(" Kastrup - ", tc.prefix_fg),
+                style::bold(&style::fg(title, title_color)),
+                style::fg(&format!(" [{} folders]", display.len()), tc.hint_fg),
+            ));
+
+            // Bottom bar
+            self.bottom.say(&style::fg(
+                " j/k:Navigate | Enter/l:Open | h:Collapse | Space:Toggle | F:Favorites | +:Fav | ESC:Back",
+                tc.hint_fg,
+            ));
+
+            // Input
+            let Some(key) = Input::getchr(None) else {
+                continue;
+            };
+            match key.as_str() {
+                "j" | "DOWN" => {
+                    if !display.is_empty() {
+                        idx = (idx + 1) % display.len();
+                    }
+                }
+                "k" | "UP" => {
+                    if !display.is_empty() {
+                        idx = if idx == 0 {
+                            display.len() - 1
+                        } else {
+                            idx - 1
+                        };
+                    }
+                }
+                "PgDOWN" => {
+                    idx = (idx + h.saturating_sub(2)).min(display.len().saturating_sub(1));
+                }
+                "PgUP" => {
+                    idx = idx.saturating_sub(h.saturating_sub(2));
+                }
+                "HOME" => {
+                    idx = 0;
+                }
+                "END" => {
+                    idx = display.len().saturating_sub(1);
+                }
+                "ENTER" | "l" | "RIGHT" => {
+                    if let Some(f) = display.get(idx) {
+                        return Some(f.full_name.clone());
+                    }
+                }
+                "h" | "LEFT" => {
+                    if let Some(f) = display.get(idx) {
+                        if f.has_children && !f.collapsed {
+                            self.folder_collapsed.insert(f.full_name.clone(), true);
+                            self.rebuild_folder_display(display, is_favorites);
+                            idx = idx.min(display.len().saturating_sub(1));
+                        } else if f.depth > 0 {
+                            // Go to parent
+                            let parent = f
+                                .full_name
+                                .rsplitn(2, '.')
+                                .nth(1)
+                                .unwrap_or("")
+                                .to_string();
+                            if let Some(pi) = display.iter().position(|e| e.full_name == parent) {
+                                idx = pi;
+                            }
+                        }
+                    }
+                }
+                " " | "SPACE" => {
+                    if let Some(f) = display.get(idx) {
+                        if f.has_children {
+                            if f.collapsed {
+                                self.folder_collapsed.remove(&f.full_name);
+                            } else {
+                                self.folder_collapsed.insert(f.full_name.clone(), true);
+                            }
+                            self.rebuild_folder_display(display, is_favorites);
+                            idx = idx.min(display.len().saturating_sub(1));
+                        }
+                    }
+                }
+                "+" => {
+                    if let Some(f) = display.get(idx) {
+                        let fname = f.full_name.clone();
+                        let mut favs = self.db.get_favorite_folders();
+                        if favs.contains(&fname) {
+                            favs.retain(|x| x != &fname);
+                            fav_set.remove(&fname);
+                            self.set_feedback(
+                                &format!("Removed {} from favorites", fname),
+                                tc.feedback_ok,
+                            );
+                        } else {
+                            favs.push(fname.clone());
+                            fav_set.insert(fname.clone());
+                            self.set_feedback(
+                                &format!("Added {} to favorites", fname),
+                                tc.feedback_ok,
+                            );
+                        }
+                        self.db.save_favorite_folders(&favs);
+                    }
+                }
+                "F" => {
+                    if !is_favorites {
+                        let favs = self.db.get_favorite_folders();
+                        if favs.is_empty() {
+                            self.set_feedback("No favorites", tc.feedback_warn);
+                        } else {
+                            let tree = build_folder_tree(&favs);
+                            *display = flatten_folder_tree(&tree, "", 0, &self.folder_collapsed);
+                            idx = 0;
+                        }
+                    }
+                }
+                "ESC" | "q" => {
+                    return None;
+                }
+                "RESIZE" => {
+                    self.handle_resize();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn rebuild_folder_display(&self, display: &mut Vec<FolderEntry>, is_favorites: bool) {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let maildir_path = std::path::PathBuf::from(&home).join("Main/Maildir");
+        let mut folder_names = discover_maildir_folders(&maildir_path);
+        if is_favorites {
+            let favs: HashSet<String> = self.db.get_favorite_folders().into_iter().collect();
+            folder_names.retain(|f| favs.contains(f));
+        }
+        let tree = build_folder_tree(&folder_names);
+        *display = flatten_folder_tree(&tree, "", 0, &self.folder_collapsed);
+    }
+
+    fn open_folder(&mut self, folder: &str) {
+        self.current_view = "A".to_string();
+        self.in_source_view = false;
+        self.index = 0;
+
+        self.set_feedback(
+            &format!("Loading {}...", folder),
+            self.config.theme_colors.unread,
+        );
+
+        let mut filters = Filters::default();
+        filters.folder = Some(folder.to_string());
+        self.filtered_messages = self.db.get_messages(&filters, 500, 0);
+        for msg in &mut self.filtered_messages {
+            if let Some(st) = self.source_type_map.get(&msg.source_id) {
+                msg.source_type = st.clone();
+            }
+        }
+        self.sort_messages();
+        self.rebuild_display();
+
+        self.top.bg = self.config.theme_colors.top_bg;
+        self.set_feedback(
+            &format!("Folder: {} ({} messages)", folder, self.filtered_messages.len()),
+            self.config.theme_colors.feedback_ok,
+        );
+        self.render_all();
+    }
+}
+
+// --- Sorting ---
+
+impl App {
+    fn sort_messages(&mut self) {
+        match self.sort_order.as_str() {
+            "latest" => {
+                self.filtered_messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            }
+            "alphabetical" => {
+                self.filtered_messages.sort_by(|a, b| {
+                    let sa = a.subject.as_deref().unwrap_or("");
+                    let sb = b.subject.as_deref().unwrap_or("");
+                    sa.to_lowercase().cmp(&sb.to_lowercase())
+                });
+            }
+            "sender" | "from" => {
+                self.filtered_messages.sort_by(|a, b| {
+                    a.sender.to_lowercase().cmp(&b.sender.to_lowercase())
+                });
+            }
+            "unread" => {
+                self.filtered_messages.sort_by(|a, b| {
+                    a.read.cmp(&b.read).then(b.timestamp.cmp(&a.timestamp))
+                });
+            }
+            "source" => {
+                self.filtered_messages.sort_by(|a, b| {
+                    a.source_type.cmp(&b.source_type).then(b.timestamp.cmp(&a.timestamp))
+                });
+            }
+            _ => {
+                self.filtered_messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            }
+        }
+        if self.sort_inverted {
+            self.filtered_messages.reverse();
+        }
+    }
+
+    fn cycle_sort(&mut self) {
+        let orders = ["latest", "alphabetical", "sender", "from", "unread", "source"];
+        let idx = orders.iter().position(|&o| o == self.sort_order).unwrap_or(0);
+        self.sort_order = orders[(idx + 1) % orders.len()].to_string();
+        self.set_feedback(&format!("Sort: {}", self.sort_order), self.config.theme_colors.info_fg);
+        self.sort_messages();
+        self.rebuild_display();
+        self.render_all();
+    }
+
+    fn toggle_sort_invert(&mut self) {
+        self.sort_inverted = !self.sort_inverted;
+        let label = if self.sort_inverted { "inverted" } else { "normal" };
+        self.set_feedback(&format!("Sort direction: {}", label), self.config.theme_colors.info_fg);
+        self.sort_messages();
+        self.rebuild_display();
+        self.render_all();
+    }
+}
+
+// --- Threading ---
+
+impl App {
+    fn cycle_view_mode(&mut self) {
+        let tc = &self.config.theme_colors;
+        if !self.show_threaded && !self.group_by_folder {
+            self.show_threaded = true;
+            self.group_by_folder = false;
+            self.set_feedback("View mode: Threaded", tc.feedback_ok);
+        } else if self.show_threaded && !self.group_by_folder {
+            self.group_by_folder = true;
+            self.set_feedback("View mode: Folder-grouped", tc.feedback_ok);
+        } else {
+            self.show_threaded = false;
+            self.group_by_folder = false;
+            self.set_feedback("View mode: Flat", tc.feedback_ok);
+        }
+        self.index = 0;
+        self.rebuild_display();
+        self.render_all();
+    }
+
+    fn rebuild_display(&mut self) {
+        if !self.show_threaded {
+            self.display_messages.clear();
+            return;
+        }
+        let sections = if self.group_by_folder {
+            organizer::organize_by_folder(&self.filtered_messages, self.sort_inverted)
+        } else {
+            organizer::organize_messages(&self.filtered_messages, &self.sort_order, self.sort_inverted)
+        };
+
+        self.display_messages.clear();
+        for section in &sections {
+            let is_collapsed = self.section_collapsed.get(&section.name).copied().unwrap_or(false);
+            let mut header = Message::default_header();
+            header.subject = Some(section.display_name.clone());
+            header.content = format!("{} messages", section.messages.len());
+            header.source_type = section.source_type.clone();
+            header.is_header = true;
+            header.read = section.unread_count == 0;
+            // Store section name in thread_id for collapse tracking
+            header.thread_id = Some(section.name.clone());
+            if let Some(first_idx) = section.messages.first() {
+                header.timestamp = self.filtered_messages[*first_idx].timestamp;
+                header.source_id = self.filtered_messages[*first_idx].source_id;
+            }
+            self.display_messages.push(header);
+
+            if !is_collapsed {
+                for &idx in &section.messages {
+                    let mut msg = self.filtered_messages[idx].clone();
+                    // Don't clone heavy fields for display list (loaded on demand)
+                    msg.content = String::new();
+                    msg.html_content = None;
+                    msg.metadata = serde_json::Value::Null;
+                    msg.full_loaded = false;
+                    self.display_messages.push(msg);
+                }
+            }
+        }
+    }
+
+    fn toggle_collapse(&mut self) {
+        if !self.show_threaded { return; }
+        if let Some(msg) = self.display_messages.get(self.index) {
+            if msg.is_header {
+                if let Some(ref name) = msg.thread_id {
+                    let name = name.clone();
+                    let collapsed = self.section_collapsed.entry(name).or_insert(false);
+                    *collapsed = !*collapsed;
+                    self.rebuild_display();
+                    self.render_all();
+                }
+            }
+        }
+    }
+
+    fn collapse_current(&mut self) {
+        if !self.show_threaded { return; }
+        if let Some(msg) = self.display_messages.get(self.index) {
+            if msg.is_header {
+                if let Some(ref name) = msg.thread_id {
+                    let name = name.clone();
+                    self.section_collapsed.insert(name, true);
+                    self.rebuild_display();
+                    self.render_all();
+                }
+            }
+        }
+    }
+}
+
+// --- Message operations ---
+
+impl App {
+    fn open_message(&mut self) {
+        if self.show_threaded {
+            if let Some(msg) = self.display_messages.get_mut(self.index) {
+                if msg.is_header { return; }
+                self.browsed_ids.insert(msg.id);
+                if !msg.read {
+                    self.db.mark_as_read(msg.id);
+                    msg.read = true;
+                    // Also mark in filtered_messages
+                    if let Some(fm) = self.filtered_messages.iter_mut().find(|m| m.id == msg.id) {
+                        fm.read = true;
+                    }
+                }
+                if !msg.full_loaded {
+                    if let Some((content, html)) = self.db.get_message_content(msg.id) {
+                        msg.content = content;
+                        msg.html_content = html;
+                        msg.full_loaded = true;
+                    }
+                }
+            }
+        } else if let Some(msg) = self.filtered_messages.get_mut(self.index) {
+            self.browsed_ids.insert(msg.id);
+            if !msg.read {
+                self.db.mark_as_read(msg.id);
+                msg.read = true;
+            }
+            if !msg.full_loaded {
+                if let Some((content, html)) = self.db.get_message_content(msg.id) {
+                    msg.content = content;
+                    msg.html_content = html;
+                    msg.full_loaded = true;
+                }
+            }
+        }
+        self.render_all();
+    }
+
+    fn toggle_read(&mut self) {
+        if let Some(msg) = self.filtered_messages.get_mut(self.index) {
+            let new_state = self.db.toggle_read(msg.id);
+            msg.read = new_state;
+            self.render_all();
+        }
+    }
+
+    fn mark_all_read(&mut self) {
+        // Build filters matching current view
+        let filters = self.current_view_filters();
+        self.db.mark_all_as_read(filters.as_ref());
+        for msg in &mut self.filtered_messages {
+            msg.read = true;
+        }
+        self.set_feedback("Marked all as read", self.config.theme_colors.feedback_ok);
+        self.render_all();
+    }
+
+    fn toggle_star(&mut self) {
+        if let Some(msg) = self.filtered_messages.get_mut(self.index) {
+            let new_state = self.db.toggle_star(msg.id);
+            msg.starred = new_state;
+            self.render_all();
+        }
+    }
+
+    fn toggle_tag(&mut self) {
+        if let Some(msg) = self.filtered_messages.get(self.index) {
+            let id = msg.id;
+            if self.tagged.contains(&id) {
+                self.tagged.remove(&id);
+            } else {
+                self.tagged.insert(id);
+            }
+            if self.index < self.filtered_messages.len().saturating_sub(1) {
+                self.index += 1;
+            }
+            self.render_all();
+        }
+    }
+
+    fn tag_all_toggle(&mut self) {
+        if self.tagged.is_empty() {
+            // Tag all
+            for msg in &self.filtered_messages {
+                self.tagged.insert(msg.id);
+            }
+        } else {
+            // Untag all
+            self.tagged.clear();
+        }
+        self.render_all();
+    }
+
+    fn toggle_delete_mark(&mut self) {
+        if let Some(msg) = self.filtered_messages.get(self.index) {
+            let id = msg.id;
+            if self.delete_marked.contains(&id) {
+                self.delete_marked.remove(&id);
+            } else {
+                self.delete_marked.insert(id);
+            }
+            if self.index < self.filtered_messages.len().saturating_sub(1) {
+                self.index += 1;
+            }
+            self.render_all();
+        }
+    }
+
+    fn purge_deleted(&mut self) {
+        if self.delete_marked.is_empty() { return; }
+        let ids: Vec<i64> = self.delete_marked.iter().copied().collect();
+        self.db.delete_messages(&ids);
+        let count = ids.len();
+        self.delete_marked.clear();
+        self.filtered_messages.retain(|m| !ids.contains(&m.id));
+        if self.index >= self.filtered_messages.len() {
+            self.index = self.filtered_messages.len().saturating_sub(1);
+        }
+        self.set_feedback(&format!("Purged {} messages", count), self.config.theme_colors.feedback_ok);
+        self.render_all();
+    }
+
+    fn file_message(&mut self) {
+        if self.filtered_messages.is_empty() { return; }
+
+        // Build hint from save_folders
+        let shortcuts = self.config.save_folders.clone();
+        let mut keys: Vec<&String> = shortcuts.keys().collect();
+        keys.sort();
+        let hint: String = keys.iter()
+            .map(|k| {
+                let v = &shortcuts[*k];
+                let short = v.rsplit('.').next().unwrap_or(v);
+                format!("s{}:{}", k, short)
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let hint_display = if hint.is_empty() { String::new() } else { format!(" [{}]", hint) };
+
+        let tagged_count = self.tagged.len();
+        let tagged_hint = if tagged_count > 0 {
+            format!(" ({} tagged)", tagged_count)
+        } else {
+            String::new()
+        };
+
+        self.set_feedback(
+            &format!("Save to folder:{}{} B:Browse =:Config", hint_display, tagged_hint),
+            self.config.theme_colors.unread,
+        );
+
+        // Wait for sub-key
+        let Some(chr) = Input::getchr(Some(5)) else {
+            self.render_bottom_bar();
+            return;
+        };
+
+        if chr == "ESC" || chr == "\x1b" {
+            self.render_bottom_bar();
+            return;
+        }
+
+        if chr == "=" {
+            self.configure_save_shortcuts();
+            return;
+        }
+
+        // Determine destination folder
+        let dest = if let Some(folder) = shortcuts.get(&chr) {
+            folder.clone()
+        } else if chr == "B" {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            let maildir_path = std::path::PathBuf::from(&home).join("Main/Maildir");
+            let folder_names = discover_maildir_folders(&maildir_path);
+            let tree = build_folder_tree(&folder_names);
+            let mut browser_display = flatten_folder_tree(&tree, "", 0, &self.folder_collapsed);
+            if let Some(picked) = self.folder_browser_loop(&mut browser_display, false) {
+                self.handle_resize();
+                picked
+            } else {
+                self.handle_resize();
+                return;
+            }
+        } else if chr == "F" {
+            let favs = self.db.get_favorite_folders();
+            if favs.is_empty() {
+                self.set_feedback("No favorites. Use + in folder browser.", self.config.theme_colors.feedback_warn);
+                return;
+            }
+            let tree = build_folder_tree(&favs);
+            let mut browser_display = flatten_folder_tree(&tree, "", 0, &self.folder_collapsed);
+            if let Some(picked) = self.folder_browser_loop(&mut browser_display, true) {
+                self.handle_resize();
+                picked
+            } else {
+                self.handle_resize();
+                return;
+            }
+        } else {
+            // Type folder name
+            let initial = if chr == "ENTER" { String::new() } else { chr.clone() };
+            let typed = self.prompt("Move to folder: ", &initial);
+            if typed.is_empty() { return; }
+            typed
+        };
+
+        // Collect messages to file
+        let msg_ids: Vec<i64> = if !self.tagged.is_empty() {
+            self.filtered_messages.iter()
+                .filter(|m| self.tagged.contains(&m.id))
+                .map(|m| m.id)
+                .collect()
+        } else if let Some(msg) = self.filtered_messages.get(self.index) {
+            vec![msg.id]
+        } else {
+            return;
+        };
+
+        if msg_ids.is_empty() { return; }
+
+        let mut count = 0;
+        let mut failed = 0;
+
+        for &id in &msg_ids {
+            match self.file_single_message(id, &dest) {
+                Ok(_) => count += 1,
+                Err(_) => failed += 1,
+            }
+        }
+
+        // Remove filed messages from view
+        self.filtered_messages.retain(|m| !msg_ids.contains(&m.id));
+        if !self.tagged.is_empty() {
+            for &id in &msg_ids { self.tagged.remove(&id); }
+        }
+        if self.index >= self.filtered_messages.len() {
+            self.index = self.filtered_messages.len().saturating_sub(1);
+        }
+
+        let msg = format!(
+            "Moved {} message{} to {}",
+            count,
+            if count != 1 { "s" } else { "" },
+            dest
+        );
+        let color = if failed > 0 {
+            self.config.theme_colors.attachment
+        } else {
+            self.config.theme_colors.feedback_ok
+        };
+        self.set_feedback(&msg, color);
+        self.render_all();
+    }
+
+    fn file_single_message(&self, id: i64, dest: &str) -> Result<(), String> {
+        // Get message from DB with metadata
+        let msg = self.db.get_message(id).ok_or("Message not found")?;
+
+        // Move maildir file on disk if applicable
+        if let Some(file_path) = msg.metadata.get("maildir_file").and_then(|v| v.as_str()) {
+            if std::path::Path::new(file_path).exists() {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                let maildir_root = std::path::PathBuf::from(&home).join("Main/Maildir");
+                let dest_dir = maildir_root.join(format!(".{}", dest));
+                let cur_dir = dest_dir.join("cur");
+                let _ = std::fs::create_dir_all(&cur_dir);
+                let _ = std::fs::create_dir_all(dest_dir.join("new"));
+                let _ = std::fs::create_dir_all(dest_dir.join("tmp"));
+
+                // Move file
+                let filename = std::path::Path::new(file_path)
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("msg");
+                let new_path = cur_dir.join(filename);
+                if std::fs::rename(file_path, &new_path).is_ok() {
+                    let mut new_meta = msg.metadata.clone();
+                    new_meta["maildir_file"] =
+                        serde_json::json!(new_path.to_string_lossy().to_string());
+                    new_meta["maildir_folder"] = serde_json::json!(dest);
+                    self.db.update_message_folder(id, dest, &new_meta);
+                }
+            }
+        }
+
+        // Update folder + labels in DB
+        self.db.update_message_folder(id, dest, &msg.metadata);
+
+        // Mark as read
+        self.db.mark_as_read(id);
+
+        Ok(())
+    }
+
+    fn configure_save_shortcuts(&mut self) {
+        let mut shortcuts = self.config.save_folders.clone();
+
+        loop {
+            // Build display
+            let mut lines = vec![
+                style::bold(&style::fg("Save Folder Shortcuts", self.config.theme_colors.view_custom)),
+                String::new(),
+            ];
+            let mut keys: Vec<&String> = shortcuts.keys().collect();
+            keys.sort();
+            for k in &keys {
+                lines.push(format!("  s{} = {}", k, shortcuts[*k]));
+            }
+            if keys.is_empty() {
+                lines.push(style::fg("  (none configured)", self.config.theme_colors.hint_fg));
+            }
+            lines.push(String::new());
+            lines.push(style::fg(
+                "Press 0-9 to set, d+key to delete, ESC to finish",
+                self.config.theme_colors.hint_fg,
+            ));
+
+            self.right.set_text(&lines.join("\n"));
+            self.right.ix = 0;
+            self.right.full_refresh();
+            if self.right.border { self.right.border_refresh(); }
+
+            let Some(chr) = Input::getchr(None) else { continue };
+            match chr.as_str() {
+                "ESC" | "q" => break,
+                "d" => {
+                    self.set_feedback("Delete which key? (0-9)", self.config.theme_colors.feedback_warn);
+                    if let Some(key) = Input::getchr(Some(3)) {
+                        if shortcuts.remove(&key).is_some() {
+                            self.set_feedback(
+                                &format!("Removed shortcut s{}", key),
+                                self.config.theme_colors.feedback_ok,
+                            );
+                        }
+                    }
+                }
+                k if k.len() == 1
+                    && k.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) =>
+                {
+                    let default = shortcuts.get(k).cloned().unwrap_or_default();
+                    let folder = self.prompt(&format!("Folder for s{} (or 'b' to browse): ", k), &default);
+                    if folder == "b" {
+                        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                        let maildir_path = std::path::PathBuf::from(&home).join("Main/Maildir");
+                        let folder_names = discover_maildir_folders(&maildir_path);
+                        let tree = build_folder_tree(&folder_names);
+                        let mut browser_display = flatten_folder_tree(&tree, "", 0, &self.folder_collapsed);
+                        if let Some(picked) = self.folder_browser_loop(&mut browser_display, false) {
+                            shortcuts.insert(k.to_string(), picked);
+                        }
+                        self.handle_resize();
+                    } else if !folder.is_empty() {
+                        shortcuts.insert(k.to_string(), folder);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        self.config.save_folders = shortcuts;
+        self.config.save();
+        self.render_all();
+    }
+
+    fn copy_message_id(&mut self) {
+        if let Some(msg) = self.filtered_messages.get(self.index) {
+            let id_str = format!("heathrow:{}", msg.id);
+            crust::clipboard_copy(&id_str, "clipboard");
+            self.set_feedback(&format!("Copied: {}", id_str), self.config.theme_colors.feedback_ok);
+        }
+    }
+
+    fn copy_right_pane(&self) {
+        let text = self.right.text();
+        crust::clipboard_copy(&crust::strip_ansi(text), "clipboard");
+    }
+
+    /// Build a Filters struct matching the current view (for mark-all-read)
+    fn current_view_filters(&self) -> Option<Filters> {
+        match self.current_view.as_str() {
+            "A" => None,
+            "N" => {
+                let mut f = Filters::default();
+                f.is_read = Some(false);
+                Some(f)
+            }
+            _ => None,
+        }
+    }
+}
+
+// --- UI controls ---
+
+impl App {
+    fn cycle_width(&mut self) {
+        self.width = if self.width >= 6 { 1 } else { self.width + 1 };
+        self.handle_resize();
+    }
+
+    fn cycle_border(&mut self) {
+        self.border = (self.border + 1) % 4;
+        self.handle_resize();
+    }
+
+    fn cycle_date_format(&mut self) {
+        let formats = [
+            "%b %e", "%d/%m %H:%M", "%m/%d %H:%M", "%Y-%m-%d %H:%M",
+            "%d.%m %H:%M", "%d %b %H:%M", "%b %d %H:%M",
+        ];
+        let idx = formats.iter().position(|&f| f == self.date_format).unwrap_or(0);
+        self.date_format = formats[(idx + 1) % formats.len()].to_string();
+        self.render_all();
+    }
+
+    fn first_run_wizard(&mut self) {
+        let tc = self.config.theme_colors.clone();
+        self.render_all();
+
+        let welcome = format!("{}\n\n\
+{}\n\n\
+{}\n\
+{}\n\
+{}\n\n\
+{}\n\n\
+{}\n\
+{}\n\
+{}\n\
+{}\n\n\
+{}\n",
+            style::bold(&style::fg("Welcome to Kastrup!", tc.view_custom)),
+            "A unified terminal messaging hub for all your communication.",
+            style::fg("Kastrup connects to:", tc.unread),
+            "  Email (Maildir), RSS feeds, Discord, Slack, Telegram,",
+            "  WhatsApp, Messenger, Instagram, Reddit, WeeChat, and more.",
+            style::fg("To get started, set up your first source:", tc.unread),
+            style::fg("  1. Press S to open Sources view", tc.hint_fg),
+            style::fg("  2. Press 'a' to add a new source", tc.hint_fg),
+            style::fg("  3. For email, add a Maildir source pointing to ~/Maildir", tc.hint_fg),
+            style::fg("  4. For RSS, add feeds by URL", tc.hint_fg),
+            style::fg("Press any key to continue, or 'q' to quit.", tc.hint_fg),
+        );
+
+        self.right.set_text(&welcome);
+        self.right.ix = 0;
+        self.right.full_refresh();
+        if self.right.border { self.right.border_refresh(); }
+
+        self.top.say(&format!("{}{}",
+            style::fg(" Kastrup - ", tc.prefix_fg),
+            style::bold(&style::fg("Welcome", tc.view_custom))));
+
+        self.bottom.say(&style::fg(
+            " Press 'a' to add a Maildir source now, or any other key to continue",
+            tc.hint_fg));
+
+        if let Some(key) = Input::getchr(None) {
+            if key == "q" || key == "Q" {
+                self.running = false;
+                return;
+            }
+            if key == "a" {
+                // Quick Maildir setup
+                let maildir_path = self.prompt("Maildir path: ", "~/Maildir");
+                if !maildir_path.is_empty() {
+                    let expanded = maildir_path.replace("~/",
+                        &format!("{}/", std::env::var("HOME").unwrap_or_default()));
+                    if std::path::Path::new(&expanded).is_dir() {
+                        let now = database::now_secs();
+                        let config_json = serde_json::json!({"path": expanded}).to_string();
+                        let conn = self.db.conn.lock().unwrap();
+                        let _ = conn.execute(
+                            "INSERT INTO sources (name, plugin_type, enabled, config, capabilities, created_at, updated_at, poll_interval) \
+                             VALUES (?, 'maildir', 1, ?, '[\"read\",\"send\"]', ?, ?, 30)",
+                            rusqlite::params!["Local Maildir", config_json, now, now],
+                        );
+                        drop(conn);
+                        self.source_type_map = self.db.get_source_type_map();
+                        self.set_feedback("Maildir source added! Messages will sync on next poll.", tc.feedback_ok);
+                    } else {
+                        self.set_feedback(&format!("Path not found: {}", expanded), tc.feedback_warn);
+                    }
+                }
+            }
+        }
+    }
+
+    fn show_help(&mut self) {
+        let help = format!("{}\n\n\
+{}\n\
+  j/k, Up/Down   Navigate messages\n\
+  h/Left          Collapse thread\n\
+  Space            Toggle collapse\n\
+  PgDn/PgUp      Page down/up\n\
+  Home/End        First/last message\n\
+  Enter           Open message (mark read)\n\
+  n/p             Next/prev unread\n\
+  J               Jump to date\n\
+  G               Toggle threaded/flat view\n\n\
+{}\n\
+  A               All messages\n\
+  N               New (unread)\n\
+  S               Sources\n\
+  0-9             Custom views\n\
+  F1-F12          Extended views\n\
+  F               Favorites browser\n\
+  L               Load more messages\n\
+  Ctrl-R          Refresh current view\n\
+  Ctrl-F          Filter editor\n\
+  K               Kill (close) view\n\n\
+{}\n\
+  R               Toggle read/unread\n\
+  M               Mark all read\n\
+  */- toggle star\n\
+  t/T             Tag / tag all\n\
+  Ctrl-T          Tag by regex\n\
+  d               Mark for deletion\n\
+  <               Purge deleted\n\
+  u/U             Mark unseen\n\
+  Shift-Space     Mark browsed\n\n\
+{}\n\
+  r               Reply\n\
+  e               Reply in editor\n\
+  g               Reply-all\n\
+  f               Forward\n\
+  m               Compose new\n\
+  E               Edit draft\n\n\
+{}\n\
+  v               View/save attachments\n\
+  V               Inline image\n\
+  x               Open in external app\n\
+  X               Open HTML in browser\n\n\
+{}\n\
+  /               Search messages\n\
+  @               Address book\n\
+  l               Label message\n\
+  s               File/save message\n\
+  +               Add to favorites\n\
+  I               AI assistant\n\
+  Z               Timely actions\n\n\
+{}\n\
+  o               Cycle sort order\n\
+  i               Invert sort\n\
+  w               Cycle pane width\n\
+  c               Set top bar color\n\
+  B               Folder browser\n\
+  Ctrl-B          Cycle border style\n\
+  D               Cycle date format\n\
+  P               Preferences\n\
+  y/Y             Copy ID / copy content\n\
+  Ctrl-L          Redraw\n\
+  q               Quit",
+            style::bold("Kastrup - Messaging Hub"),
+            style::fg("Navigation", self.config.theme_colors.feedback_warn),
+            style::fg("Views", self.config.theme_colors.feedback_warn),
+            style::fg("Message Operations", self.config.theme_colors.feedback_warn),
+            style::fg("Compose / Reply", self.config.theme_colors.feedback_warn),
+            style::fg("Attachments / External", self.config.theme_colors.feedback_warn),
+            style::fg("Search / Misc", self.config.theme_colors.feedback_warn),
+            style::fg("UI", self.config.theme_colors.feedback_warn),
+        );
+        self.right.set_text(&help);
+        self.right.ix = 0;
+        self.right.full_refresh();
+    }
+
+    fn handle_resize(&mut self) {
+        let (cols, rows) = Crust::terminal_size();
+        self.cols = cols;
+        self.rows = rows;
+        let (top, left, right, bottom) = create_panes(cols, rows, self.width, self.border, &self.config);
+        self.top = top;
+        self.left = left;
+        self.right = right;
+        self.bottom = bottom;
+        // Restore per-view top bar bg color
+        self.restore_view_top_bg();
+        Crust::clear_screen();
+        self.render_all();
+    }
+
+    fn restore_view_top_bg(&mut self) {
+        if let Some(vw) = self.views.iter().find(|v| v.key_binding.as_deref() == Some(&self.current_view)) {
+            if let Ok(f) = serde_json::from_str::<serde_json::Value>(&vw.filters) {
+                if let Some(bg) = f["top_bg"].as_str().and_then(|s| s.parse::<u16>().ok()) {
+                    self.top.bg = bg;
+                } else if let Some(bg) = f["top_bg"].as_u64() {
+                    self.top.bg = bg as u16;
+                }
+            }
+        }
+    }
+
+    fn force_redraw(&mut self) {
+        self.handle_resize();
+    }
+
+    fn set_feedback(&mut self, msg: &str, color: u8) {
+        self.feedback_message = Some((msg.to_string(), color));
+        self.feedback_expires = Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        self.render_bottom_bar();
+    }
+
+    /// Prompt in the bottom bar, always restore status bar after
+    fn prompt(&mut self, label: &str, default: &str) -> String {
+        let result = self.bottom.ask_with_bg(label, default, self.config.theme_colors.cmd_bg);
+        // Restore bottom bar bg (ask_with_bg changes it to cmd_bg)
+        self.bottom.bg = self.config.theme_colors.bottom_bg;
+        self.render_bottom_bar();
+        result
+    }
+}
+
+// --- New feature methods ---
+
+impl App {
+    fn jump_to_date(&mut self) {
+        let input = self.prompt("Jump to date (yyyy-mm-dd): ", "");
+        self.render_bottom_bar();
+        if input.is_empty() { return; }
+        let parts: Vec<&str> = input.split('-').collect();
+        if parts.len() == 3 {
+            if let (Ok(y), Ok(m), Ok(d)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>(), parts[2].parse::<i64>()) {
+                // Approximate unix timestamp (good enough for jumping)
+                let target_ts = ((y - 1970) * 365 + (y - 1969) / 4) * 86400 + (m - 1) * 30 * 86400 + (d - 1) * 86400;
+                if let Some(pos) = self.filtered_messages.iter().position(|msg| msg.timestamp <= target_ts) {
+                    self.index = pos;
+                    self.render_all();
+                } else {
+                    self.set_feedback("No messages found at that date", self.config.theme_colors.feedback_warn);
+                }
+            } else {
+                self.set_feedback("Invalid date format", 196);
+            }
+        } else {
+            self.set_feedback("Use format: yyyy-mm-dd", 196);
+        }
+    }
+
+    fn open_external(&mut self) {
+        // x key: open in default browser (xdg-open / Firefox)
+        // Ensure full content loaded for HTML
+        if !self.filtered_messages.get(self.index).map(|m| m.full_loaded).unwrap_or(true) {
+            let id = self.filtered_messages[self.index].id;
+            if let Some((content, html)) = self.db.get_message_content(id) {
+                self.filtered_messages[self.index].content = content;
+                self.filtered_messages[self.index].html_content = html;
+                self.filtered_messages[self.index].full_loaded = true;
+            }
+        }
+        if let Some(msg) = self.filtered_messages.get(self.index) {
+            if let Some(link) = msg.metadata.get("link").and_then(|v| v.as_str()) {
+                let _ = std::process::Command::new("xdg-open").arg(link).spawn();
+                self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
+            } else if msg.html_content.is_some() || msg.content.trim_start().starts_with('<') {
+                let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
+                let html = msg.html_content.as_deref().unwrap_or(&msg.content);
+                if std::fs::write(&path, html).is_ok() {
+                    let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+                    self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
+                }
+            } else {
+                self.set_feedback("No link or HTML content", self.config.theme_colors.feedback_warn);
+            }
+        }
+    }
+
+    fn open_in_browser(&mut self) {
+        // X key: open in Scroll (terminal browser)
+        if let Some(msg) = self.filtered_messages.get(self.index) {
+            let url = if let Some(link) = msg.metadata.get("link").and_then(|v| v.as_str()) {
+                Some(link.to_string())
+            } else if msg.html_content.is_some() || msg.content.contains("<html") {
+                let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
+                let html = msg.html_content.as_deref().unwrap_or(&msg.content);
+                let _ = std::fs::write(&path, html);
+                Some(format!("file://{}", path))
+            } else {
+                None
+            };
+
+            if let Some(url) = url {
+                Crust::cleanup();
+                let _ = std::process::Command::new("scroll").arg(&url).status();
+                Crust::init();
+                Crust::clear_screen();
+                self.handle_resize();
+            } else {
+                self.set_feedback("No content to open", self.config.theme_colors.feedback_warn);
+            }
+        }
+    }
+
+    fn load_more(&mut self) {
+        let current_count = self.filtered_messages.len();
+        let filters = self.build_current_filters();
+        let more = self.db.get_messages(&filters, 500, current_count);
+        if more.is_empty() {
+            self.set_feedback("No more messages", self.config.theme_colors.feedback_info);
+        } else {
+            let count = more.len();
+            for mut msg in more {
+                if let Some(st) = self.source_type_map.get(&msg.source_id) {
+                    msg.source_type = st.clone();
+                }
+                self.filtered_messages.push(msg);
+            }
+            self.sort_messages();
+            self.rebuild_display();
+            self.set_feedback(&format!("Loaded {} more messages", count), self.config.theme_colors.feedback_ok);
+            self.render_all();
+        }
+    }
+
+    fn build_current_filters(&self) -> Filters {
+        let mut filters = Filters::default();
+        match self.current_view.as_str() {
+            "A" => {}
+            "N" => { filters.is_read = Some(false); }
+            "*" => { filters.is_starred = Some(true); }
+            key => {
+                if let Some(view) = self.views.iter().find(|v| v.key_binding.as_deref() == Some(key)) {
+                    if let Ok(f) = serde_json::from_str::<serde_json::Value>(&view.filters) {
+                        if let Some(rules) = f["rules"].as_array() {
+                            for rule in rules {
+                                let field = rule["field"].as_str().unwrap_or("");
+                                let value = &rule["value"];
+                                match field {
+                                    "read" => { filters.is_read = Some(!value.as_bool().unwrap_or(true)); }
+                                    "starred" => { filters.is_starred = value.as_bool(); }
+                                    "folder" => { filters.folder = value.as_str().map(|s| s.to_string()); }
+                                    "source_id" => { filters.source_id = value.as_i64(); }
+                                    "sender" => { filters.sender_pattern = value.as_str().map(|s| s.to_string()); }
+                                    "source_type" => { filters.source_type = value.as_str().map(|s| s.to_string()); }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        filters
+    }
+
+    fn refresh_view(&mut self) {
+        let view = self.current_view.clone();
+        if self.in_source_view {
+            self.show_sources();
+        } else {
+            self.switch_to_view(&view);
+        }
+        self.set_feedback("View refreshed", self.config.theme_colors.feedback_ok);
+    }
+
+    fn tag_by_regex(&mut self) {
+        let pattern = self.prompt("Tag regex: ", "");
+        self.render_bottom_bar();
+        if pattern.is_empty() { return; }
+        if let Ok(re) = regex::Regex::new(&pattern) {
+            let mut count = 0;
+            for msg in &self.filtered_messages {
+                let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
+                let subject = msg.subject.as_deref().unwrap_or("");
+                if re.is_match(sender) || re.is_match(subject) {
+                    self.tagged.insert(msg.id);
+                    count += 1;
+                }
+            }
+            self.set_feedback(&format!("Tagged {} messages", count), self.config.theme_colors.feedback_ok);
+            self.render_all();
+        } else {
+            self.set_feedback("Invalid regex", 196);
+        }
+    }
+
+    fn search_prompt(&mut self) {
+        let query = self.prompt("/", "");
+        self.render_bottom_bar();
+        if query.is_empty() { return; }
+
+        // Try notmuch first
+        let notmuch = std::process::Command::new("notmuch")
+            .args(["search", "--format=json", "--output=summary", &query])
+            .output();
+
+        if let Ok(output) = notmuch {
+            if output.status.success() {
+                let json_str = String::from_utf8_lossy(&output.stdout);
+                if let Ok(results) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
+                    if !results.is_empty() {
+                        // Search DB for matching content
+                        let mut filters = Filters::default();
+                        filters.content_pattern = Some(query.clone());
+                        self.filtered_messages = self.db.get_messages(&filters, 500, 0);
+                        for msg in &mut self.filtered_messages {
+                            if let Some(st) = self.source_type_map.get(&msg.source_id) {
+                                msg.source_type = st.clone();
+                            }
+                        }
+                        self.index = 0;
+                        self.set_feedback(&format!("Notmuch: {} results", self.filtered_messages.len()), self.config.theme_colors.feedback_ok);
+                        self.render_all();
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Fallback: simple DB substring search
+        let lower = query.to_lowercase();
+        if let Some(pos) = self.filtered_messages.iter().skip(self.index + 1).position(|msg| {
+            let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
+            let subject = msg.subject.as_deref().unwrap_or("");
+            sender.to_lowercase().contains(&lower)
+                || subject.to_lowercase().contains(&lower)
+                || msg.content.to_lowercase().contains(&lower)
+        }) {
+            self.index = self.index + 1 + pos;
+            self.render_all();
+        } else {
+            self.set_feedback("No matches found", self.config.theme_colors.feedback_warn);
+        }
+    }
+
+    fn set_view_color(&mut self) {
+        let input = self.prompt("Top bar color (0-255): ", "");
+        if let Ok(c) = input.parse::<u16>() {
+            self.top.bg = c;
+            // Persist to view's filters JSON in DB
+            if let Some(vw) = self.views.iter().find(|v| v.key_binding.as_deref() == Some(&self.current_view)) {
+                let mut f: serde_json::Value = serde_json::from_str(&vw.filters).unwrap_or(serde_json::json!({}));
+                f["top_bg"] = serde_json::json!(c.to_string());
+                let new_filters = serde_json::to_string(&f).unwrap_or_default();
+                let conn = self.db.conn.lock().unwrap();
+                let _ = conn.execute(
+                    "UPDATE views SET filters = ?, updated_at = ? WHERE key_binding = ?",
+                    rusqlite::params![new_filters, crate::database::now_secs(), self.current_view],
+                );
+            }
+            self.render_top_bar();
+        }
+    }
+
+    fn test_source(&mut self) {
+        if let Some(src) = self.sources_list.get(self.index) {
+            let name = src.name.clone();
+            let err = src.last_error.clone();
+            if let Some(err_msg) = err {
+                self.set_feedback(&format!("Source has error: {}", err_msg), 196);
+            } else {
+                self.set_feedback(&format!("Source '{}' looks OK", name), self.config.theme_colors.feedback_ok);
+            }
+        }
+    }
+
+    fn toggle_source(&mut self) {
+        if let Some(src) = self.sources_list.get(self.index) {
+            let sid = src.id;
+            let new_state = self.db.toggle_source_enabled(sid);
+            // Refresh sources list
+            self.sources_list = self.db.get_sources(false);
+            let label = if new_state { "enabled" } else { "disabled" };
+            self.set_feedback(&format!("Source {}", label), self.config.theme_colors.feedback_ok);
+            self.render_source_list();
+            self.render_source_info();
+        }
+    }
+
+    // --- Source management (Batch C) ---
+
+    fn add_source(&mut self) {
+        let stype = self.prompt("Source type (maildir/rss): ", "maildir");
+        if stype.is_empty() { return; }
+        match stype.as_str() {
+            "maildir" => {
+                let name = self.prompt("Source name: ", "Local Maildir");
+                if name.is_empty() { return; }
+                let path = self.prompt("Maildir path: ", "~/Maildir");
+                if path.is_empty() { return; }
+                let expanded = path.replace("~/", &format!("{}/", std::env::var("HOME").unwrap_or_default()));
+                let config = serde_json::json!({"path": expanded});
+                self.db.add_source(&name, "maildir", &config.to_string(), "[\"read\",\"send\"]", 30);
+                self.source_type_map = self.db.get_source_type_map();
+                self.set_feedback(&format!("Added source: {}", name), self.config.theme_colors.feedback_ok);
+            }
+            "rss" => {
+                let name = self.prompt("Source name: ", "RSS Feeds");
+                if name.is_empty() { return; }
+                let url = self.prompt("Feed URL: ", "");
+                if url.is_empty() { return; }
+                let config = serde_json::json!({"feeds": [{"url": url}]});
+                self.db.add_source(&name, "rss", &config.to_string(), "[\"read\"]", 3600);
+                self.source_type_map = self.db.get_source_type_map();
+                self.set_feedback(&format!("Added source: {}", name), self.config.theme_colors.feedback_ok);
+            }
+            _ => {
+                self.set_feedback(&format!("Unknown source type: {}", stype), self.config.theme_colors.feedback_warn);
+            }
+        }
+        self.sources_list = self.db.get_sources(false);
+        self.render_source_list();
+        self.render_source_info();
+    }
+
+    fn edit_source(&mut self) {
+        let (id, current_name) = match self.sources_list.get(self.index) {
+            Some(s) => (s.id, s.name.clone()),
+            None => return,
+        };
+        let name = self.prompt("Name: ", &current_name);
+        if !name.is_empty() {
+            let conn = self.db.conn.lock().unwrap();
+            let _ = conn.execute("UPDATE sources SET name = ? WHERE id = ?", rusqlite::params![name, id]);
+        }
+        self.sources_list = self.db.get_sources(false);
+        self.source_type_map = self.db.get_source_type_map();
+        self.render_source_list();
+        self.render_source_info();
+    }
+
+    fn delete_source(&mut self) {
+        let src = match self.sources_list.get(self.index) { Some(s) => s, None => return };
+        let name = src.name.clone();
+        let id = src.id;
+        self.set_feedback(&format!("Delete '{}' and all its messages? (y/n)", name), self.config.theme_colors.feedback_warn);
+        if let Some(key) = Input::getchr(Some(5)) {
+            if key == "y" || key == "Y" {
+                let conn = self.db.conn.lock().unwrap();
+                let _ = conn.execute("DELETE FROM messages WHERE source_id = ?", rusqlite::params![id]);
+                let _ = conn.execute("DELETE FROM sources WHERE id = ?", rusqlite::params![id]);
+                drop(conn);
+                self.sources_list = self.db.get_sources(false);
+                self.source_type_map = self.db.get_source_type_map();
+                if self.index >= self.sources_list.len() { self.index = self.sources_list.len().saturating_sub(1); }
+                self.set_feedback(&format!("Deleted: {}", name), self.config.theme_colors.feedback_ok);
+            } else {
+                self.set_feedback("Cancelled", self.config.theme_colors.feedback_info);
+            }
+        }
+        self.render_source_list();
+    }
+
+    fn set_source_color(&mut self) {
+        let src_id = match self.sources_list.get(self.index) { Some(s) => s.id, None => return };
+        let input = self.prompt("Color (0-255): ", "");
+        if let Ok(c) = input.parse::<u16>() {
+            let conn = self.db.conn.lock().unwrap();
+            let _ = conn.execute("UPDATE sources SET color = ? WHERE id = ?", rusqlite::params![c.to_string(), src_id]);
+            drop(conn);
+            self.sources_list = self.db.get_sources(false);
+            self.render_source_list();
+        }
+    }
+
+    fn set_source_poll_interval(&mut self) {
+        let (src_id, current_interval) = match self.sources_list.get(self.index) {
+            Some(s) => (s.id, s.poll_interval.to_string()),
+            None => return,
+        };
+        let input = self.prompt("Poll interval (seconds): ", &current_interval);
+        if let Ok(secs) = input.parse::<i64>() {
+            let conn = self.db.conn.lock().unwrap();
+            let _ = conn.execute("UPDATE sources SET poll_interval = ? WHERE id = ?", rusqlite::params![secs, src_id]);
+            drop(conn);
+            self.sources_list = self.db.get_sources(false);
+            self.set_feedback(&format!("Poll interval set to {}s", secs), self.config.theme_colors.feedback_ok);
+        }
+    }
+
+    // --- Labels, Unsee, Mark Browsed (Batch D) ---
+
+    fn label_message(&mut self) {
+        let tc = self.config.theme_colors.clone();
+        let tagged_hint = if !self.tagged.is_empty() { format!(" ({} tagged)", self.tagged.len()) } else { String::new() };
+        let action = self.prompt(&format!("Label{} (+add / -remove / ? list): ", tagged_hint), "+");
+        if action.is_empty() { return; }
+
+        if action.trim() == "?" {
+            // Show all labels
+            let labels: Vec<String> = {
+                let conn = self.db.conn.lock().unwrap();
+                let mut stmt = conn.prepare("SELECT DISTINCT json_each.value FROM messages, json_each(messages.labels) ORDER BY 1").unwrap();
+                stmt.query_map([], |r| r.get::<_, String>(0))
+                    .unwrap().filter_map(|r| r.ok()).collect()
+            };
+            self.right.set_text(&format!("{}\n\n{}",
+                style::bold(&style::fg("All Labels", tc.view_custom)),
+                labels.join("\n")));
+            self.right.ix = 0;
+            self.right.full_refresh();
+            if self.right.border { self.right.border_refresh(); }
+            return;
+        }
+
+        let adding = !action.starts_with('-');
+        let label_name = action.trim_start_matches('+').trim_start_matches('-').trim().to_string();
+        if label_name.is_empty() { return; }
+
+        let msg_ids: Vec<i64> = if !self.tagged.is_empty() {
+            self.filtered_messages.iter().filter(|m| self.tagged.contains(&m.id)).map(|m| m.id).collect()
+        } else {
+            self.filtered_messages.get(self.index).map(|m| vec![m.id]).unwrap_or_default()
+        };
+
+        let mut count = 0;
+        for &id in &msg_ids {
+            if let Some(msg) = self.filtered_messages.iter_mut().find(|m| m.id == id) {
+                if adding && !msg.labels.contains(&label_name) {
+                    msg.labels.push(label_name.clone());
+                    count += 1;
+                } else if !adding {
+                    if let Some(pos) = msg.labels.iter().position(|l| l == &label_name) {
+                        msg.labels.remove(pos);
+                        count += 1;
+                    }
+                }
+                let labels_json = serde_json::to_string(&msg.labels).unwrap_or_default();
+                let conn = self.db.conn.lock().unwrap();
+                let _ = conn.execute("UPDATE messages SET labels = ? WHERE id = ?", rusqlite::params![labels_json, id]);
+            }
+        }
+
+        if !self.tagged.is_empty() { self.tagged.clear(); }
+        let verb = if adding { "Added" } else { "Removed" };
+        self.set_feedback(&format!("{} '{}' on {} message(s)", verb, label_name, count), tc.feedback_ok);
+        self.render_all();
+    }
+
+    fn unsee_message(&mut self) {
+        if let Some(msg) = self.filtered_messages.get(self.index) {
+            self.browsed_ids.remove(&msg.id);
+            self.set_feedback("Message unseen", self.config.theme_colors.feedback_ok);
+        }
+    }
+
+    fn mark_browsed_as_read(&mut self) {
+        if self.browsed_ids.is_empty() {
+            self.set_feedback("No browsed messages", self.config.theme_colors.feedback_info);
+            return;
+        }
+        let count = self.browsed_ids.len();
+        for &id in &self.browsed_ids.clone() {
+            self.db.mark_as_read(id);
+            if let Some(msg) = self.filtered_messages.iter_mut().find(|m| m.id == id) {
+                msg.read = true;
+            }
+        }
+        self.browsed_ids.clear();
+        self.set_feedback(&format!("Marked {} browsed message(s) as read", count), self.config.theme_colors.feedback_ok);
+        self.render_all();
+    }
+
+    // --- Filter Editor, Kill View (Batch F) ---
+
+    fn edit_filter(&mut self) {
+        let tc = self.config.theme_colors.clone();
+        let view = self.views.iter().find(|v| v.key_binding.as_deref() == Some(&self.current_view));
+        let current_filters = view.map(|v| v.filters.clone()).unwrap_or_default();
+
+        let lines = vec![
+            style::bold(&style::fg("Filter Editor", tc.view_custom)),
+            String::new(),
+            style::fg(&format!("View: {}", self.current_view), tc.info_fg),
+            String::new(),
+            style::fg("Current filters:", tc.hint_fg),
+            style::fg(&current_filters, tc.info_fg),
+            String::new(),
+            style::fg("Press 'a' to add rule, 'd' to clear, ESC to close", tc.hint_fg),
+        ];
+
+        self.right.set_text(&lines.join("\n"));
+        self.right.ix = 0;
+        self.right.full_refresh();
+        if self.right.border { self.right.border_refresh(); }
+
+        loop {
+            let Some(key) = Input::getchr(None) else { continue };
+            match key.as_str() {
+                "a" => {
+                    let field = self.prompt("Field (folder/sender/source_id/read/starred): ", "folder");
+                    let op = self.prompt("Operator (=/like/!=): ", "like");
+                    let value = self.prompt("Value: ", "");
+                    if !field.is_empty() && !value.is_empty() {
+                        let mut f: serde_json::Value = serde_json::from_str(&current_filters).unwrap_or(serde_json::json!({"rules":[]}));
+                        if let Some(rules) = f["rules"].as_array_mut() {
+                            rules.push(serde_json::json!({"field": field, "op": op, "value": value}));
+                        }
+                        let new_filters = serde_json::to_string(&f).unwrap_or_default();
+                        let conn = self.db.conn.lock().unwrap();
+                        let _ = conn.execute("UPDATE views SET filters = ? WHERE key_binding = ?",
+                            rusqlite::params![new_filters, self.current_view]);
+                        drop(conn);
+                        self.views = self.db.get_views();
+                        self.set_feedback("Rule added", tc.feedback_ok);
+                    }
+                    break;
+                }
+                "d" => {
+                    let f = serde_json::json!({"rules":[]});
+                    let new_filters = serde_json::to_string(&f).unwrap_or_default();
+                    let conn = self.db.conn.lock().unwrap();
+                    let _ = conn.execute("UPDATE views SET filters = ? WHERE key_binding = ?",
+                        rusqlite::params![new_filters, self.current_view]);
+                    drop(conn);
+                    self.views = self.db.get_views();
+                    self.set_feedback("Filters cleared", tc.feedback_ok);
+                    break;
+                }
+                "ESC" | "q" => break,
+                _ => {}
+            }
+        }
+        self.render_all();
+    }
+
+    fn kill_view(&mut self) {
+        if self.current_view == "A" || self.current_view == "N" || self.current_view == "*" {
+            self.set_feedback("Cannot delete built-in views", self.config.theme_colors.feedback_warn);
+            return;
+        }
+        self.set_feedback(&format!("Delete view '{}'? (y/n)", self.current_view), self.config.theme_colors.feedback_warn);
+        if let Some(key) = Input::getchr(Some(5)) {
+            if key == "y" || key == "Y" {
+                let conn = self.db.conn.lock().unwrap();
+                let _ = conn.execute("DELETE FROM views WHERE key_binding = ?", rusqlite::params![self.current_view]);
+                drop(conn);
+                self.views = self.db.get_views();
+                self.set_feedback("View deleted", self.config.theme_colors.feedback_ok);
+                self.switch_to_view("A");
+            } else {
+                self.set_feedback("Cancelled", self.config.theme_colors.feedback_info);
+            }
+        }
+    }
+
+    // --- Edit Message (Batch G) ---
+
+    fn edit_message(&mut self) {
+        let msg = match self.filtered_messages.get(self.index) { Some(m) => m, None => return };
+        let id = msg.id;
+        // Ensure full content
+        if !msg.full_loaded {
+            if let Some((content, _html)) = self.db.get_message_content(id) {
+                self.filtered_messages[self.index].content = content;
+                self.filtered_messages[self.index].full_loaded = true;
+            }
+        }
+        let content = self.filtered_messages[self.index].content.clone();
+        let tmpfile = format!("/tmp/kastrup_edit_{}.txt", std::process::id());
+        let _ = std::fs::write(&tmpfile, &content);
+
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".into());
+        Crust::cleanup();
+        let _ = std::process::Command::new("sh").arg("-c").arg(&format!("{} {}", editor, crust::shell_escape(&tmpfile))).status();
+        Crust::init();
+        Crust::clear_screen();
+
+        if let Ok(edited) = std::fs::read_to_string(&tmpfile) {
+            if edited.trim() != content.trim() {
+                let conn = self.db.conn.lock().unwrap();
+                let _ = conn.execute("UPDATE messages SET content = ? WHERE id = ?", rusqlite::params![edited, id]);
+                drop(conn);
+                self.filtered_messages[self.index].content = edited;
+                self.set_feedback("Message updated", self.config.theme_colors.feedback_ok);
+            }
+        }
+        let _ = std::fs::remove_file(&tmpfile);
+        self.handle_resize();
+    }
+
+    fn show_preferences(&mut self) {
+        let pw = 60u16.min(self.cols - 4);
+        let ph = 18u16.min(self.rows - 6);
+        let px = (self.cols.saturating_sub(pw)) / 2;
+        let py = (self.rows.saturating_sub(ph)) / 2;
+        let mut popup = Pane::new(px, py, pw, ph, 255, 235);
+        popup.border = true;
+        popup.border_refresh();
+
+        let mut items: Vec<(&str, PrefType)> = vec![
+            ("Default view", PrefType::Text(self.config.default_view.clone())),
+            ("Color theme", PrefType::Choice(vec!["Default", "Mutt", "Ocean", "Forest", "Amber"], self.config.color_theme.clone())),
+            ("Date format", PrefType::Choice(vec!["%b %e", "%d/%m %H:%M", "%m/%d %H:%M", "%Y-%m-%d %H:%M", "%d.%m %H:%M", "%d %b %H:%M", "%b %d %H:%M"], self.date_format.clone())),
+            ("Sort order", PrefType::Choice(vec!["latest", "alphabetical", "sender", "from", "conversation", "unread", "source"], self.sort_order.clone())),
+            ("Sort inverted", PrefType::Bool(self.sort_inverted)),
+            ("Pane width", PrefType::Num(self.width as u8, 1, 6)),
+            ("Border style", PrefType::Num(self.border, 0, 3)),
+            ("Confirm purge", PrefType::Bool(self.config.confirm_purge)),
+            ("Download folder", PrefType::Text(self.config.download_folder.clone())),
+            ("Editor args", PrefType::Text(self.config.editor_args.clone())),
+            ("Default email", PrefType::Text(self.config.default_email.clone())),
+            ("SMTP command", PrefType::Text(self.config.smtp_command.clone())),
+        ];
+
+        let mut sel = 0usize;
+        let mut dirty = false;
+        let mut theme_preset_changed = false;
+
+        loop {
+            let mut lines = Vec::new();
+            lines.push(format!(" {}", style::fg(&style::bold("Preferences"), self.config.theme_colors.view_custom)));
+            lines.push(String::new());
+
+            for (i, (label, ptype)) in items.iter().enumerate() {
+                let label_fmt = format!("{:<18}", label);
+                let value_str = match ptype {
+                    PrefType::Bool(v) => if *v { style::fg("Yes", self.config.theme_colors.feedback_ok) } else { style::fg("No", 196) },
+                    PrefType::Choice(_, current) => style::fg(current, self.config.theme_colors.view_custom),
+                    PrefType::Text(v) => if v.len() > 25 { format!("{}...", &v[..22]) } else { v.clone() },
+                    PrefType::Num(v, _, _) => format!("{}", v),
+                };
+                if i == sel {
+                    lines.push(format!(" {} \u{25C0} {} \u{25B6}", style::reverse(&label_fmt), value_str));
+                } else {
+                    lines.push(format!(" {}   {}  ", label_fmt, value_str));
+                }
+            }
+            lines.push(String::new());
+            lines.push(style::fg(" j/k navigate  l/h change  Enter edit  ESC save & close", self.config.theme_colors.hint_fg));
+
+            popup.set_text(&lines.join("\n"));
+            popup.ix = 0;
+            popup.full_refresh();
+
+            let Some(key) = Input::getchr(None) else { continue };
+            match key.as_str() {
+                "ESC" | "q" => break,
+                "j" | "DOWN" => { if sel < items.len() - 1 { sel += 1; } }
+                "k" | "UP" => { if sel > 0 { sel -= 1; } }
+                "l" | "RIGHT" => { next_pref(&mut items[sel].1); dirty = true; if sel == 1 { theme_preset_changed = true; } }
+                "h" | "LEFT" => { prev_pref(&mut items[sel].1); dirty = true; if sel == 1 { theme_preset_changed = true; } }
+                "ENTER" => {
+                    if sel == 1 {
+                        // Color theme: open theme color detail editor
+                        self.show_theme_colors_popup();
+                        dirty = true;
+                        // Full redraw after theme color sub-popup
+                        self.handle_resize();
+                        popup.full_refresh();
+                        popup.border_refresh();
+                    } else {
+                        let label = items[sel].0.to_string();
+                        match &mut items[sel].1 {
+                            PrefType::Text(val) => {
+                                let new_val = self.prompt(&format!("{}: ", label), val);
+                                if !new_val.is_empty() { *val = new_val; dirty = true; }
+                                // Restore popup's bottom hint (prompt overwrites status bar)
+                                self.bottom.say(&style::fg(" j/k navigate  l/h change  Enter edit  ESC save & close", self.config.theme_colors.hint_fg));
+                            }
+                            _ => { next_pref(&mut items[sel].1); dirty = true; }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Apply settings back
+        if dirty {
+            for (label, ptype) in &items {
+                match (*label, ptype) {
+                    ("Default view", PrefType::Text(v)) => self.config.default_view = v.clone(),
+                    ("Color theme", PrefType::Choice(_, v)) => {
+                        self.config.color_theme = v.clone();
+                        if theme_preset_changed {
+                            self.config.theme_colors = config::ThemeColors::for_theme(v);
+                        }
+                    }
+                    ("Date format", PrefType::Choice(_, v)) => { self.date_format = v.clone(); self.config.date_format = v.clone(); }
+                    ("Sort order", PrefType::Choice(_, v)) => self.sort_order = v.clone(),
+                    ("Sort inverted", PrefType::Bool(v)) => self.sort_inverted = *v,
+                    ("Pane width", PrefType::Num(v, _, _)) => self.width = *v as u16,
+                    ("Border style", PrefType::Num(v, _, _)) => self.border = *v,
+                    ("Confirm purge", PrefType::Bool(v)) => self.config.confirm_purge = *v,
+                    ("Download folder", PrefType::Text(v)) => self.config.download_folder = v.clone(),
+                    ("Editor args", PrefType::Text(v)) => self.config.editor_args = v.clone(),
+                    ("Default email", PrefType::Text(v)) => self.config.default_email = v.clone(),
+                    ("SMTP command", PrefType::Text(v)) => self.config.smtp_command = v.clone(),
+                    _ => {}
+                }
+            }
+            self.config.save();
+            self.sort_messages();
+            self.rebuild_display();
+        }
+        self.handle_resize(); // Rebuild panes (restore_view_top_bg called inside)
+        self.render_top_bar();
+    }
+
+    fn show_theme_colors_popup(&mut self) {
+        let pw = 50u16.min(self.cols - 4);
+        let ph = 30u16.min(self.rows - 4);
+        let px = (self.cols.saturating_sub(pw)) / 2;
+        let py = (self.rows.saturating_sub(ph)) / 2;
+        let mut popup = Pane::new(px, py, pw, ph, 255, 235);
+        popup.border = true;
+        popup.border_refresh();
+
+        // Build editable color list from theme_colors
+        let mut colors: Vec<(&str, u8)> = vec![
+            ("Unread", self.config.theme_colors.unread),
+            ("Read", self.config.theme_colors.read),
+            ("Accent", self.config.theme_colors.accent),
+            ("Thread", self.config.theme_colors.thread),
+            ("DM", self.config.theme_colors.dm),
+            ("Tag", self.config.theme_colors.tag),
+            ("Star", self.config.theme_colors.star),
+            ("Quote 1", self.config.theme_colors.quote1),
+            ("Quote 2", self.config.theme_colors.quote2),
+            ("Quote 3", self.config.theme_colors.quote3),
+            ("Quote 4", self.config.theme_colors.quote4),
+            ("Signature", self.config.theme_colors.sig),
+            ("Link", self.config.theme_colors.link),
+            ("Email", self.config.theme_colors.src_email),
+            ("Discord", self.config.theme_colors.src_discord),
+            ("Slack", self.config.theme_colors.src_slack),
+            ("Telegram", self.config.theme_colors.src_telegram),
+            ("WhatsApp", self.config.theme_colors.src_whatsapp),
+            ("Reddit", self.config.theme_colors.src_reddit),
+            ("RSS", self.config.theme_colors.src_rss),
+            ("Web", self.config.theme_colors.src_web),
+            ("Messenger", self.config.theme_colors.src_messenger),
+            ("Instagram", self.config.theme_colors.src_instagram),
+            ("WeeChat", self.config.theme_colors.src_weechat),
+        ];
+
+        let mut sel = 0usize;
+
+        loop {
+            let mut lines = Vec::new();
+            lines.push(format!(" {}", style::fg(&style::bold("Theme Colors"), self.config.theme_colors.view_custom)));
+            lines.push(String::new());
+            for (i, (label, val)) in colors.iter().enumerate() {
+                let swatch = style::fg("\u{2588}\u{2588}\u{2588}", *val);
+                let label_fmt = format!("{:<12}", label);
+                if i == sel {
+                    lines.push(format!(" {} \u{25C0} {} {:>3} \u{25B6}", style::reverse(&label_fmt), swatch, val));
+                } else {
+                    lines.push(format!(" {}   {} {:>3}  ", label_fmt, swatch, val));
+                }
+            }
+            lines.push(String::new());
+            lines.push(style::fg(" h/l:\u{00B1}1  H/L:\u{00B1}10  Enter:type  ESC:done", self.config.theme_colors.hint_fg));
+
+            popup.set_text(&lines.join("\n"));
+            popup.ix = 0;
+            popup.full_refresh();
+
+            let Some(key) = Input::getchr(None) else { continue };
+            match key.as_str() {
+                "ESC" | "q" => break,
+                "j" | "DOWN" => { if sel < colors.len() - 1 { sel += 1; } }
+                "k" | "UP" => { if sel > 0 { sel -= 1; } }
+                "l" | "RIGHT" => { colors[sel].1 = (colors[sel].1 as u16 + 1).min(255) as u8; }
+                "h" | "LEFT" => { colors[sel].1 = colors[sel].1.saturating_sub(1); }
+                "L" => { colors[sel].1 = (colors[sel].1 as u16 + 10).min(255) as u8; }
+                "H" => { colors[sel].1 = colors[sel].1.saturating_sub(10); }
+                "ENTER" => {
+                    let input = self.prompt("Color (0-255): ", &colors[sel].1.to_string());
+                    self.render_bottom_bar();
+                    if let Ok(v) = input.parse::<u8>() { colors[sel].1 = v; }
+                }
+                _ => {}
+            }
+        }
+
+        // Apply colors back
+        let tc = &mut self.config.theme_colors;
+        tc.unread = colors[0].1;   tc.read = colors[1].1;
+        tc.accent = colors[2].1;   tc.thread = colors[3].1;
+        tc.dm = colors[4].1;       tc.tag = colors[5].1;
+        tc.star = colors[6].1;     tc.quote1 = colors[7].1;
+        tc.quote2 = colors[8].1;   tc.quote3 = colors[9].1;
+        tc.quote4 = colors[10].1;  tc.sig = colors[11].1;
+        tc.link = colors[12].1;    tc.src_email = colors[13].1;
+        tc.src_discord = colors[14].1;  tc.src_slack = colors[15].1;
+        tc.src_telegram = colors[16].1; tc.src_whatsapp = colors[17].1;
+        tc.src_reddit = colors[18].1;   tc.src_rss = colors[19].1;
+        tc.src_web = colors[20].1;      tc.src_messenger = colors[21].1;
+        tc.src_instagram = colors[22].1; tc.src_weechat = colors[23].1;
+        self.render_all();
+    }
+}
+
+// --- Compose / Reply / Forward ---
+
+impl App {
+    /// Get the "From:" identity string for composing.
+    /// Uses default_email, or the first identity if configured.
+    fn compose_from(&self) -> String {
+        if let Some((_key, ident)) = self.config.identities.iter().next() {
+            if !ident.name.is_empty() {
+                format!("{} <{}>", ident.name, ident.email)
+            } else {
+                ident.email.clone()
+            }
+        } else {
+            self.config.default_email.clone()
+        }
+    }
+
+    /// Get the email address (bare) for the identity.
+    fn compose_email(&self) -> String {
+        if let Some((_key, ident)) = self.config.identities.iter().next() {
+            ident.email.clone()
+        } else {
+            self.config.default_email.clone()
+        }
+    }
+
+    /// Get signature text for the identity, if any.
+    fn compose_signature(&self) -> String {
+        if let Some((_key, ident)) = self.config.identities.iter().next() {
+            if !ident.signature.is_empty() {
+                return format!("-- \n{}", ident.signature);
+            }
+        }
+        String::new()
+    }
+
+    /// Ensure the selected message has full content loaded.
+    fn ensure_full_content(&mut self) {
+        if self.index >= self.filtered_messages.len() { return; }
+        if !self.filtered_messages[self.index].full_loaded {
+            let msg_id = self.filtered_messages[self.index].id;
+            if let Some((content, html)) = self.db.get_message_content(msg_id) {
+                self.filtered_messages[self.index].content = content;
+                self.filtered_messages[self.index].html_content = html;
+                self.filtered_messages[self.index].full_loaded = true;
+            }
+        }
+    }
+
+    fn reply(&mut self, _force_editor: bool) {
+        if self.filtered_messages.is_empty() { return; }
+        self.ensure_full_content();
+        let msg = &self.filtered_messages[self.index];
+
+        let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
+        let subject = msg.subject.as_deref().unwrap_or("");
+        let re_subject = if subject.starts_with("Re:") {
+            subject.to_string()
+        } else {
+            format!("Re: {}", subject)
+        };
+        let date = format_timestamp(msg.timestamp, "%Y-%m-%d %H:%M");
+        let from = self.compose_from();
+        let reply_to = self.compose_email();
+        let sig = self.compose_signature();
+
+        let mut template = String::new();
+        template.push_str(&format!("From: {}\n", from));
+        template.push_str(&format!("To: {}\n", msg.sender));
+        template.push_str("Cc: \n");
+        template.push_str("Bcc: \n");
+        template.push_str(&format!("Reply-To: {}\n", reply_to));
+        template.push_str(&format!("Subject: {}\n", re_subject));
+        template.push('\n');
+        template.push('\n');
+        template.push_str(&format!("On {}, {} wrote:\n", date, sender));
+
+        // Get content, falling back to HTML conversion
+        let content = self.get_display_content(msg);
+        for line in content.lines() {
+            template.push_str(&format!("> {}\n", line));
+        }
+
+        if !sig.is_empty() {
+            template.push('\n');
+            template.push_str(&sig);
+            template.push('\n');
+        }
+
+        self.run_editor_compose(&template);
+    }
+
+    fn reply_all(&mut self) {
+        if self.filtered_messages.is_empty() { return; }
+        self.ensure_full_content();
+        let msg = &self.filtered_messages[self.index];
+
+        let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
+        let subject = msg.subject.as_deref().unwrap_or("");
+        let re_subject = if subject.starts_with("Re:") {
+            subject.to_string()
+        } else {
+            format!("Re: {}", subject)
+        };
+        let date = format_timestamp(msg.timestamp, "%Y-%m-%d %H:%M");
+        let from = self.compose_from();
+        let reply_to = self.compose_email();
+        let my_email = reply_to.to_lowercase();
+        let sig = self.compose_signature();
+
+        // Build Cc from original recipients + cc, minus self and original sender
+        let to_list = parse_json_recipients(&msg.recipients);
+        let cc_list = msg.cc.as_deref().map(parse_json_recipients).unwrap_or_default();
+        let all_cc: Vec<&str> = to_list
+            .split(", ")
+            .chain(cc_list.split(", "))
+            .filter(|a| {
+                !a.is_empty()
+                    && !a.to_lowercase().contains(&my_email)
+                    && !a.to_lowercase().contains(&msg.sender.to_lowercase())
+            })
+            .collect();
+        let cc = all_cc.join(", ");
+
+        let mut template = String::new();
+        template.push_str(&format!("From: {}\n", from));
+        template.push_str(&format!("To: {}\n", msg.sender));
+        template.push_str(&format!("Cc: {}\n", cc));
+        template.push_str("Bcc: \n");
+        template.push_str(&format!("Reply-To: {}\n", reply_to));
+        template.push_str(&format!("Subject: {}\n", re_subject));
+        template.push('\n');
+        template.push('\n');
+        template.push_str(&format!("On {}, {} wrote:\n", date, sender));
+
+        let content = self.get_display_content(msg);
+        for line in content.lines() {
+            template.push_str(&format!("> {}\n", line));
+        }
+
+        if !sig.is_empty() {
+            template.push('\n');
+            template.push_str(&sig);
+            template.push('\n');
+        }
+
+        self.run_editor_compose(&template);
+    }
+
+    fn forward(&mut self) {
+        if self.filtered_messages.is_empty() { return; }
+        self.ensure_full_content();
+        let msg = &self.filtered_messages[self.index];
+
+        let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
+        let subject = msg.subject.as_deref().unwrap_or("");
+        let fwd_subject = if subject.starts_with("Fwd:") {
+            subject.to_string()
+        } else {
+            format!("Fwd: {}", subject)
+        };
+        let date = format_timestamp(msg.timestamp, "%Y-%m-%d %H:%M");
+        let from = self.compose_from();
+        let reply_to = self.compose_email();
+        let sig = self.compose_signature();
+
+        let mut template = String::new();
+        template.push_str(&format!("From: {}\n", from));
+        template.push_str("To: \n");
+        template.push_str("Cc: \n");
+        template.push_str("Bcc: \n");
+        template.push_str(&format!("Reply-To: {}\n", reply_to));
+        template.push_str(&format!("Subject: {}\n", fwd_subject));
+        template.push('\n');
+        template.push('\n');
+        template.push_str("---------- Forwarded message ----------\n");
+        template.push_str(&format!("From: {}\n", sender));
+        template.push_str(&format!("Date: {}\n", date));
+        template.push_str(&format!("Subject: {}\n", subject));
+        template.push('\n');
+
+        let content = self.get_display_content(msg);
+        template.push_str(&content);
+        template.push('\n');
+
+        if !sig.is_empty() {
+            template.push('\n');
+            template.push_str(&sig);
+            template.push('\n');
+        }
+
+        self.run_editor_compose(&template);
+    }
+
+    fn compose_new(&mut self) {
+        // Check for postponed messages
+        let conn = self.db.conn.lock().unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM postponed", [], |r| r.get(0)).unwrap_or(0);
+        drop(conn);
+
+        if count > 0 {
+            self.set_feedback(&format!("{} postponed draft(s). Recall? (y/n)", count), self.config.theme_colors.unread);
+            if let Some(key) = Input::getchr(Some(5)) {
+                if key == "y" || key == "Y" {
+                    let conn = self.db.conn.lock().unwrap();
+                    let draft: Option<(i64, String)> = conn.query_row(
+                        "SELECT id, data FROM postponed ORDER BY created_at DESC LIMIT 1",
+                        [], |r| Ok((r.get(0)?, r.get(1)?))
+                    ).ok();
+                    if let Some((draft_id, data)) = draft {
+                        let _ = conn.execute("DELETE FROM postponed WHERE id = ?", rusqlite::params![draft_id]);
+                        drop(conn);
+                        self.run_editor_compose(&data);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Normal compose
+        let from = self.compose_from();
+        let reply_to = self.compose_email();
+        let sig = self.compose_signature();
+
+        let mut template = String::new();
+        template.push_str(&format!("From: {}\n", from));
+        template.push_str("To: \n");
+        template.push_str("Cc: \n");
+        template.push_str("Bcc: \n");
+        template.push_str(&format!("Reply-To: {}\n", reply_to));
+        template.push_str("Subject: \n");
+        template.push('\n');
+        template.push('\n');
+
+        if !sig.is_empty() {
+            template.push_str(&sig);
+            template.push('\n');
+        }
+
+        self.run_editor_compose(&template);
+    }
+
+    /// Get displayable text content from a message, converting HTML if needed.
+    fn get_display_content(&self, msg: &Message) -> String {
+        let use_html = msg.html_content.is_some()
+            && (msg.content.is_empty()
+                || msg.content.contains("HTML messages are not supported")
+                || msg.content.contains("not displayed")
+                || msg.content.trim().len() < 20);
+        if use_html {
+            html_to_text(msg.html_content.as_deref().unwrap_or(""))
+        } else {
+            msg.content.clone()
+        }
+    }
+
+    fn load_compose_plugins(&self) -> Vec<(String, String, String)> {
+        let dir = home_dir().join(".heathrow/plugins/compose");
+        let mut plugins = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                    let key = regex::Regex::new(r"key:\s*'([^']+)'").ok()
+                        .and_then(|r| r.captures(&content))
+                        .and_then(|c| c.get(1))
+                        .map(|m| m.as_str().to_string());
+                    let label = regex::Regex::new(r"label:\s*'([^']+)'").ok()
+                        .and_then(|r| r.captures(&content))
+                        .and_then(|c| c.get(1))
+                        .map(|m| m.as_str().to_string());
+                    let command = regex::Regex::new(r"command:\s*'([^']+)'").ok()
+                        .and_then(|r| r.captures(&content))
+                        .and_then(|c| c.get(1))
+                        .map(|m| m.as_str().to_string());
+                    if let (Some(k), Some(l), Some(c)) = (key, label, command) {
+                        plugins.push((k, l, c));
+                    }
+                }
+            }
+        }
+        plugins
+    }
+
+    fn run_editor_compose(&mut self, template: &str) {
+        let tmpfile = format!("/tmp/kastrup_compose_{}.eml", std::process::id());
+        if std::fs::write(&tmpfile, template).is_err() {
+            self.set_feedback("Failed to create temp file", 196);
+            return;
+        }
+
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".into());
+        let editor_args = self.config.editor_args.clone();
+
+        Crust::cleanup();
+
+        // Find cursor position (line after first blank line = body start)
+        let cursor_line = template
+            .lines()
+            .position(|l| l.is_empty())
+            .unwrap_or(0)
+            + 2;
+
+        // Build full command string and pass through sh -c to handle quoted args properly
+        let escaped_file = crust::shell_escape(&tmpfile);
+        let cmd_str = if editor.contains("vim") || editor.contains("vi") {
+            format!("{} +{} {} {}", editor, cursor_line, editor_args, escaped_file)
+        } else {
+            format!("{} {} {}", editor, editor_args, escaped_file)
+        };
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd_str)
+            .status();
+
+        Crust::init();
+        Crust::clear_screen();
+
+        if let Ok(s) = status {
+            if s.success() {
+                if let Ok(content) = std::fs::read_to_string(&tmpfile) {
+                    if content.trim() != template.trim() {
+                        let tc = self.config.theme_colors.clone();
+                        self.handle_resize();
+                        // Post-editor loop with compose plugins and attachments
+                        let mut attachments: Vec<String> = Vec::new();
+                        let plugins = self.load_compose_plugins();
+                        loop {
+                            let plugin_hints: String = plugins.iter()
+                                .map(|(k, l, _)| format!(" {}:{}", k, l)).collect();
+                            let att_hint = if attachments.is_empty() { String::new() }
+                                else { format!(" [{}att]", attachments.len()) };
+                            let prompt_text = format!(
+                                " Enter:Send  e:Re-edit  p:Postpone  a:Attach{}{} ESC:Cancel",
+                                plugin_hints, att_hint);
+                            self.bottom.say(&style::fg(&prompt_text, tc.hint_fg));
+                            let Some(key) = Input::getchr(None) else { continue };
+                            match key.as_str() {
+                                "ENTER" => {
+                                    let final_content = std::fs::read_to_string(&tmpfile)
+                                        .unwrap_or_else(|_| content.clone());
+                                    if attachments.is_empty() {
+                                        self.handle_composed_message(&final_content);
+                                    } else {
+                                        self.handle_composed_message_with_attachments(&final_content, &attachments);
+                                    }
+                                    break;
+                                }
+                                "e" => {
+                                    let _ = std::fs::remove_file(&tmpfile);
+                                    self.run_editor_compose(&content);
+                                    return;
+                                }
+                                "p" => {
+                                    let conn = self.db.conn.lock().unwrap();
+                                    let now = database::now_secs();
+                                    let _ = conn.execute("INSERT INTO postponed (data, created_at) VALUES (?, ?)",
+                                        rusqlite::params![content, now]);
+                                    drop(conn);
+                                    self.set_feedback("Message postponed", tc.feedback_ok);
+                                    break;
+                                }
+                                "a" => {
+                                    let path = self.prompt("Attach file: ", "");
+                                    if !path.is_empty() {
+                                        let expanded = path.replace("~/",
+                                            &format!("{}/", std::env::var("HOME").unwrap_or_default()));
+                                        if std::path::Path::new(&expanded).exists() {
+                                            attachments.push(expanded);
+                                            self.set_feedback(&format!("{} attachment(s)", attachments.len()), tc.feedback_ok);
+                                        } else {
+                                            self.set_feedback("File not found", tc.feedback_warn);
+                                        }
+                                    }
+                                    continue;
+                                }
+                                "ESC" => {
+                                    self.set_feedback("Cancelled", tc.feedback_info);
+                                    break;
+                                }
+                                _ => {
+                                    let plugin = plugins.iter().find(|(k, _, _)| k == key.as_str()).cloned();
+                                    if let Some((_, label, command)) = plugin {
+                                        let pick_file = format!("/tmp/kastrup_plugin_pick_{}.txt", std::process::id());
+                                        let _ = std::fs::remove_file(&pick_file);
+                                        let cmd = command.replace("%{pick_file}", &crust::shell_escape(&pick_file));
+                                        Crust::cleanup();
+                                        print!("\x1b[2J\x1b[H");
+                                        let _ = std::process::Command::new("sh").arg("-c").arg(&cmd).status();
+                                        Crust::init();
+                                        Crust::clear_screen();
+                                        if let Ok(files) = std::fs::read_to_string(&pick_file) {
+                                            let paths: Vec<String> = files.lines()
+                                                .map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+                                            if !paths.is_empty() {
+                                                attachments.extend(paths);
+                                                self.set_feedback(&format!("{}: {} file(s) attached", label, attachments.len()), tc.feedback_ok);
+                                            }
+                                        }
+                                        let _ = std::fs::remove_file(&pick_file);
+                                        self.handle_resize();
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        self.set_feedback(
+                            "Cancelled (no changes)",
+                            self.config.theme_colors.feedback_info,
+                        );
+                    }
+                }
+            }
+        }
+
+        let _ = std::fs::remove_file(&tmpfile);
+        // Force full redraw after returning from editor (pane caches are stale)
+        self.handle_resize();
+    }
+
+    fn handle_composed_message_with_attachments(&mut self, content: &str, attachments: &[String]) {
+        let mut from = String::new();
+        let mut to = String::new();
+        let mut cc = String::new();
+        let mut bcc = String::new();
+        let mut subject = String::new();
+        let mut reply_to = String::new();
+        let mut body_lines = Vec::new();
+        let mut in_body = false;
+        for line in content.lines() {
+            if in_body { body_lines.push(line); }
+            else if line.trim().is_empty() { in_body = true; }
+            else if let Some(val) = line.strip_prefix("From: ") { from = val.trim().to_string(); }
+            else if let Some(val) = line.strip_prefix("To: ") { to = val.trim().to_string(); }
+            else if let Some(val) = line.strip_prefix("Cc: ") { cc = val.trim().to_string(); }
+            else if let Some(val) = line.strip_prefix("Bcc: ") { bcc = val.trim().to_string(); }
+            else if let Some(val) = line.strip_prefix("Subject: ") { subject = val.trim().to_string(); }
+            else if let Some(val) = line.strip_prefix("Reply-To: ") { reply_to = val.trim().to_string(); }
+        }
+        let body = body_lines.join("\n");
+        if to.is_empty() || body.trim().is_empty() {
+            self.set_feedback("Cancelled (empty To or body)", self.config.theme_colors.feedback_warn);
+            return;
+        }
+        if self.config.smtp_command.is_empty() {
+            self.set_feedback("No SMTP command configured (set in Preferences)", self.config.theme_colors.feedback_warn);
+            return;
+        }
+        let boundary = format!("kastrup-boundary-{}", std::process::id());
+        let mut rfc_msg = String::new();
+        rfc_msg.push_str(&format!("From: {}\n", from));
+        rfc_msg.push_str(&format!("To: {}\n", to));
+        if !cc.is_empty() { rfc_msg.push_str(&format!("Cc: {}\n", cc)); }
+        if !bcc.is_empty() { rfc_msg.push_str(&format!("Bcc: {}\n", bcc)); }
+        if !reply_to.is_empty() { rfc_msg.push_str(&format!("Reply-To: {}\n", reply_to)); }
+        rfc_msg.push_str(&format!("Subject: {}\n", subject));
+        rfc_msg.push_str("MIME-Version: 1.0\n");
+        rfc_msg.push_str(&format!("Content-Type: multipart/mixed; boundary=\"{}\"\n", boundary));
+        rfc_msg.push('\n');
+        rfc_msg.push_str(&format!("--{}\n", boundary));
+        rfc_msg.push_str("Content-Type: text/plain; charset=UTF-8\n\n");
+        rfc_msg.push_str(&body);
+        rfc_msg.push('\n');
+        for att_path in attachments {
+            let fname = std::path::Path::new(att_path).file_name()
+                .and_then(|f| f.to_str()).unwrap_or("attachment");
+            if let Ok(data) = std::fs::read(att_path) {
+                let encoded = base64_encode(&data);
+                rfc_msg.push_str(&format!("--{}\n", boundary));
+                rfc_msg.push_str(&format!("Content-Type: application/octet-stream; name=\"{}\"\n", fname));
+                rfc_msg.push_str("Content-Transfer-Encoding: base64\n");
+                rfc_msg.push_str(&format!("Content-Disposition: attachment; filename=\"{}\"\n\n", fname));
+                for chunk in encoded.as_bytes().chunks(76) {
+                    rfc_msg.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+                    rfc_msg.push('\n');
+                }
+            }
+        }
+        rfc_msg.push_str(&format!("--{}--\n", boundary));
+        let smtp_tmpfile = format!("/tmp/kastrup_send_{}.eml", std::process::id());
+        if std::fs::write(&smtp_tmpfile, &rfc_msg).is_err() {
+            self.set_feedback("Failed to write send file", 196);
+            return;
+        }
+        let result = std::process::Command::new("sh").arg("-c")
+            .arg(&format!("{} < '{}'", self.config.smtp_command, smtp_tmpfile)).status();
+        let _ = std::fs::remove_file(&smtp_tmpfile);
+        match result {
+            Ok(s) if s.success() => {
+                self.set_feedback(&format!("Sent to {} ({} attachment(s))", to, attachments.len()), self.config.theme_colors.feedback_ok);
+            }
+            _ => { self.set_feedback("Send failed", 196); }
+        }
+    }
+
+    fn handle_composed_message(&mut self, content: &str) {
+        // Parse headers and body
+        let mut from = String::new();
+        let mut to = String::new();
+        let mut cc = String::new();
+        let mut bcc = String::new();
+        let mut subject = String::new();
+        let mut reply_to = String::new();
+        let mut body_lines = Vec::new();
+        let mut in_body = false;
+
+        for line in content.lines() {
+            if in_body {
+                body_lines.push(line);
+            } else if line.trim().is_empty() {
+                in_body = true;
+            } else if let Some(val) = line.strip_prefix("From: ") {
+                from = val.trim().to_string();
+            } else if let Some(val) = line.strip_prefix("To: ") {
+                to = val.trim().to_string();
+            } else if let Some(val) = line.strip_prefix("Cc: ") {
+                cc = val.trim().to_string();
+            } else if let Some(val) = line.strip_prefix("Bcc: ") {
+                bcc = val.trim().to_string();
+            } else if let Some(val) = line.strip_prefix("Subject: ") {
+                subject = val.trim().to_string();
+            } else if let Some(val) = line.strip_prefix("Reply-To: ") {
+                reply_to = val.trim().to_string();
+            }
+        }
+
+        let body = body_lines.join("\n");
+
+        if to.is_empty() || body.trim().is_empty() {
+            self.set_feedback(
+                "Cancelled (empty To or body)",
+                self.config.theme_colors.feedback_warn,
+            );
+            return;
+        }
+
+        // Per-identity SMTP: check From header against identities
+        let smtp = self.config.identities.iter()
+            .find(|(_, id)| from.contains(&id.email))
+            .and_then(|(_, id)| id.smtp.as_ref())
+            .unwrap_or(&self.config.smtp_command);
+
+        // Build RFC822-style message for SMTP
+        if smtp.is_empty() {
+            self.set_feedback(
+                "No SMTP command configured (set in Preferences)",
+                self.config.theme_colors.feedback_warn,
+            );
+            return;
+        }
+
+        let mut rfc_msg = String::new();
+        rfc_msg.push_str(&format!("From: {}\n", from));
+        rfc_msg.push_str(&format!("To: {}\n", to));
+        if !cc.is_empty() {
+            rfc_msg.push_str(&format!("Cc: {}\n", cc));
+        }
+        if !bcc.is_empty() {
+            rfc_msg.push_str(&format!("Bcc: {}\n", bcc));
+        }
+        if !reply_to.is_empty() {
+            rfc_msg.push_str(&format!("Reply-To: {}\n", reply_to));
+        }
+        rfc_msg.push_str(&format!("Subject: {}\n", subject));
+        rfc_msg.push_str("MIME-Version: 1.0\n");
+        rfc_msg.push_str("Content-Type: text/plain; charset=UTF-8\n");
+        rfc_msg.push('\n');
+        rfc_msg.push_str(&body);
+
+        let smtp_tmpfile = format!("/tmp/kastrup_send_{}.eml", std::process::id());
+        if std::fs::write(&smtp_tmpfile, &rfc_msg).is_err() {
+            self.set_feedback("Failed to write send file", 196);
+            return;
+        }
+
+        let result = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&format!("{} < '{}'", smtp, smtp_tmpfile))
+            .status();
+        let _ = std::fs::remove_file(&smtp_tmpfile);
+
+        match result {
+            Ok(s) if s.success() => {
+                self.set_feedback(
+                    &format!("Sent to {}", to),
+                    self.config.theme_colors.feedback_ok,
+                );
+            }
+            _ => {
+                self.set_feedback("Send failed", 196);
+            }
+        }
+    }
+}
+
+// --- Attachment Viewing ---
+
+impl App {
+    fn view_attachments(&mut self) {
+        if self.filtered_messages.is_empty() { return; }
+        let msg = &self.filtered_messages[self.index];
+        if msg.attachments.is_empty() {
+            self.set_feedback("No attachments", self.config.theme_colors.feedback_warn);
+            return;
+        }
+
+        let maildir_file = msg
+            .metadata
+            .get("maildir_file")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // Filter out image attachments (those are handled by V key)
+        let attachments: Vec<serde_json::Value> = msg.attachments.iter()
+            .filter(|a| !is_image_attachment(a))
+            .cloned()
+            .collect();
+        if attachments.is_empty() {
+            self.set_feedback("No non-image attachments (press V for images)", self.config.theme_colors.feedback_info);
+            return;
+        }
+        let mut att_index = 0usize;
+        let mut att_tagged: HashSet<usize> = HashSet::new();
+
+        loop {
+            // Render attachment list in right pane
+            let tc = &self.config.theme_colors;
+            let mut lines = Vec::new();
+            lines.push(style::bold(&style::fg("Attachments:", tc.attachment)));
+            lines.push(String::new());
+
+            for (i, att) in attachments.iter().enumerate() {
+                let name = att
+                    .get("name")
+                    .or_else(|| att.get("filename"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unnamed");
+                let size = att
+                    .get("size")
+                    .and_then(|v| v.as_u64())
+                    .map(|s| format!(" ({})", format_file_size(s)))
+                    .unwrap_or_default();
+                let ctype = att
+                    .get("content_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let tag = if att_tagged.contains(&i) {
+                    style::fg("* ", tc.star)
+                } else {
+                    "  ".to_string()
+                };
+
+                if i == att_index {
+                    lines.push(format!(
+                        "{}{}{}",
+                        style::fg("\u{2192} ", tc.unread),
+                        tag,
+                        style::bold(&style::fg(
+                            &format!("{}{} {}", name, size, ctype),
+                            255
+                        ))
+                    ));
+                } else {
+                    lines.push(format!(
+                        "  {}{}",
+                        tag,
+                        style::fg(&format!("{}{} {}", name, size, ctype), 250)
+                    ));
+                }
+            }
+
+            let tagged_hint = if att_tagged.is_empty() {
+                String::new()
+            } else {
+                format!("  ({} tagged)", att_tagged.len())
+            };
+            lines.push(String::new());
+            lines.push(style::fg(
+                &format!(
+                    "t:Tag  T:All  o/Enter:Open  s:Save{}  ESC:Back",
+                    tagged_hint
+                ),
+                self.config.theme_colors.hint_fg,
+            ));
+
+            self.right.set_text(&lines.join("\n"));
+            self.right.ix = 0;
+            self.right.full_refresh();
+            if self.right.border {
+                self.right.border_refresh();
+            }
+
+            self.bottom.say(&style::fg(
+                " j/k:Navigate  t:Tag  T:Tag all  o:Open  s:Save  ESC:Back",
+                self.config.theme_colors.hint_fg,
+            ));
+
+            let Some(key) = Input::getchr(None) else {
+                continue;
+            };
+            match key.as_str() {
+                "j" | "DOWN" => {
+                    att_index = (att_index + 1) % attachments.len();
+                }
+                "k" | "UP" => {
+                    att_index = if att_index == 0 {
+                        attachments.len() - 1
+                    } else {
+                        att_index - 1
+                    };
+                }
+                "t" => {
+                    if att_tagged.contains(&att_index) {
+                        att_tagged.remove(&att_index);
+                    } else {
+                        att_tagged.insert(att_index);
+                    }
+                    att_index = (att_index + 1) % attachments.len();
+                }
+                "T" => {
+                    if att_tagged.len() == attachments.len() {
+                        att_tagged.clear();
+                    } else {
+                        for i in 0..attachments.len() {
+                            att_tagged.insert(i);
+                        }
+                    }
+                }
+                "o" | "ENTER" => {
+                    self.extract_and_open_attachment(
+                        maildir_file.as_deref(),
+                        &attachments,
+                        att_index,
+                        true,
+                    );
+                }
+                "s" => {
+                    let targets: Vec<usize> = if att_tagged.is_empty() {
+                        vec![att_index]
+                    } else {
+                        att_tagged.iter().copied().collect()
+                    };
+                    for &idx in &targets {
+                        let name = attachments[idx]
+                            .get("name")
+                            .or_else(|| attachments[idx].get("filename"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unnamed");
+                        let dl = self.config.download_folder.replace(
+                            '~',
+                            &std::env::var("HOME").unwrap_or_default(),
+                        );
+                        let default_dest = format!("{}/{}", dl, name);
+                        let dest = self.prompt("Save to: ", &default_dest);
+                        if !dest.is_empty() {
+                            self.extract_and_save_attachment(
+                                maildir_file.as_deref(),
+                                &attachments,
+                                idx,
+                                &dest,
+                            );
+                        }
+                    }
+                }
+                "ESC" | "q" | "h" | "LEFT" => break,
+                _ => {}
+            }
+        }
+
+        self.render_all();
+    }
+
+    /// Extract an attachment from a maildir file and either open or save it.
+    fn extract_and_open_attachment(
+        &mut self,
+        maildir_file: Option<&str>,
+        attachments: &[serde_json::Value],
+        idx: usize,
+        open: bool,
+    ) {
+        let att = &attachments[idx];
+        let name = att
+            .get("name")
+            .or_else(|| att.get("filename"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unnamed");
+        let dest = format!("/tmp/kastrup_att_{}", name);
+
+        let Some(mf) = maildir_file else {
+            self.set_feedback("No source file available", self.config.theme_colors.feedback_warn);
+            return;
+        };
+
+        if !std::path::Path::new(mf).exists() {
+            self.set_feedback("Mail file not found on disk", self.config.theme_colors.feedback_warn);
+            return;
+        }
+
+        // Extract attachment using Python (always available, handles MIME properly)
+        let py_script = format!(
+            r#"
+import email, sys, os
+with open(sys.argv[1], 'rb') as f:
+    msg = email.message_from_binary_file(f)
+target = sys.argv[2]
+dest = sys.argv[3]
+for part in msg.walk():
+    fn = part.get_filename()
+    if fn and fn == target:
+        data = part.get_payload(decode=True)
+        if data:
+            with open(dest, 'wb') as out:
+                out.write(data)
+            sys.exit(0)
+# Fallback: try by index
+idx = int(sys.argv[4])
+i = 0
+for part in msg.walk():
+    if part.get_filename() or (part.get_content_maintype() != 'multipart' and part.get_content_maintype() != 'text'):
+        if i == idx:
+            data = part.get_payload(decode=True)
+            if data:
+                with open(dest, 'wb') as out:
+                    out.write(data)
+                sys.exit(0)
+        i += 1
+"#
+        );
+
+        let result = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(&py_script)
+            .arg(mf)
+            .arg(name)
+            .arg(&dest)
+            .arg(idx.to_string())
+            .output();
+
+        let extracted = result.is_ok() && std::path::Path::new(&dest).exists();
+
+        if !extracted {
+            self.set_feedback(
+                &format!("Could not extract: {}", name),
+                self.config.theme_colors.feedback_warn,
+            );
+            return;
+        }
+
+        if open {
+            let _ = std::process::Command::new("xdg-open").arg(&dest).spawn();
+            self.set_feedback(
+                &format!("Opened: {}", name),
+                self.config.theme_colors.feedback_ok,
+            );
+        }
+    }
+
+    /// Extract an attachment and save to a specific destination path.
+    fn extract_and_save_attachment(
+        &mut self,
+        maildir_file: Option<&str>,
+        attachments: &[serde_json::Value],
+        idx: usize,
+        dest: &str,
+    ) {
+        let att = &attachments[idx];
+        let name = att
+            .get("name")
+            .or_else(|| att.get("filename"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unnamed");
+        let tmp_dest = format!("/tmp/kastrup_att_{}", name);
+
+        // Extract to tmp first
+        self.extract_and_open_attachment(maildir_file, attachments, idx, false);
+
+        // Copy to final destination
+        if std::fs::metadata(&tmp_dest).is_ok() {
+            match std::fs::copy(&tmp_dest, dest) {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&tmp_dest);
+                    self.set_feedback(
+                        &format!("Saved: {}", dest),
+                        self.config.theme_colors.feedback_ok,
+                    );
+                }
+                Err(e) => {
+                    self.set_feedback(
+                        &format!("Save failed: {}", e),
+                        self.config.theme_colors.feedback_warn,
+                    );
+                }
+            }
+        } else {
+            self.set_feedback(
+                &format!("Could not extract: {}", name),
+                self.config.theme_colors.feedback_warn,
+            );
+        }
+    }
+}
+
+// --- Inline Image Display ---
+
+impl App {
+    fn toggle_inline_image(&mut self) {
+        if self.showing_image {
+            self.clear_inline_image();
+            self.render_message_content();
+            return;
+        }
+
+        if self.filtered_messages.is_empty() { return; }
+
+        // Ensure full content loaded
+        if !self.filtered_messages[self.index].full_loaded {
+            let msg_id = self.filtered_messages[self.index].id;
+            if let Some((content, html)) = self.db.get_message_content(msg_id) {
+                self.filtered_messages[self.index].content = content;
+                self.filtered_messages[self.index].html_content = html;
+                self.filtered_messages[self.index].full_loaded = true;
+            }
+        }
+        let msg = &self.filtered_messages[self.index];
+
+        // Collect image URLs
+        let mut urls: Vec<String> = Vec::new();
+
+        // From attachments (Discord/chat)
+        for att in &msg.attachments {
+            let url = att.get("url").or_else(|| att.get("proxy_url")).and_then(|v| v.as_str());
+            if let Some(url) = url {
+                if url.starts_with("http") && is_image_attachment(att) {
+                    urls.push(url.to_string());
+                }
+            }
+        }
+
+        // From HTML content
+        let html = msg.html_content.as_deref()
+            .or_else(|| if msg.content.trim_start().starts_with('<') { Some(msg.content.as_str()) } else { None });
+        if let Some(html) = html {
+            for url in extract_image_urls(html) {
+                if url.starts_with("http") {
+                    urls.push(url);
+                }
+            }
+        }
+
+        urls.dedup();
+
+        if urls.is_empty() {
+            self.set_feedback("No images found", self.config.theme_colors.feedback_info);
+            return;
+        }
+
+        self.set_feedback(&format!("Loading {} image(s)...", urls.len()), self.config.theme_colors.unread);
+
+        // Download to cache
+        let cache_dir = home_dir().join(".heathrow/image_cache");
+        let _ = std::fs::create_dir_all(&cache_dir);
+
+        let mut paths: Vec<String> = Vec::new();
+        for url in urls.iter().take(10) {
+            let ext = url.rsplit('.').next()
+                .and_then(|e| {
+                    let e = e.split('?').next().unwrap_or(e);
+                    if e.len() <= 5 { Some(e) } else { None }
+                })
+                .unwrap_or("jpg");
+            let hash = simple_hash(url);
+            let cache_path = cache_dir.join(format!("{}.{}", hash, ext));
+
+            if cache_path.exists() && std::fs::metadata(&cache_path).map(|m| m.len() > 100).unwrap_or(false) {
+                paths.push(cache_path.to_string_lossy().to_string());
+                continue;
+            }
+
+            // Download
+            let agent = ureq::AgentBuilder::new()
+                .timeout_connect(std::time::Duration::from_secs(5))
+                .timeout_read(std::time::Duration::from_secs(10))
+                .build();
+            if let Ok(resp) = agent.get(url).call() {
+                let mut bytes = Vec::new();
+                if std::io::Read::read_to_end(&mut resp.into_reader(), &mut bytes).is_ok() && bytes.len() > 100 {
+                    let _ = std::fs::write(&cache_path, &bytes);
+                    paths.push(cache_path.to_string_lossy().to_string());
+                }
+            }
+        }
+
+        if paths.is_empty() {
+            self.set_feedback("Download failed", self.config.theme_colors.feedback_warn);
+            return;
+        }
+
+        // Display using glow
+        let display = glow::Display::new();
+        if !display.supported() {
+            self.set_feedback("Image display not supported in this terminal", self.config.theme_colors.feedback_warn);
+            return;
+        }
+
+        let label = if paths.len() == 1 { "1 image".to_string() } else { format!("{} images", paths.len()) };
+        self.right.set_text(&style::fg(&format!(" [{}]  Press ESC to return", label), self.config.theme_colors.hint_fg));
+        self.right.full_refresh();
+        if self.right.border { self.right.border_refresh(); }
+
+        // If multiple images, use montage to composite (if available), otherwise show first
+        let display_path = if paths.len() > 1 {
+            let composite = cache_dir.join("composite.png");
+            let cols = (paths.len() as f64).sqrt().ceil() as usize;
+            let result = std::process::Command::new("montage")
+                .args(&paths)
+                .args(["-geometry", "+2+2", "-tile", &format!("{}x", cols), "-background", "none"])
+                .arg(composite.to_str().unwrap_or("/tmp/composite.png"))
+                .status();
+            if result.map(|s| s.success()).unwrap_or(false) && composite.exists() {
+                composite.to_string_lossy().to_string()
+            } else {
+                paths[0].clone()
+            }
+        } else {
+            paths[0].clone()
+        };
+
+        self.image_display = Some(display);
+        if let Some(ref mut disp) = self.image_display {
+            let img_x = self.right.x;
+            let img_y = self.right.y + 1;
+            let img_w = self.right.w.saturating_sub(2);
+            let img_h = self.right.h.saturating_sub(2);
+            disp.show(&display_path, img_x, img_y, img_w, img_h);
+        }
+        self.showing_image = true;
+    }
+
+    fn clear_inline_image(&mut self) {
+        if !self.showing_image { return; }
+        if let Some(ref mut disp) = self.image_display {
+            disp.clear(self.right.x, self.right.y, self.right.w, self.right.h, self.cols, self.rows);
+        }
+        self.image_display = None;
+        self.showing_image = false;
+    }
+}
+
+// --- Batch I-N feature methods ---
+
+impl App {
+    // Batch J: AI Assistant
+    fn ai_assistant(&mut self) {
+        let (is_header, sender, subject, content) = match self.filtered_messages.get(self.index) {
+            Some(m) => (
+                m.is_header,
+                m.sender_name.as_deref().unwrap_or(&m.sender).to_string(),
+                m.subject.as_deref().unwrap_or("").to_string(),
+                if m.content.len() > 3000 { m.content[..3000].to_string() } else { m.content.clone() },
+            ),
+            None => return,
+        };
+        if is_header { return; }
+
+        let tc = self.config.theme_colors.clone();
+        self.set_feedback("AI: d=Draft  s=Summarize  t=Translate  a=Ask...", tc.unread);
+
+        let Some(key) = Input::getchr(Some(10)) else {
+            self.render_bottom_bar();
+            return;
+        };
+
+        let ai_prompt = match key.as_str() {
+            "d" => format!("Draft a professional reply to this email.\nFrom: {}\nSubject: {}\n\n{}", sender, subject, content),
+            "s" => format!("Summarize this message concisely.\nFrom: {}\nSubject: {}\n\n{}", sender, subject, content),
+            "t" => format!("Translate this message to English.\nFrom: {}\nSubject: {}\n\n{}", sender, subject, content),
+            "a" => {
+                let question = self.prompt("Ask AI: ", "");
+                if question.is_empty() { return; }
+                format!("{}\n\nContext, email from {} about {}:\n{}", question, sender, subject, content)
+            }
+            _ => { self.render_bottom_bar(); return; }
+        };
+
+        self.set_feedback("Asking AI...", tc.unread);
+
+        // Try claude CLI first, then curl to OpenAI
+        let result = std::process::Command::new("claude")
+            .arg("-p")
+            .arg(&ai_prompt)
+            .output();
+
+        let response = if let Ok(output) = result {
+            if output.status.success() {
+                String::from_utf8_lossy(&output.stdout).to_string()
+            } else {
+                self.ai_fallback_openai(&ai_prompt)
+            }
+        } else {
+            self.ai_fallback_openai(&ai_prompt)
+        };
+
+        if response.is_empty() { return; }
+
+        self.right.set_text(&format!("{}\n\n{}",
+            style::bold(&style::fg("AI Response", tc.view_custom)), response));
+        self.right.ix = 0;
+        self.right.full_refresh();
+        if self.right.border { self.right.border_refresh(); }
+        self.set_feedback("AI response shown in right pane", tc.feedback_ok);
+    }
+
+    fn ai_fallback_openai(&mut self, ai_prompt: &str) -> String {
+        let tc = self.config.theme_colors.clone();
+        let api_key = std::fs::read_to_string("/home/.safe/openai.txt")
+            .unwrap_or_default().trim().to_string();
+        if api_key.is_empty() {
+            self.set_feedback("No AI available (install claude CLI or set OpenAI key)", tc.feedback_warn);
+            return String::new();
+        }
+        let body = serde_json::json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": ai_prompt}],
+            "max_tokens": 800
+        });
+        let resp = std::process::Command::new("curl")
+            .args(["-s", "-X", "POST", "https://api.openai.com/v1/chat/completions",
+                   "-H", "Content-Type: application/json",
+                   "-H", &format!("Authorization: Bearer {}", api_key),
+                   "-d", &body.to_string()])
+            .output();
+        if let Ok(o) = resp {
+            let json_str = String::from_utf8_lossy(&o.stdout);
+            serde_json::from_str::<serde_json::Value>(&json_str).ok()
+                .and_then(|j| j["choices"][0]["message"]["content"].as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| {
+                    self.set_feedback("AI request failed", tc.feedback_warn);
+                    String::new()
+                })
+        } else {
+            self.set_feedback("AI not available", tc.feedback_warn);
+            String::new()
+        }
+    }
+
+    // Batch K: Address Book
+    fn address_book_menu(&mut self) {
+        let tc = self.config.theme_colors.clone();
+        self.set_feedback("Address book: a=Add sender  s=Search  l=List", tc.unread);
+        let Some(key) = Input::getchr(Some(5)) else { self.render_bottom_bar(); return };
+
+        match key.as_str() {
+            "a" => {
+                if let Some(msg) = self.filtered_messages.get(self.index) {
+                    let name = msg.sender_name.as_deref().unwrap_or(&msg.sender).to_string();
+                    let email = msg.sender.clone();
+                    let conn = self.db.conn.lock().unwrap();
+                    let now = database::now_secs();
+                    let _ = conn.execute(
+                        "INSERT OR IGNORE INTO contacts (name, primary_email, message_count, last_contact) VALUES (?, ?, 1, ?)",
+                        rusqlite::params![name, email, now],
+                    );
+                    drop(conn);
+                    self.set_feedback(&format!("Added: {} <{}>", name, email), tc.feedback_ok);
+                }
+            }
+            "s" => {
+                let query = self.prompt("Search contacts: ", "");
+                if query.is_empty() { return; }
+                let conn = self.db.conn.lock().unwrap();
+                let mut stmt = conn.prepare(
+                    "SELECT name, primary_email FROM contacts WHERE name LIKE ? OR primary_email LIKE ? ORDER BY name LIMIT 50"
+                ).unwrap();
+                let like = format!("%{}%", query);
+                let results: Vec<String> = stmt.query_map(rusqlite::params![&like, &like], |r| {
+                    let name: String = r.get(0)?;
+                    let email: String = r.get(1)?;
+                    Ok(format!("{} <{}>", name, email))
+                }).unwrap().filter_map(|r| r.ok()).collect();
+                drop(stmt);
+                drop(conn);
+
+                if results.is_empty() {
+                    self.set_feedback("No contacts found", tc.feedback_info);
+                } else {
+                    self.right.set_text(&format!("{}\n\n{}",
+                        style::bold(&style::fg("Contacts", tc.view_custom)),
+                        results.join("\n")));
+                    self.right.ix = 0;
+                    self.right.full_refresh();
+                    if self.right.border { self.right.border_refresh(); }
+                }
+            }
+            "l" => {
+                let conn = self.db.conn.lock().unwrap();
+                let mut stmt = conn.prepare("SELECT name, primary_email FROM contacts ORDER BY name LIMIT 100").unwrap();
+                let results: Vec<String> = stmt.query_map([], |r| {
+                    let name: String = r.get(0)?;
+                    let email: String = r.get(1)?;
+                    Ok(format!("{} <{}>", name, email))
+                }).unwrap().filter_map(|r| r.ok()).collect();
+                drop(stmt);
+                drop(conn);
+                self.right.set_text(&format!("{}\n\n{}",
+                    style::bold(&style::fg("All Contacts", tc.view_custom)),
+                    if results.is_empty() { "(none)".to_string() } else { results.join("\n") }));
+                self.right.ix = 0;
+                self.right.full_refresh();
+                if self.right.border { self.right.border_refresh(); }
+            }
+            _ => { self.render_bottom_bar(); }
+        }
+    }
+
+    // Batch L: Calendar/Timely
+    fn open_in_timely(&mut self) {
+        let (subject, date, has_ics) = match self.filtered_messages.get(self.index) {
+            Some(m) => {
+                let subj = m.subject.as_deref().unwrap_or("").to_string();
+                let dt = format_timestamp(m.timestamp, "%Y-%m-%d %H:%M");
+                let ics = m.attachments.iter().any(|a| {
+                    a.get("content_type").and_then(|v| v.as_str()).map(|s| s.contains("calendar")).unwrap_or(false)
+                        || a.get("name").and_then(|v| v.as_str()).map(|s| s.ends_with(".ics")).unwrap_or(false)
+                });
+                (subj, dt, ics)
+            }
+            None => return,
+        };
+
+        if has_ics {
+            self.set_feedback("Calendar invite found. Opening in Timely...", self.config.theme_colors.feedback_ok);
+        }
+
+        Crust::cleanup();
+        let _ = std::process::Command::new("timely")
+            .arg("--date").arg(&date)
+            .arg("--subject").arg(&subject)
+            .status();
+        Crust::init();
+        Crust::clear_screen();
+        self.handle_resize();
+    }
+
+    // Batch M: Extended Help
+    fn show_extended_help(&mut self) {
+        let tc = self.config.theme_colors.clone();
+        let mut lines = vec![
+            style::bold(&style::fg("Kastrup, Extended Help", tc.view_custom)),
+            String::new(),
+            style::fg("Custom Key Bindings:", tc.unread),
+        ];
+        if self.config.custom_bindings.is_empty() {
+            lines.push(style::fg("  (none configured)", tc.hint_fg));
+        } else {
+            for (key, cmd) in &self.config.custom_bindings {
+                lines.push(format!("  {} = {}", style::fg(key, tc.info_fg), cmd));
+            }
+        }
+        lines.push(String::new());
+        lines.push(style::fg("Save Folder Shortcuts:", tc.unread));
+        if self.config.save_folders.is_empty() {
+            lines.push(style::fg("  (none, press s= to configure)", tc.hint_fg));
+        } else {
+            for (key, folder) in &self.config.save_folders {
+                lines.push(format!("  s{} = {}", key, folder));
+            }
+        }
+        lines.push(String::new());
+        lines.push(style::fg("Identities:", tc.unread));
+        if self.config.identities.is_empty() {
+            lines.push(style::fg("  (none configured)", tc.hint_fg));
+        } else {
+            for (name, id) in &self.config.identities {
+                lines.push(format!("  {} = {}", name, id.email));
+            }
+        }
+        lines.push(String::new());
+        lines.push(style::fg("Press ? to close, q to quit", tc.hint_fg));
+
+        self.right.set_text(&lines.join("\n"));
+        self.right.ix = 0;
+        self.right.full_refresh();
+        if self.right.border { self.right.border_refresh(); }
+    }
+}
+
+// --- HTML to text ---
+
+fn html_to_text(html: &str) -> String {
+    let mut result = String::new();
+    let mut in_tag = false;
+    let mut in_script = false;
+    let mut in_style = false;
+    let mut last_was_block = false;
+
+    let lower = html.to_lowercase();
+    let chars: Vec<char> = html.chars().collect();
+    let lower_chars: Vec<char> = lower.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if in_tag {
+            if chars[i] == '>' {
+                in_tag = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if chars[i] == '<' {
+            let rest: String = lower_chars[i..].iter().take(20).collect();
+            if rest.starts_with("<script") { in_script = true; }
+            if rest.starts_with("</script") { in_script = false; }
+            if rest.starts_with("<style") { in_style = true; }
+            if rest.starts_with("</style") { in_style = false; }
+
+            if rest.starts_with("<br") || rest.starts_with("<p")
+                || rest.starts_with("</p") || rest.starts_with("<div")
+                || rest.starts_with("</div") || rest.starts_with("<li")
+                || rest.starts_with("<tr") || rest.starts_with("<h1")
+                || rest.starts_with("<h2") || rest.starts_with("<h3")
+                || rest.starts_with("<h4") || rest.starts_with("<h5")
+                || rest.starts_with("<h6")
+            {
+                if !last_was_block {
+                    result.push('\n');
+                    last_was_block = true;
+                }
+            }
+
+            in_tag = true;
+            i += 1;
+            continue;
+        }
+
+        if in_script || in_style {
+            i += 1;
+            continue;
+        }
+
+        // HTML entity decoding
+        if chars[i] == '&' {
+            let rest: String = chars[i..].iter().take(10).collect();
+            if rest.starts_with("&amp;") { result.push('&'); i += 5; continue; }
+            if rest.starts_with("&lt;") { result.push('<'); i += 4; continue; }
+            if rest.starts_with("&gt;") { result.push('>'); i += 4; continue; }
+            if rest.starts_with("&quot;") { result.push('"'); i += 6; continue; }
+            if rest.starts_with("&apos;") { result.push('\''); i += 6; continue; }
+            if rest.starts_with("&nbsp;") { result.push(' '); i += 6; continue; }
+            if rest.starts_with("&#") {
+                if let Some(semi) = rest.find(';') {
+                    let num_str = &rest[2..semi];
+                    let code = if num_str.starts_with('x') {
+                        u32::from_str_radix(&num_str[1..], 16).ok()
+                    } else {
+                        num_str.parse::<u32>().ok()
+                    };
+                    if let Some(c) = code.and_then(char::from_u32) {
+                        result.push(c);
+                        i += semi + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        last_was_block = false;
+        result.push(chars[i]);
+        i += 1;
+    }
+
+    // Clean up: collapse multiple blank lines, trim
+    let mut cleaned = String::new();
+    let mut blank_count = 0;
+    for line in result.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            blank_count += 1;
+            if blank_count <= 2 { cleaned.push('\n'); }
+        } else {
+            blank_count = 0;
+            cleaned.push_str(trimmed);
+            cleaned.push('\n');
+        }
+    }
+    cleaned
+}
+
+// --- Utilities ---
+
+fn source_info(source_type: &str, tc: &config::ThemeColors) -> (&'static str, u8) {
+    match source_type {
+        "discord" => ("\u{25C6}", tc.src_discord),
+        "slack" => ("#", tc.src_slack),
+        "telegram" => ("\u{2708}", tc.src_telegram),
+        "whatsapp" => ("\u{25C9}", tc.src_whatsapp),
+        "reddit" => ("\u{00AE}", tc.src_reddit),
+        "email" | "maildir" | "imap" | "gmail" => ("\u{2709}", tc.src_email),
+        "rss" => ("\u{25C8}", tc.src_rss),
+        "web" | "webpage" => ("\u{25CE}", tc.src_web),
+        "messenger" => ("\u{260E}", tc.src_messenger),
+        "instagram" => ("\u{25C8}", tc.src_instagram),
+        "weechat" | "workspace" => ("\u{2318}", tc.src_weechat),
+        _ => ("\u{2022}", tc.src_default),
+    }
+}
+
+/// Format a unix timestamp using a simple date format string.
+/// Avoids the chrono dependency by computing date components manually.
+fn format_timestamp(ts: i64, fmt: &str) -> String {
+    if ts == 0 { return String::new(); }
+
+    // Apply local timezone offset
+    let utc_offset = local_utc_offset();
+    let local_ts = ts + utc_offset;
+
+    let secs = local_ts;
+    let days = secs.div_euclid(86400);
+    let (y, m, d) = days_to_ymd(days);
+    let time_of_day = secs.rem_euclid(86400);
+    let hours = time_of_day / 3600;
+    let mins = (time_of_day % 3600) / 60;
+
+    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let month_name = months.get((m - 1) as usize).unwrap_or(&"???");
+
+    match fmt {
+        "%b %e" | "%b %-d" => format!("{} {:>2}", month_name, d),
+        "%d/%m %H:%M" => format!("{:02}/{:02} {:02}:{:02}", d, m, hours, mins),
+        "%m/%d %H:%M" => format!("{:02}/{:02} {:02}:{:02}", m, d, hours, mins),
+        "%Y-%m-%d %H:%M" => format!("{}-{:02}-{:02} {:02}:{:02}", y, m, d, hours, mins),
+        "%d.%m %H:%M" => format!("{:02}.{:02} {:02}:{:02}", d, m, hours, mins),
+        "%d %b %H:%M" => format!("{:02} {} {:02}:{:02}", d, month_name, hours, mins),
+        "%b %d %H:%M" => format!("{} {:02} {:02}:{:02}", month_name, d, hours, mins),
+        _ => format!("{} {:>2}", month_name, d),
+    }
+}
+
+/// Convert days since epoch to (year, month, day).
+/// Algorithm from http://howardhinnant.github.io/date_algorithms.html
+fn days_to_ymd(days: i64) -> (i64, i64, i64) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Get local UTC offset in seconds using libc
+fn local_utc_offset() -> i64 {
+    unsafe {
+        let mut now: libc::time_t = 0;
+        libc::time(&mut now);
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&now, &mut tm);
+        tm.tm_gmtoff as i64
+    }
+}
+
+/// Truncate a plain string to at most `max` characters
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{}\u{2026}", truncated)
+    }
+}
+
+/// Parse a JSON array string like `["a@b.com","c@d.com"]` into a comma-separated display string.
+/// Falls back to returning the raw string if parsing fails.
+fn parse_json_recipients(raw: &str) -> String {
+    if let Ok(arr) = serde_json::from_str::<Vec<String>>(raw) {
+        arr.join(", ")
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Format a byte count into a human-readable file size
+fn format_file_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+// --- Image helpers ---
+
+fn home_dir() -> std::path::PathBuf {
+    std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+/// Check if a filename has an image extension
+fn is_image_filename(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".png")
+        || lower.ends_with(".gif") || lower.ends_with(".webp") || lower.ends_with(".bmp")
+}
+
+/// Check if an attachment JSON value represents an image
+fn is_image_attachment(att: &serde_json::Value) -> bool {
+    let ctype = att.get("content_type").and_then(|v| v.as_str()).unwrap_or("");
+    let fname = att.get("name").or_else(|| att.get("filename")).and_then(|v| v.as_str()).unwrap_or("");
+    ctype.starts_with("image") || is_image_filename(fname)
+}
+
+/// Extract image URLs from HTML content, skipping tracking pixels and tiny icons
+fn extract_image_urls(html: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let lower = html.to_lowercase();
+    let mut pos = 0;
+    while let Some(img_start) = lower[pos..].find("<img") {
+        let abs = pos + img_start;
+        if let Some(end) = lower[abs..].find('>') {
+            let tag = &html[abs..abs + end + 1];
+            // Extract src attribute
+            if let Some(src_pos) = tag.to_lowercase().find("src=") {
+                let rest = &tag[src_pos + 4..];
+                let (delim, start) = if rest.starts_with('"') { ('"', 1) }
+                    else if rest.starts_with('\'') { ('\'', 1) }
+                    else { (' ', 0) };
+                if let Some(end_pos) = rest[start..].find(delim) {
+                    let url = &rest[start..start + end_pos];
+                    // Skip tracking pixels, icons, spacers
+                    let lower_url = url.to_lowercase();
+                    if !lower_url.contains("track") && !lower_url.contains("pixel")
+                        && !lower_url.contains("spacer") && !lower_url.contains("beacon")
+                        && !lower_url.ends_with(".gif")
+                    {
+                        // Skip small images by checking width/height attrs
+                        let tag_lower = tag.to_lowercase();
+                        let w: Option<u32> = tag_lower.find("width=").and_then(|p| {
+                            tag[p+6..].trim_start_matches(&['"', '\''][..])
+                                .split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+                        });
+                        let h: Option<u32> = tag_lower.find("height=").and_then(|p| {
+                            tag[p+7..].trim_start_matches(&['"', '\''][..])
+                                .split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+                        });
+                        if w.unwrap_or(100) > 40 && h.unwrap_or(100) > 40 {
+                            urls.push(url.to_string());
+                        }
+                    }
+                }
+            }
+            pos = abs + end + 1;
+        } else {
+            break;
+        }
+    }
+    urls
+}
+
+/// Simple string hash for cache filenames
+fn simple_hash(s: &str) -> String {
+    let mut h: u64 = 5381;
+    for b in s.bytes() {
+        h = h.wrapping_mul(33).wrapping_add(b as u64);
+    }
+    format!("{:016x}", h)
+}
+
+/// Simple base64 encoding for MIME attachments
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        result.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        result.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
+}
