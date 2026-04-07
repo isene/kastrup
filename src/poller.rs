@@ -93,14 +93,14 @@ impl Poller {
 
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        // Don't join: the thread may be mid-sync with network timeouts.
+        // It will exit on its own when the flag is checked.
+        self.thread.take();
     }
 }
 
 impl Drop for Poller {
     fn drop(&mut self) {
-        self.stop();
+        self.running.store(false, Ordering::Relaxed);
     }
 }

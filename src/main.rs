@@ -383,6 +383,13 @@ fn main() {
         }
     }
 
+    // Stop poller immediately (don't wait for drop)
+    if let Some(mut p) = app.poller.take() {
+        p.stop();
+    }
+    // Drop app (closes write_tx, ending writer thread)
+    drop(app);
+
     Crust::cleanup();
 }
 
@@ -2686,24 +2693,27 @@ impl App {
             if let Some(link) = msg.metadata.get("link").and_then(|v| v.as_str()) {
                 let _ = std::process::Command::new("xdg-open").arg(link).spawn();
                 self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
-            } else if msg.html_content.is_some() || msg.content.trim_start().starts_with('<')
-                || msg.content.contains("<html") || msg.content.contains("<body") {
-                let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
-                let html = msg.html_content.as_deref().unwrap_or(&msg.content);
-                if std::fs::write(&path, html).is_ok() {
-                    let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
-                    self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
-                }
-            } else if msg.content.contains("Content-Type:") && msg.content.lines().any(|l| l.starts_with("--")) {
-                // MIME multipart with embedded HTML: extract the HTML part
-                let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
-                let html = extract_mime_html(&msg.content).unwrap_or_else(|| msg.content.clone());
-                if std::fs::write(&path, html).is_ok() {
-                    let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
-                    self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
-                }
             } else {
-                self.set_feedback("No link or HTML content", self.config.theme_colors.feedback_warn);
+                // Get best HTML to display: html_content > MIME extraction > raw content
+                let html = if let Some(ref h) = msg.html_content {
+                    h.clone()
+                } else if msg.content.contains("Content-Type:") || msg.content.lines().any(|l| l.starts_with("--") && l.len() > 4) {
+                    extract_mime_html(&msg.content).unwrap_or_else(|| {
+                        // Wrap raw text in HTML as last resort
+                        let text = msg.content.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                        format!("<html><head><meta charset=\"utf-8\"><style>body{{font-family:monospace;white-space:pre-wrap;padding:1em}}</style></head><body>{}</body></html>", text)
+                    })
+                } else if msg.content.contains("<html") || msg.content.contains("<body") || msg.content.trim_start().starts_with('<') {
+                    msg.content.clone()
+                } else {
+                    self.set_feedback("No HTML content to open", self.config.theme_colors.feedback_warn);
+                    return;
+                };
+                let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
+                if std::fs::write(&path, &html).is_ok() {
+                    let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+                    self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
+                }
             }
         }
     }
@@ -2713,18 +2723,24 @@ impl App {
         if let Some(msg) = self.filtered_messages.get(self.index) {
             let url = if let Some(link) = msg.metadata.get("link").and_then(|v| v.as_str()) {
                 Some(link.to_string())
-            } else if msg.html_content.is_some() || msg.content.contains("<html") || msg.content.contains("<body") {
-                let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
-                let html = msg.html_content.as_deref().unwrap_or(&msg.content);
-                let _ = std::fs::write(&path, html);
-                Some(format!("file://{}", path))
-            } else if msg.content.contains("Content-Type:") && msg.content.lines().any(|l| l.starts_with("--")) {
-                let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
-                let html = extract_mime_html(&msg.content).unwrap_or_else(|| msg.content.clone());
-                let _ = std::fs::write(&path, html);
-                Some(format!("file://{}", path))
             } else {
-                None
+                let html = if let Some(ref h) = msg.html_content {
+                    Some(h.clone())
+                } else if msg.content.contains("Content-Type:") || msg.content.lines().any(|l| l.starts_with("--") && l.len() > 4) {
+                    Some(extract_mime_html(&msg.content).unwrap_or_else(|| {
+                        let text = msg.content.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                        format!("<html><head><meta charset=\"utf-8\"><style>body{{font-family:monospace;white-space:pre-wrap;padding:1em}}</style></head><body>{}</body></html>", text)
+                    }))
+                } else if msg.content.contains("<html") || msg.content.contains("<body") || msg.content.trim_start().starts_with('<') {
+                    Some(msg.content.clone())
+                } else {
+                    None
+                };
+                html.map(|h| {
+                    let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
+                    let _ = std::fs::write(&path, &h);
+                    format!("file://{}", path)
+                })
             };
 
             if let Some(url) = url {
@@ -4857,19 +4873,28 @@ fn extract_mime_html(raw: &str) -> Option<String> {
             .map(|l| l[2..].trim_end_matches(':').trim().to_string())?
     };
     let delimiter = format!("--{}", boundary);
+    let mut text_plain = None;
     for part in raw.split(&delimiter) {
         let lower = part.to_lowercase();
-        if lower.contains("text/html") {
-            if let Some(hdr_end) = part.find("\n\n").or_else(|| part.find("\r\n\r\n")) {
-                let body_start = if part[hdr_end..].starts_with("\r\n\r\n") { hdr_end + 4 } else { hdr_end + 2 };
-                let headers = &part[..hdr_end];
-                let body = &part[body_start..];
-                let is_qp = headers.to_lowercase().contains("quoted-printable");
-                return Some(if is_qp { decode_quoted_printable(body) } else { body.to_string() });
+        if let Some(hdr_end) = part.find("\n\n").or_else(|| part.find("\r\n\r\n")) {
+            let body_start = if part[hdr_end..].starts_with("\r\n\r\n") { hdr_end + 4 } else { hdr_end + 2 };
+            let headers = &part[..hdr_end];
+            let body = &part[body_start..];
+            let is_qp = headers.to_lowercase().contains("quoted-printable");
+            let decoded = if is_qp { decode_quoted_printable(body) } else { body.to_string() };
+
+            if lower.contains("text/html") {
+                return Some(decoded);
+            } else if lower.contains("text/plain") && !decoded.trim().is_empty() && text_plain.is_none() {
+                text_plain = Some(decoded);
             }
         }
     }
-    None
+    // No HTML part: wrap text/plain in basic HTML for browser display
+    text_plain.map(|text| {
+        format!("<html><head><meta charset=\"utf-8\"><style>body{{font-family:monospace;white-space:pre-wrap;padding:1em;background:#1a1a2e;color:#eee}}</style></head><body>{}</body></html>",
+            text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"))
+    })
 }
 
 /// Decode quoted-printable encoding: =XX hex escapes, =\n soft line breaks
