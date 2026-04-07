@@ -59,6 +59,7 @@ cp target/release/kastrup ~/.local/bin/
 | v | View/save attachments |
 | x | Open in browser |
 | X | Open in Scroll |
+| Z | Open in Tock (calendar events) |
 | B | Folder browser |
 | l | Manage labels |
 | I | AI assistant |

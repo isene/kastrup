@@ -39,7 +39,8 @@ impl Poller {
                     // Sync: filesystem/network scan happens WITHOUT holding DB lock
                     let messages = match source.plugin_type.as_str() {
                         "maildir" => {
-                            let path = source.config.get("path")
+                            let path = source.config.get("maildir_path")
+                                .or_else(|| source.config.get("path"))
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("~/Maildir");
                             let expanded = path.replace("~/",
@@ -61,9 +62,12 @@ impl Poller {
 
                     let count = messages.len();
                     if count > 0 {
-                        // Add new external_ids to cache so we don't re-insert next cycle
+                        // Add new external_ids to cache (exact + base without flags)
                         for msg in &messages {
                             known.insert(msg.external_id.clone());
+                            // Also cache the base (stripped of :2,FLAGS) for flag-change dedup
+                            let base = msg.external_id.split(":2,").next().unwrap_or(&msg.external_id);
+                            known.insert(base.to_string());
                         }
                         // Brief DB lock for batch insert only
                         db.insert_messages_batch(source.id, &messages);
@@ -76,10 +80,10 @@ impl Poller {
                     }
                 }
 
-                // Sleep 10 seconds between poll cycles (check stop flag every 100ms)
-                for _ in 0..100 {
+                // Sleep 10 seconds between poll cycles (check stop flag every 1s)
+                for _ in 0..10 {
                     if !running_clone.load(Ordering::Relaxed) { break; }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    std::thread::sleep(std::time::Duration::from_secs(1));
                 }
             }
         });

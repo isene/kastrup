@@ -202,6 +202,35 @@ struct App {
 }
 
 fn main() {
+    // Parse CLI args: --compose-to EMAIL --subject SUBJECT, or mailto:URL
+    let args: Vec<String> = std::env::args().collect();
+    let mut compose_to: Option<String> = None;
+    let mut compose_subject: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--compose-to" if i + 1 < args.len() => { compose_to = Some(args[i + 1].clone()); i += 2; }
+            "--subject" if i + 1 < args.len() => { compose_subject = Some(args[i + 1].clone()); i += 2; }
+            a if a.starts_with("mailto:") => {
+                // Parse mailto:user@host?subject=X&cc=Y&body=Z
+                let rest = &a[7..];
+                let (addr, query) = rest.split_once('?').unwrap_or((rest, ""));
+                compose_to = Some(addr.to_string());
+                for param in query.split('&') {
+                    if let Some((k, v)) = param.split_once('=') {
+                        let decoded = v.replace("%20", " ").replace("+", " ");
+                        match k.to_lowercase().as_str() {
+                            "subject" => compose_subject = Some(decoded),
+                            _ => {}
+                        }
+                    }
+                }
+                i += 1;
+            }
+            _ => { i += 1; }
+        }
+    }
+
     Crust::init();
     let (cols, rows) = Crust::terminal_size();
 
@@ -307,6 +336,12 @@ fn main() {
     app.switch_to_view(&default_view);
     app.render_all();
 
+    // Handle --compose-to from CLI (e.g. from Tock)
+    if let Some(to) = compose_to {
+        let subj = compose_subject.unwrap_or_default();
+        app.compose_to(&to, &subj);
+    }
+
     while app.running {
         // Check feedback expiry
         if let Some(expires) = app.feedback_expires {
@@ -337,28 +372,12 @@ fn main() {
                         &format!("{} new message(s)", new_count),
                         app.config.theme_colors.feedback_ok,
                     );
-                    let view = app.current_view.clone();
-                    app.switch_to_view(&view);
+                    app.refresh_current_view();
                 }
                 // Periodic DB refresh (skip when showing inline images)
                 if !app.showing_image && app.last_db_refresh.elapsed().as_secs() >= 5 {
                     app.last_db_refresh = std::time::Instant::now();
-                    app.stats_cache = None;
-                    let saved_index = app.index;
-                    let saved_id = app.filtered_messages.get(app.index).map(|m| m.id);
-                    let view = app.current_view.clone();
-                    app.switch_to_view(&view);
-                    // Restore position: try by message ID first, then by index
-                    if let Some(id) = saved_id {
-                        if let Some(pos) = app.filtered_messages.iter().position(|m| m.id == id) {
-                            app.index = pos;
-                        } else {
-                            app.index = saved_index.min(app.filtered_messages.len().saturating_sub(1));
-                        }
-                    } else {
-                        app.index = saved_index.min(app.filtered_messages.len().saturating_sub(1));
-                    }
-                    app.render_all();
+                    app.refresh_current_view();
                 }
             }
         }
@@ -812,14 +831,15 @@ impl App {
         let sender_truncated = truncate_str(sender_display, 14);
         let sender_padded = format!("{:<14} ", sender_truncated); // 14 chars + always 1 space gap
 
-        // Subject fills remaining width
-        let subject = msg.subject.as_deref().unwrap_or("");
+        // Subject fills remaining width (decode RFC 2047 encoded-words)
+        let raw_subject = msg.subject.as_deref().unwrap_or("");
+        let subject = sources::maildir::decode_rfc2047(raw_subject);
         // Calculate available width for subject
         // "N r I DDDDDD i sender          subject"
         // 1+1+1+1+6+1+1+1+15+1 = 29 fixed chars
         let fixed = 29;
         let subj_w = pane_w.saturating_sub(fixed);
-        let subject_truncated = truncate_str(subject, subj_w);
+        let subject_truncated = truncate_str(&subject, subj_w);
 
         let flags = format!("{}{}{}", nflag, rflag, ind);
 
@@ -848,7 +868,7 @@ impl App {
         };
 
         if selected {
-            format!("{}{}", flags, style::underline(&style::bold(&style::fg(&full_content, color))))
+            format!("{}{}{}", flags, style::underline(&style::bold(&style::fg(&content, color))), style::bold(&style::fg(&padding, color)))
         } else if !msg.read {
             format!("{}{}", flags, style::bold(&style::fg(&full_content, color)))
         } else {
@@ -986,7 +1006,8 @@ impl App {
 
         // Subject
         if let Some(ref subj) = msg.subject {
-            lines.push(format!("{} {}", style::bold(&style::fg("Subject:", tc.header_subj)), style::bold(&style::fg(subj, tc.header_subj))));
+            let decoded_subj = sources::maildir::decode_rfc2047(subj);
+            lines.push(format!("{} {}", style::bold(&style::fg("Subject:", tc.header_subj)), style::bold(&style::fg(&decoded_subj, tc.header_subj))));
         }
 
         // Date
@@ -1058,28 +1079,45 @@ impl App {
         }
 
         // HTML indicator
-        if msg.html_content.is_some() {
+        let has_mime_html = msg.content.contains("Content-Type:") && msg.content.lines().any(|l| l.starts_with("--"));
+        if msg.html_content.is_some() || has_mime_html {
             lines.push(style::fg("HTML mail, press x to open in browser", tc.html_hint));
             lines.push(String::new());
         }
 
         lines.push(String::new());
 
-        // Content: detect HTML and parse it, whether in content or html_content
+        // Content: extract from MIME, decode QP, detect HTML and parse
         let raw = &msg.content;
-        let content = if let Some(ref html) = msg.html_content {
-            if raw.is_empty() || raw.contains("HTML messages are not support")
-                || raw.contains("not displayed") || raw.trim().len() < 20 {
-                html_to_text(html)
-            } else if raw.trim_start().starts_with('<') && (raw.contains("<html") || raw.contains("<body") || raw.contains("<div") || raw.contains("<table")) {
-                html_to_text(raw)
-            } else {
-                raw.clone()
-            }
-        } else if raw.trim_start().starts_with('<') && (raw.contains("<html") || raw.contains("<body") || raw.contains("<div") || raw.contains("<table")) {
-            html_to_text(raw)
+        // Try MIME multipart extraction first
+        let looks_mime = raw.contains("boundary=")
+            || (raw.contains("Content-Type:") && raw.lines().any(|l| l.starts_with("--") && l.len() > 4));
+        let extracted = if looks_mime {
+            extract_mime_text(raw).unwrap_or_else(|| raw.clone())
+        } else if raw.contains("Content-Transfer-Encoding: quoted-printable") {
+            // Single-part QP encoded
+            let body_start = raw.find("\n\n").map(|p| p + 2)
+                .or_else(|| raw.find("\r\n\r\n").map(|p| p + 4))
+                .unwrap_or(0);
+            decode_quoted_printable(&raw[body_start..])
         } else {
             raw.clone()
+        };
+        let content = if let Some(ref html) = msg.html_content {
+            if extracted.is_empty() || extracted.contains("HTML messages are not support")
+                || extracted.contains("not displayed") || extracted.trim().len() < 20 {
+                html_to_text(html)
+            } else if extracted.contains("<br") || extracted.contains("<p>") || extracted.contains("<p ") ||
+                (extracted.trim_start().starts_with('<') && (extracted.contains("<html") || extracted.contains("<body") || extracted.contains("<div") || extracted.contains("<table"))) {
+                html_to_text(&extracted)
+            } else {
+                extracted
+            }
+        } else if extracted.contains("<br") || extracted.contains("<p>") || extracted.contains("<p ") ||
+            (extracted.trim_start().starts_with('<') && (extracted.contains("<html") || extracted.contains("<body") || extracted.contains("<div") || extracted.contains("<table"))) {
+            html_to_text(&extracted)
+        } else {
+            extracted
         };
         let mut in_signature = false;
         for line in content.lines() {
@@ -1397,6 +1435,66 @@ impl App {
         }
         self.sort_messages();
         self.rebuild_display();
+        self.render_all();
+    }
+
+    /// Reload messages for current view without resetting cursor position.
+    fn refresh_current_view(&mut self) {
+        let saved_id = self.filtered_messages.get(self.index).map(|m| m.id);
+        let saved_index = self.index;
+
+        // Rebuild filters for the current view (same logic as switch_to_view but no index=0)
+        let key = self.current_view.clone();
+        let mut filters = Filters::default();
+        match key.as_str() {
+            "N" => { filters.is_read = Some(false); }
+            "*" => { filters.is_starred = Some(true); }
+            "A" => {}
+            _ => {
+                if let Some(view) = self.views.iter().find(|v| v.key_binding.as_deref() == Some(&key)) {
+                    if let Ok(f) = serde_json::from_str::<serde_json::Value>(&view.filters) {
+                        if let Some(rules) = f["rules"].as_array() {
+                            for rule in rules {
+                                let field = rule["field"].as_str().unwrap_or("");
+                                let value = &rule["value"];
+                                match field {
+                                    "read" => { filters.is_read = Some(!value.as_bool().unwrap_or(true)); }
+                                    "starred" => { filters.is_starred = value.as_bool(); }
+                                    "folder" => { filters.folder = value.as_str().map(|s| s.to_string()); }
+                                    "source_id" => { filters.source_id = value.as_i64(); }
+                                    "sender" => { filters.sender_pattern = value.as_str().map(|s| s.to_string()); }
+                                    "source_type" => { filters.source_type = value.as_str().map(|s| s.to_string()); }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let limit = self.config.load_limit;
+        self.filtered_messages = self.db.get_messages(&filters, limit, 0);
+        for msg in &mut self.filtered_messages {
+            if let Some(st) = self.source_type_map.get(&msg.source_id) {
+                msg.source_type = st.clone();
+            }
+        }
+        self.sort_messages();
+        self.rebuild_display();
+
+        // Restore position by message ID, fall back to saved index
+        if let Some(id) = saved_id {
+            if let Some(pos) = self.filtered_messages.iter().position(|m| m.id == id) {
+                self.index = pos;
+            } else {
+                self.index = saved_index.min(self.filtered_messages.len().saturating_sub(1));
+            }
+        } else {
+            self.index = saved_index.min(self.filtered_messages.len().saturating_sub(1));
+        }
+
+        self.stats_cache = None;
         self.render_all();
     }
 
@@ -2016,15 +2114,18 @@ impl App {
 
     fn purge_deleted(&mut self) {
         if self.delete_marked.is_empty() { return; }
+
+        // Remember current message to restore position after purge
+        let current_id = self.filtered_messages.get(self.index).map(|m| m.id);
+
         let ids: Vec<i64> = self.delete_marked.iter().copied().collect();
 
-        // Delete maildir files from disk (add T flag = Trashed, then remove)
+        // Delete maildir files from disk
         for &id in &ids {
             if let Some(msg) = self.filtered_messages.iter().find(|m| m.id == id) {
                 if let Some(file) = msg.metadata.get("maildir_file").and_then(|v| v.as_str()) {
                     let path = std::path::Path::new(file);
                     if path.exists() {
-                        // Move to trash or just delete
                         let _ = std::fs::remove_file(path);
                     }
                 }
@@ -2038,9 +2139,18 @@ impl App {
         if self.show_threaded {
             self.display_messages.retain(|m| !ids.contains(&m.id));
         }
-        if self.index >= self.filtered_messages.len() {
-            self.index = self.filtered_messages.len().saturating_sub(1);
+
+        // Restore to same message if it wasn't deleted, otherwise nearest position
+        if let Some(cid) = current_id {
+            if let Some(pos) = self.filtered_messages.iter().position(|m| m.id == cid) {
+                self.index = pos;
+            } else {
+                self.index = self.index.min(self.filtered_messages.len().saturating_sub(1));
+            }
+        } else {
+            self.index = self.index.min(self.filtered_messages.len().saturating_sub(1));
         }
+
         self.set_feedback(&format!("Purged {} messages", count), self.config.theme_colors.feedback_ok);
         self.render_all();
     }
@@ -2576,9 +2686,18 @@ impl App {
             if let Some(link) = msg.metadata.get("link").and_then(|v| v.as_str()) {
                 let _ = std::process::Command::new("xdg-open").arg(link).spawn();
                 self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
-            } else if msg.html_content.is_some() || msg.content.trim_start().starts_with('<') {
+            } else if msg.html_content.is_some() || msg.content.trim_start().starts_with('<')
+                || msg.content.contains("<html") || msg.content.contains("<body") {
                 let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
                 let html = msg.html_content.as_deref().unwrap_or(&msg.content);
+                if std::fs::write(&path, html).is_ok() {
+                    let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+                    self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
+                }
+            } else if msg.content.contains("Content-Type:") && msg.content.lines().any(|l| l.starts_with("--")) {
+                // MIME multipart with embedded HTML: extract the HTML part
+                let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
+                let html = extract_mime_html(&msg.content).unwrap_or_else(|| msg.content.clone());
                 if std::fs::write(&path, html).is_ok() {
                     let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
                     self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
@@ -2594,9 +2713,14 @@ impl App {
         if let Some(msg) = self.filtered_messages.get(self.index) {
             let url = if let Some(link) = msg.metadata.get("link").and_then(|v| v.as_str()) {
                 Some(link.to_string())
-            } else if msg.html_content.is_some() || msg.content.contains("<html") {
+            } else if msg.html_content.is_some() || msg.content.contains("<html") || msg.content.contains("<body") {
                 let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
                 let html = msg.html_content.as_deref().unwrap_or(&msg.content);
+                let _ = std::fs::write(&path, html);
+                Some(format!("file://{}", path))
+            } else if msg.content.contains("Content-Type:") && msg.content.lines().any(|l| l.starts_with("--")) {
+                let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
+                let html = extract_mime_html(&msg.content).unwrap_or_else(|| msg.content.clone());
                 let _ = std::fs::write(&path, html);
                 Some(format!("file://{}", path))
             } else {
@@ -3494,6 +3618,29 @@ impl App {
 
         if !sig.is_empty() {
             template.push('\n');
+            template.push_str(&sig);
+            template.push('\n');
+        }
+
+        self.run_editor_compose(&template);
+    }
+
+    fn compose_to(&mut self, to: &str, subject: &str) {
+        let from = self.compose_from();
+        let reply_to = self.compose_email();
+        let sig = self.compose_signature();
+
+        let mut template = String::new();
+        template.push_str(&format!("From: {}\n", from));
+        template.push_str(&format!("To: {}\n", to));
+        template.push_str("Cc: \n");
+        template.push_str("Bcc: \n");
+        template.push_str(&format!("Reply-To: {}\n", reply_to));
+        template.push_str(&format!("Subject: {}\n", subject));
+        template.push('\n');
+        template.push('\n');
+
+        if !sig.is_empty() {
             template.push_str(&sig);
             template.push('\n');
         }
@@ -4542,31 +4689,71 @@ impl App {
 
     // Batch L: Calendar/Timely
     fn open_in_timely(&mut self) {
-        let (subject, date, has_ics) = match self.filtered_messages.get(self.index) {
-            Some(m) => {
-                let subj = m.subject.as_deref().unwrap_or("").to_string();
-                let dt = format_timestamp(m.timestamp, "%Y-%m-%d %H:%M");
-                let ics = m.attachments.iter().any(|a| {
-                    a.get("content_type").and_then(|v| v.as_str()).map(|s| s.contains("calendar")).unwrap_or(false)
-                        || a.get("name").and_then(|v| v.as_str()).map(|s| s.ends_with(".ics")).unwrap_or(false)
-                });
-                (subj, dt, ics)
-            }
+        let msg = match self.filtered_messages.get(self.index) {
+            Some(m) => m.clone(),
             None => return,
         };
 
-        if has_ics {
-            self.set_feedback("Calendar invite found. Opening in Timely...", self.config.theme_colors.feedback_ok);
+        let home = std::env::var("HOME").unwrap_or_default();
+        let tock_home = std::path::PathBuf::from(&home).join(".tock");
+        if !tock_home.is_dir() {
+            self.set_feedback("Tock not configured (~/.tock missing)", self.config.theme_colors.feedback_warn);
+            return;
         }
 
-        Crust::cleanup();
-        let _ = std::process::Command::new("timely")
-            .arg("--date").arg(&date)
-            .arg("--subject").arg(&subject)
-            .status();
-        Crust::init();
-        Crust::clear_screen();
-        self.handle_resize();
+        // Try to extract date from ICS attachment in the maildir file
+        let mut date_str = None;
+        if let Some(file) = msg.metadata.get("maildir_file").and_then(|v| v.as_str()) {
+            if std::path::Path::new(file).exists() {
+                if let Ok(content) = std::fs::read_to_string(file) {
+                    // Look for DTSTART in any VEVENT block
+                    if let Some(vevent_start) = content.find("BEGIN:VEVENT") {
+                        let vevent = &content[vevent_start..];
+                        for line in vevent.lines() {
+                            let l = line.trim();
+                            if l.starts_with("DTSTART") {
+                                // Extract YYYYMMDD from various formats
+                                if let Some(colon) = l.find(':') {
+                                    let val = &l[colon + 1..];
+                                    if val.len() >= 8 {
+                                        date_str = Some(format!("{}-{}-{}", &val[0..4], &val[4..6], &val[6..8]));
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    // Copy ICS parts to incoming dir
+                    if content.contains("BEGIN:VCALENDAR") || content.contains("text/calendar") {
+                        let incoming = tock_home.join("incoming");
+                        let _ = std::fs::create_dir_all(&incoming);
+                        // Extract ICS from MIME or use whole file if it's an ICS
+                        if content.starts_with("BEGIN:VCALENDAR") {
+                            let ics_path = incoming.join(format!("kastrup_{}.ics", msg.id));
+                            if !ics_path.exists() {
+                                let _ = std::fs::write(&ics_path, &content);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: use message timestamp
+        if date_str.is_none() && msg.timestamp > 0 {
+            date_str = Some(format_timestamp(msg.timestamp, "%Y-%m-%d"));
+        }
+
+        let Some(date) = date_str else {
+            self.set_feedback("Could not determine date", self.config.theme_colors.feedback_warn);
+            return;
+        };
+
+        // Write goto file for Tock/Timely
+        let goto_path = tock_home.join("goto");
+        let _ = std::fs::write(&goto_path, &date);
+        self.set_feedback(&format!("Sent to Tock: {}", date), self.config.theme_colors.feedback_ok);
     }
 
     // Batch M: Extended Help
@@ -4610,6 +4797,115 @@ impl App {
         self.right.full_refresh();
         if self.right.border { self.right.border_refresh(); }
     }
+}
+
+// --- MIME / QP decoding ---
+
+/// Extract readable text from raw MIME multipart content.
+/// If content contains MIME boundaries, extract the text/plain part and decode QP.
+fn extract_mime_text(raw: &str) -> Option<String> {
+    // Detect MIME boundary: from boundary= header or first "--" line in content
+    let boundary = if let Some(pos) = raw.find("boundary=") {
+        let rest = &raw[pos + 9..];
+        let b = rest.trim_start_matches('"').split('"').next()
+            .or_else(|| rest.split_whitespace().next())
+            .unwrap_or("");
+        if b.is_empty() { return None; }
+        b.to_string()
+    } else {
+        // Look for first line starting with "--" (common in body-only MIME content)
+        raw.lines()
+            .find(|l| l.starts_with("--") && l.len() > 4 && !l.starts_with("---"))
+            .map(|l| l[2..].trim_end_matches(':').trim().to_string())?
+    };
+
+    let delimiter = format!("--{}", boundary);
+    let parts: Vec<&str> = raw.split(&delimiter).collect();
+
+    // Find text/plain part first, fall back to text/html
+    let mut text_part = None;
+    let mut html_part = None;
+    for part in &parts {
+        let lower = part.to_lowercase();
+        if let Some(header_end) = part.find("\n\n").or_else(|| part.find("\r\n\r\n")) {
+            let headers = &part[..header_end];
+            let body_start = if part[header_end..].starts_with("\r\n\r\n") { header_end + 4 } else { header_end + 2 };
+            let body = &part[body_start..];
+            let is_qp = headers.to_lowercase().contains("quoted-printable");
+            let decoded = if is_qp { decode_quoted_printable(body) } else { body.to_string() };
+
+            if lower.contains("text/plain") && !decoded.trim().is_empty() {
+                text_part = Some(decoded);
+            } else if lower.contains("text/html") {
+                html_part = Some(decoded);
+            }
+        }
+    }
+
+    text_part.or_else(|| html_part.map(|h| html_to_text(&h)))
+}
+
+/// Extract raw HTML from MIME multipart content (for browser display).
+fn extract_mime_html(raw: &str) -> Option<String> {
+    let boundary = if let Some(pos) = raw.find("boundary=") {
+        let rest = &raw[pos + 9..];
+        rest.trim_start_matches('"').split('"').next()
+            .or_else(|| rest.split_whitespace().next())?.to_string()
+    } else {
+        raw.lines()
+            .find(|l| l.starts_with("--") && l.len() > 4 && !l.starts_with("---"))
+            .map(|l| l[2..].trim_end_matches(':').trim().to_string())?
+    };
+    let delimiter = format!("--{}", boundary);
+    for part in raw.split(&delimiter) {
+        let lower = part.to_lowercase();
+        if lower.contains("text/html") {
+            if let Some(hdr_end) = part.find("\n\n").or_else(|| part.find("\r\n\r\n")) {
+                let body_start = if part[hdr_end..].starts_with("\r\n\r\n") { hdr_end + 4 } else { hdr_end + 2 };
+                let headers = &part[..hdr_end];
+                let body = &part[body_start..];
+                let is_qp = headers.to_lowercase().contains("quoted-printable");
+                return Some(if is_qp { decode_quoted_printable(body) } else { body.to_string() });
+            }
+        }
+    }
+    None
+}
+
+/// Decode quoted-printable encoding: =XX hex escapes, =\n soft line breaks
+fn decode_quoted_printable(s: &str) -> String {
+    let mut bytes = Vec::with_capacity(s.len());
+    let input = s.as_bytes();
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'=' {
+            if i + 1 < input.len() && (input[i + 1] == b'\r' || input[i + 1] == b'\n') {
+                // Soft line break
+                i += 1;
+                if i < input.len() && input[i] == b'\r' { i += 1; }
+                if i < input.len() && input[i] == b'\n' { i += 1; }
+            } else if i + 2 < input.len() {
+                let hex = &s[i + 1..i + 3];
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    bytes.push(byte);
+                    i += 3;
+                } else {
+                    bytes.push(b'=');
+                    i += 1;
+                }
+            } else {
+                bytes.push(b'=');
+                i += 1;
+            }
+        } else {
+            bytes.push(input[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_else(|e| {
+        // Fall back to lossy conversion
+        String::from_utf8_lossy(e.as_bytes()).into_owned()
+    })
 }
 
 // --- HTML to text ---
@@ -4669,23 +4965,43 @@ fn html_to_text(html: &str) -> String {
         // HTML entity decoding
         if chars[i] == '&' {
             let rest: String = chars[i..].iter().take(10).collect();
-            if rest.starts_with("&amp;") { result.push('&'); i += 5; continue; }
-            if rest.starts_with("&lt;") { result.push('<'); i += 4; continue; }
-            if rest.starts_with("&gt;") { result.push('>'); i += 4; continue; }
-            if rest.starts_with("&quot;") { result.push('"'); i += 6; continue; }
-            if rest.starts_with("&apos;") { result.push('\''); i += 6; continue; }
-            if rest.starts_with("&nbsp;") { result.push(' '); i += 6; continue; }
-            if rest.starts_with("&#") {
-                if let Some(semi) = rest.find(';') {
-                    let num_str = &rest[2..semi];
-                    let code = if num_str.starts_with('x') {
+            // Find the entity (up to ';')
+            let entity_end = chars[i..].iter().take(12).position(|&c| c == ';');
+            if let Some(end) = entity_end {
+                let entity: String = chars[i..i + end + 1].iter().collect();
+                let decoded = match entity.as_str() {
+                    "&amp;" => Some('&'), "&lt;" => Some('<'), "&gt;" => Some('>'),
+                    "&quot;" => Some('"'), "&apos;" => Some('\''), "&nbsp;" => Some(' '),
+                    "&ndash;" => Some('\u{2013}'), "&mdash;" => Some('\u{2014}'),
+                    "&lsquo;" => Some('\u{2018}'), "&rsquo;" => Some('\u{2019}'),
+                    "&ldquo;" => Some('\u{201C}'), "&rdquo;" => Some('\u{201D}'),
+                    "&bull;" => Some('\u{2022}'), "&hellip;" => Some('\u{2026}'),
+                    "&trade;" => Some('\u{2122}'), "&copy;" => Some('\u{00A9}'),
+                    "&reg;" => Some('\u{00AE}'), "&deg;" => Some('\u{00B0}'),
+                    "&sup1;" => Some('\u{00B9}'), "&sup2;" => Some('\u{00B2}'),
+                    "&sup3;" => Some('\u{00B3}'), "&frac12;" => Some('\u{00BD}'),
+                    "&zwnj;" | "&zwj;" => Some('\u{200C}'),
+                    _ => None,
+                };
+                if let Some(c) = decoded {
+                    if c != '\u{200C}' { result.push(c); } // skip zero-width chars
+                    i += end + 1;
+                    continue;
+                }
+            }
+            // Numeric entities: &#NNN; or &#xHHH;
+            if let Some(end) = entity_end {
+                let entity: String = chars[i..i + end + 1].iter().collect();
+                if entity.starts_with("&#") {
+                    let num_str = &entity[2..entity.len() - 1];
+                    let code = if num_str.starts_with('x') || num_str.starts_with('X') {
                         u32::from_str_radix(&num_str[1..], 16).ok()
                     } else {
                         num_str.parse::<u32>().ok()
                     };
                     if let Some(c) = code.and_then(char::from_u32) {
                         result.push(c);
-                        i += semi + 1;
+                        i += end + 1;
                         continue;
                     }
                 }

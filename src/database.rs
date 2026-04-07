@@ -739,8 +739,8 @@ fn row_to_source(row: &rusqlite::Row) -> Source {
         last_sync: row.get(6).ok(),
         last_error: row.get(7).ok(),
         message_count: row.get(8).unwrap_or(0),
-        poll_interval: row.get::<_, i64>(10).unwrap_or(900),
-        color: row.get(11).ok(),
+        poll_interval: row.get::<_, i64>(11).unwrap_or(900),
+        color: row.get(12).ok(),
     }
 }
 
