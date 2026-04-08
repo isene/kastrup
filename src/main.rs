@@ -1087,6 +1087,33 @@ impl App {
             }
         }
 
+        // Detect MIME attachments embedded in raw content (when DB attachments field is empty)
+        let mime_atts_to_inject = if msg.attachments.is_empty() && msg.content.contains("Content-Type:") {
+            let atts = extract_mime_attachments(&msg.content, msg.id);
+            if !atts.is_empty() {
+                let regular: Vec<_> = atts.iter().filter(|a| !a["is_image"].as_bool().unwrap_or(false)).collect();
+                let images: Vec<_> = atts.iter().filter(|a| a["is_image"].as_bool().unwrap_or(false)).collect();
+                if !regular.is_empty() {
+                    lines.push(style::bold(&style::fg("Attachments:", tc.attachment)));
+                    for (i, att) in regular.iter().enumerate() {
+                        let name = att["name"].as_str().unwrap_or("unknown");
+                        let size = att["size"].as_u64().map(|s| format_file_size(s)).unwrap_or_default();
+                        let size_part = if size.is_empty() { String::new() } else { format!(" ({})", size) };
+                        lines.push(style::fg(&format!("  [{}] {}{}", i + 1, name, size_part), tc.attachment));
+                    }
+                    lines.push(style::fg("  Press 'v' to view/save attachments", tc.attachment));
+                    lines.push(String::new());
+                }
+                if !images.is_empty() {
+                    let label = if images.len() == 1 { "1 image".to_string() } else { format!("{} images", images.len()) };
+                    lines.push(style::fg(&format!("{}, press V to view", label), tc.feedback_ok));
+                    lines.push(String::new());
+                }
+                Some(atts)
+            } else { None }
+        } else { None };
+        // Inject after msg borrow is done (below, after rendering)
+
         // HTML indicator
         let has_mime_html = msg.content.contains("Content-Type:") && msg.content.lines().any(|l| l.starts_with("--") && l.len() > 5);
         if msg.html_content.is_some() || has_mime_html {
@@ -1159,6 +1186,15 @@ impl App {
         }
         self.right.full_refresh();
         if self.right.border { self.right.border_refresh(); }
+
+        // Inject MIME attachments into message (deferred to avoid borrow conflict)
+        if let Some(atts) = mime_atts_to_inject {
+            let idx = self.index;
+            let messages = if self.show_threaded { &mut self.display_messages } else { &mut self.filtered_messages };
+            if let Some(m) = messages.get_mut(idx) {
+                m.attachments = atts;
+            }
+        }
     }
 
     fn render_bottom_bar(&mut self) {
@@ -3670,7 +3706,7 @@ impl App {
             template.push('\n');
         }
 
-        self.run_editor_compose_at(&template, None);
+        self.run_editor_compose_at(&template, Some(2)); // cursor on To: line
     }
 
     fn compose_to(&mut self, to: &str, subject: &str) {
@@ -3746,15 +3782,31 @@ impl App {
 
     /// Get displayable text content from a message, converting HTML if needed.
     fn get_display_content(&self, msg: &Message) -> String {
-        let use_html = msg.html_content.is_some()
-            && (msg.content.is_empty()
-                || msg.content.contains("HTML messages are not supported")
-                || msg.content.contains("not displayed")
-                || msg.content.trim().len() < 20);
-        if use_html {
-            html_to_text(msg.html_content.as_deref().unwrap_or(""))
+        let raw = &msg.content;
+        // MIME extraction + QP/base64 decoding (same logic as render_message_content)
+        let looks_mime = raw.contains("Content-Type:")
+            || raw.lines().any(|l| l.starts_with("--") && l.len() > 5);
+        let extracted = if looks_mime {
+            extract_mime_text(raw).unwrap_or_else(|| raw.clone())
+        } else if raw.contains("Content-Transfer-Encoding: quoted-printable") {
+            let body_start = raw.find("\n\n").map(|p| p + 2)
+                .or_else(|| raw.find("\r\n\r\n").map(|p| p + 4))
+                .unwrap_or(0);
+            decode_quoted_printable(&raw[body_start..])
         } else {
-            msg.content.clone()
+            raw.clone()
+        };
+        if let Some(ref html) = msg.html_content {
+            if extracted.is_empty() || extracted.contains("HTML messages are not support")
+                || extracted.contains("not displayed") || extracted.trim().len() < 20 {
+                return html_to_text(html);
+            }
+        }
+        if extracted.contains("<br") || extracted.contains("<p>") || extracted.contains("<p ")
+            || (extracted.trim_start().starts_with('<') && (extracted.contains("<html") || extracted.contains("<body"))) {
+            html_to_text(&extracted)
+        } else {
+            extracted
         }
     }
 
@@ -4848,8 +4900,12 @@ impl App {
 // --- MIME / QP decoding ---
 
 /// Extract readable text from raw MIME multipart content.
-/// If content contains MIME boundaries, extract the text/plain part and decode QP.
 fn extract_mime_text(raw: &str) -> Option<String> {
+    extract_mime_text_depth(raw, 0)
+}
+
+fn extract_mime_text_depth(raw: &str, depth: usize) -> Option<String> {
+    if depth > 5 { return None; } // prevent infinite recursion
     // Detect MIME boundary: from boundary= header or first "--" line in content
     let boundary = if let Some(pos) = raw.find("boundary=") {
         let rest = &raw[pos + 9..];
@@ -4882,11 +4938,34 @@ fn extract_mime_text(raw: &str) -> Option<String> {
             let is_qp = headers_lower.contains("quoted-printable");
             let is_b64 = headers_lower.contains("base64");
 
+            // Detect charset for proper decoding
+            let is_latin1 = headers_lower.contains("iso-8859") || headers_lower.contains("windows-1252");
+
+            // Recurse into nested multipart parts
+            if headers_lower.contains("multipart/") {
+                if let Some(result) = extract_mime_text_depth(part, depth + 1) {
+                    if text_part.is_none() { text_part = Some(result); }
+                }
+                continue;
+            }
+
             if lower.contains("text/plain") {
-                let decoded = if is_qp { decode_quoted_printable(body) } else { body.to_string() };
+                let decoded = if is_qp {
+                    let bytes = decode_qp_bytes_body(body);
+                    if is_latin1 { latin1_to_utf8(&bytes) } else { String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()) }
+                } else if is_b64 {
+                    let bytes = sources::maildir::base64_decode(body.trim()).unwrap_or_default();
+                    if is_latin1 { latin1_to_utf8(&bytes) } else { String::from_utf8(bytes).unwrap_or_default() }
+                } else { body.to_string() };
                 if !decoded.trim().is_empty() { text_part = Some(decoded); }
             } else if lower.contains("text/html") {
-                let decoded = if is_qp { decode_quoted_printable(body) } else { body.to_string() };
+                let decoded = if is_qp {
+                    let bytes = decode_qp_bytes_body(body);
+                    if is_latin1 { latin1_to_utf8(&bytes) } else { String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()) }
+                } else if is_b64 {
+                    let bytes = sources::maildir::base64_decode(body.trim()).unwrap_or_default();
+                    if is_latin1 { latin1_to_utf8(&bytes) } else { String::from_utf8(bytes).unwrap_or_default() }
+                } else { body.to_string() };
                 html_part = Some(decoded);
             } else if lower.contains("text/calendar") && cal_part.is_none() {
                 let decoded = if is_b64 {
@@ -4908,6 +4987,11 @@ fn extract_mime_text(raw: &str) -> Option<String> {
 
 /// Extract raw HTML from MIME multipart content (for browser display).
 fn extract_mime_html(raw: &str) -> Option<String> {
+    extract_mime_html_depth(raw, 0)
+}
+
+fn extract_mime_html_depth(raw: &str, depth: usize) -> Option<String> {
+    if depth > 5 { return None; }
     let boundary = if let Some(pos) = raw.find("boundary=") {
         let rest = &raw[pos + 9..];
         rest.trim_start_matches('"').split('"').next()
@@ -4927,6 +5011,26 @@ fn extract_mime_html(raw: &str) -> Option<String> {
             let body = &part[body_start..];
             let is_qp = headers.to_lowercase().contains("quoted-printable");
             let decoded = if is_qp { decode_quoted_printable(body) } else { body.to_string() };
+
+            let headers_lower = headers.to_lowercase();
+            let is_b64 = headers_lower.contains("base64");
+            let is_latin1 = headers_lower.contains("iso-8859") || headers_lower.contains("windows-1252");
+
+            // Recurse into nested multipart
+            if headers_lower.contains("multipart/") {
+                if let Some(result) = extract_mime_html_depth(part, depth + 1) {
+                    return Some(result);
+                }
+                continue;
+            }
+
+            let decoded = if is_qp {
+                let bytes = decode_qp_bytes_body(body);
+                if is_latin1 { latin1_to_utf8(&bytes) } else { String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()) }
+            } else if is_b64 {
+                let bytes = sources::maildir::base64_decode(body.trim()).unwrap_or_default();
+                if is_latin1 { latin1_to_utf8(&bytes) } else { String::from_utf8(bytes).unwrap_or_default() }
+            } else { body.to_string() };
 
             if lower.contains("text/html") {
                 return Some(decoded);
@@ -5148,6 +5252,118 @@ fn parse_rrule_display(rrule: &str) -> String {
         if until.len() >= 8 { s += &format!(" (until {}-{}-{})", &until[0..4], &until[4..6], &until[6..8]); }
     }
     s
+}
+
+/// Extract MIME attachments from raw content, decode to temp files, return as JSON Value array
+/// matching the DB attachment format so existing v/V handlers work.
+fn extract_mime_attachments(content: &str, msg_id: i64) -> Vec<serde_json::Value> {
+    let mut atts = Vec::new();
+    // Find all boundaries in the content (including nested)
+    let boundary_re = regex::Regex::new(r#"boundary="?([^"\s;]+)"?"#).unwrap();
+    let mut boundaries = Vec::new();
+    for cap in boundary_re.captures_iter(content) {
+        boundaries.push(cap.get(1).unwrap().as_str().to_string());
+    }
+    // Also detect bare -- boundary lines
+    for line in content.lines() {
+        if line.starts_with("--") && line.len() > 5 {
+            let b = line[2..].trim_end_matches("--").trim();
+            if !b.is_empty() && !boundaries.contains(&b.to_string()) {
+                boundaries.push(b.to_string());
+            }
+        }
+    }
+
+    for boundary in &boundaries {
+        let delimiter = format!("--{}", boundary);
+        for part in content.split(&delimiter) {
+            let Some(hdr_end) = part.find("\n\n").or_else(|| part.find("\r\n\r\n")) else { continue };
+            let headers = &part[..hdr_end];
+            let body_start = if part[hdr_end..].starts_with("\r\n\r\n") { hdr_end + 4 } else { hdr_end + 2 };
+            let body = &part[body_start..];
+            let headers_lower = headers.to_lowercase();
+
+            // Skip text/* and multipart/* parts
+            if headers_lower.contains("text/plain") || headers_lower.contains("text/html")
+                || headers_lower.contains("text/calendar") || headers_lower.contains("multipart/") {
+                continue;
+            }
+
+            // Must have a Content-Type with a non-text type
+            let ct_re = regex::Regex::new(r#"(?i)Content-Type:\s*([^;\n]+)"#).unwrap();
+            let Some(ct_cap) = ct_re.captures(headers) else { continue };
+            let ctype = ct_cap.get(1).unwrap().as_str().trim().to_string();
+
+            // Get filename from name= or filename=
+            let name_re = regex::Regex::new(r#"(?i)(?:name|filename)="([^"]+)""#).unwrap();
+            let filename = name_re.captures(headers)
+                .map(|c| c.get(1).unwrap().as_str().to_string())
+                .unwrap_or_else(|| format!("attachment_{}", atts.len() + 1));
+
+            // Skip if already found this filename
+            if atts.iter().any(|a: &serde_json::Value| a["name"].as_str() == Some(&filename)) { continue; }
+
+            // Decode body to temp file
+            let is_b64 = headers_lower.contains("base64");
+            let tmp_path = format!("/tmp/kastrup_att_{}_{}", msg_id, filename);
+            if is_b64 {
+                if let Some(bytes) = sources::maildir::base64_decode(body.trim()) {
+                    let _ = std::fs::write(&tmp_path, &bytes);
+                }
+            } else {
+                let _ = std::fs::write(&tmp_path, body);
+            }
+
+            let is_image = ctype.starts_with("image/");
+            atts.push(serde_json::json!({
+                "name": filename,
+                "filename": filename,
+                "content_type": ctype,
+                "size": std::fs::metadata(&tmp_path).map(|m| m.len()).unwrap_or(0),
+                "source_file": tmp_path,
+                "url": format!("file://{}", tmp_path),
+                "is_image": is_image,
+            }));
+        }
+    }
+    atts
+}
+
+/// Convert ISO-8859-1 / Windows-1252 bytes to UTF-8 string.
+fn latin1_to_utf8(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
+}
+
+/// Decode quoted-printable to raw bytes (for charset-aware conversion).
+fn decode_qp_bytes_body(s: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(s.len());
+    let input = s.as_bytes();
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'=' {
+            if i + 1 < input.len() && (input[i + 1] == b'\r' || input[i + 1] == b'\n') {
+                i += 1;
+                if i < input.len() && input[i] == b'\r' { i += 1; }
+                if i < input.len() && input[i] == b'\n' { i += 1; }
+            } else if i + 2 < input.len() {
+                let hex = &s[i + 1..i + 3];
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    bytes.push(byte);
+                    i += 3;
+                } else {
+                    bytes.push(b'=');
+                    i += 1;
+                }
+            } else {
+                bytes.push(b'=');
+                i += 1;
+            }
+        } else {
+            bytes.push(input[i]);
+            i += 1;
+        }
+    }
+    bytes
 }
 
 /// Decode quoted-printable encoding: =XX hex escapes, =\n soft line breaks
