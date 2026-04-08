@@ -112,11 +112,31 @@ pub struct ViewDef {
 pub struct Identity {
     pub name: String,
     pub email: String,
-    pub signature: String,
+    pub signature_path: String, // path to sig file/script (expanded ~)
     pub smtp: Option<String>,
 }
 
-/// Application configuration loaded from ~/.heathrow/config.yml and ~/.heathrowrc
+impl Identity {
+    /// Get signature text. If path is executable, run it each time for fresh output.
+    /// If it's a file, read it. Preserves leading whitespace.
+    pub fn signature(&self) -> String {
+        if self.signature_path.is_empty() { return String::new(); }
+        let p = std::path::Path::new(&self.signature_path);
+        if !p.exists() { return String::new(); }
+        use std::os::unix::fs::PermissionsExt;
+        if p.metadata().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false) {
+            std::process::Command::new(&self.signature_path).output()
+                .ok().and_then(|o| String::from_utf8(o.stdout).ok())
+                .unwrap_or_default()
+                .trim_end().to_string()
+        } else {
+            std::fs::read_to_string(&self.signature_path).unwrap_or_default()
+                .trim_end().to_string()
+        }
+    }
+}
+
+/// Application configuration loaded from ~/.kastrup/config.yml and ~/.kastrup/kastruprc
 pub struct Config {
     pub color_theme: String,
     pub date_format: String,
@@ -168,7 +188,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Save current settings to ~/.heathrow/config.yml
+    /// Save current settings to ~/.kastrup/config.yml
     /// Loads existing YAML first and merges, preserving unknown keys.
     pub fn save(&self) {
         let path = config_yml_path();
@@ -219,7 +239,7 @@ impl Config {
         let _ = std::fs::write(path, yaml);
     }
 
-    /// Load configuration from ~/.heathrow/config.yml and ~/.heathrowrc
+    /// Load configuration from ~/.kastrup/config.yml and ~/.kastrup/kastruprc
     pub fn load() -> Self {
         let mut config = Config::default();
         config.load_yaml();  // Loads theme name + saved color overrides
@@ -228,7 +248,7 @@ impl Config {
         config
     }
 
-    /// Load settings from ~/.heathrow/config.yml
+    /// Load settings from ~/.kastrup/config.yml
     fn load_yaml(&mut self) {
         let path = config_yml_path();
         let content = match std::fs::read_to_string(&path) {
@@ -324,7 +344,7 @@ impl Config {
         }
     }
 
-    /// Load settings from ~/.heathrowrc (Ruby-style config, pattern-matched)
+    /// Load settings from ~/.kastrup/kastruprc (Ruby-style config, pattern-matched)
     fn load_rc(&mut self) {
         let path = rc_path();
         let content = match std::fs::read_to_string(&path) {
@@ -332,9 +352,83 @@ impl Config {
             Err(_) => return,
         };
 
+        // Pre-process: join continuation lines (lines after identity/folder_hook that start with whitespace)
+        let mut joined_lines: Vec<String> = Vec::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                joined_lines.push(line.to_string());
+                continue;
+            }
+            // Continuation: starts with whitespace and previous line ends with comma
+            if (line.starts_with(' ') || line.starts_with('\t'))
+                && !joined_lines.is_empty()
+                && joined_lines.last().map(|l| l.trim_end().ends_with(',')).unwrap_or(false)
+            {
+                if let Some(last) = joined_lines.last_mut() {
+                    last.push(' ');
+                    last.push_str(trimmed);
+                }
+            } else {
+                joined_lines.push(line.to_string());
+            }
+        }
+
+        // Parse identities and folder_hooks from joined lines
+        let home = std::env::var("HOME").unwrap_or_default();
+        for jline in &joined_lines {
+            let t = jline.trim();
+            if t.starts_with("identity ") {
+                // identity 'name', from: 'X', signature: 'Y', smtp: 'Z'
+                let ident_re = regex::Regex::new(
+                    r#"identity\s+['"](\w+)['"]\s*,\s*(.+)"#
+                ).unwrap();
+                if let Some(caps) = ident_re.captures(t) {
+                    let iname = caps.get(1).unwrap().as_str().to_string();
+                    let rest = caps.get(2).unwrap().as_str();
+                    let from_re = regex::Regex::new(r#"from:\s*['"]([^'"]+)['"]"#).unwrap();
+                    let sig_re = regex::Regex::new(r#"signature:\s*['"]([^'"]+)['"]"#).unwrap();
+                    let smtp_re = regex::Regex::new(r#"smtp:\s*['"]([^'"]+)['"]"#).unwrap();
+
+                    let from_val = from_re.captures(rest).map(|c| c.get(1).unwrap().as_str().to_string()).unwrap_or_default();
+                    let sig_path = sig_re.captures(rest).map(|c| {
+                        c.get(1).unwrap().as_str().replace("~/", &format!("{}/", home))
+                    }).unwrap_or_default();
+                    let smtp_val = smtp_re.captures(rest).map(|c| {
+                        c.get(1).unwrap().as_str().replace("~/", &format!("{}/", home))
+                    });
+
+                    // Parse "Name <email>" from the from field
+                    let (pname, pemail) = if let Some(lt) = from_val.find('<') {
+                        (from_val[..lt].trim().to_string(), from_val[lt+1..].trim_end_matches('>').to_string())
+                    } else {
+                        (String::new(), from_val.clone())
+                    };
+
+                    self.identities.insert(iname, Identity {
+                        name: pname,
+                        email: pemail,
+                        signature_path: sig_path,
+                        smtp: smtp_val,
+                    });
+                }
+            }
+            if t.starts_with("folder_hook") {
+                // folder_hook /pattern/i, 'identity_name'
+                let fh_re = regex::Regex::new(
+                    r#"folder_hook\s+/([^/]+)/\w*\s*,\s*['"](\w+)['"]"#
+                ).unwrap();
+                if let Some(caps) = fh_re.captures(t) {
+                    let pattern = caps.get(1).unwrap().as_str().to_string();
+                    let ident_name = caps.get(2).unwrap().as_str().to_string();
+                    self.folder_hooks.push((pattern, ident_name));
+                }
+            }
+        }
+
         let set_re = regex::Regex::new(r#"^\s*set\s+:(\w+)\s*,\s*(.+)$"#).unwrap();
 
-        for line in content.lines() {
+        for line in joined_lines.iter() {
             let trimmed = line.trim();
             // Skip comments and empty lines
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -427,6 +521,11 @@ impl Config {
                 }
             }
 
+            // Parse identity blocks (multi-line: identity 'name', from: ..., signature: ..., smtp: ...)
+            // Collected as single joined line from continuation lines
+            // Parse folder_hook /pattern/i, 'identity_name'
+            // (These are handled in a second pass below)
+
             // Parse bind :key, "command"
             if trimmed.starts_with("bind") {
                 let bind_re = regex::Regex::new(
@@ -454,6 +553,22 @@ impl Config {
     }
 }
 
+impl Config {
+    /// Get identity for a folder name (first matching folder_hook wins, fallback to 'default')
+    pub fn identity_for_folder(&self, folder: Option<&str>) -> Option<&Identity> {
+        let folder = folder.unwrap_or("INBOX");
+        for (pattern, ident_name) in &self.folder_hooks {
+            // Case-insensitive prefix/contains match (simplified from Ruby regex)
+            if let Ok(re) = regex::RegexBuilder::new(pattern).case_insensitive(true).build() {
+                if re.is_match(folder) {
+                    return self.identities.get(ident_name);
+                }
+            }
+        }
+        self.identities.get("default")
+    }
+}
+
 /// Strip surrounding Ruby quotes from a value string
 fn strip_ruby_quotes(s: &str) -> &str {
     let s = s.trim();
@@ -466,14 +581,20 @@ fn strip_ruby_quotes(s: &str) -> &str {
     }
 }
 
-/// Path to ~/.heathrow/config.yml
-fn config_yml_path() -> PathBuf {
+/// Path to ~/.kastrup (config home, created if missing)
+fn kastrup_home() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".heathrow").join("config.yml")
+    let dir = PathBuf::from(home).join(".kastrup");
+    if !dir.exists() { let _ = std::fs::create_dir_all(&dir); }
+    dir
 }
 
-/// Path to ~/.heathrowrc
+/// Path to ~/.kastrup/config.yml
+fn config_yml_path() -> PathBuf {
+    kastrup_home().join("config.yml")
+}
+
+/// Path to ~/.kastrup/kastruprc
 fn rc_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".heathrowrc")
+    kastrup_home().join("kastruprc")
 }

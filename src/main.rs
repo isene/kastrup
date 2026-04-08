@@ -26,7 +26,7 @@ enum DbWriteOp {
     Execute(String, Vec<String>), // raw SQL with string params
 }
 
-use config::Config;
+use config::{Config, Identity};
 use database::{Database, Filters};
 use message::Message;
 
@@ -183,6 +183,7 @@ struct App {
     feedback_expires: Option<std::time::Instant>,
 
     showing_image: bool,
+    right_pane_msg_id: Option<i64>,
     image_display: Option<glow::Display>,
 
     // Threading state
@@ -303,6 +304,7 @@ fn main() {
         feedback_message: None,
         feedback_expires: None,
         showing_image: false,
+        right_pane_msg_id: None,
         image_display: None,
         show_threaded: false,
         group_by_folder: false,
@@ -1086,7 +1088,7 @@ impl App {
         }
 
         // HTML indicator
-        let has_mime_html = msg.content.contains("Content-Type:") && msg.content.lines().any(|l| l.starts_with("--"));
+        let has_mime_html = msg.content.contains("Content-Type:") && msg.content.lines().any(|l| l.starts_with("--") && l.len() > 5);
         if msg.html_content.is_some() || has_mime_html {
             lines.push(style::fg("HTML mail, press x to open in browser", tc.html_hint));
             lines.push(String::new());
@@ -1098,7 +1100,7 @@ impl App {
         let raw = &msg.content;
         // Try MIME multipart extraction first
         let looks_mime = raw.contains("boundary=")
-            || (raw.contains("Content-Type:") && raw.lines().any(|l| l.starts_with("--") && l.len() > 4));
+            || (raw.contains("Content-Type:") && raw.lines().any(|l| l.starts_with("--") && l.len() > 5));
         let extracted = if looks_mime {
             extract_mime_text(raw).unwrap_or_else(|| raw.clone())
         } else if raw.contains("Content-Transfer-Encoding: quoted-printable") {
@@ -1146,8 +1148,15 @@ impl App {
             }
         }
 
+        // Only reset scroll when viewing a different message
+        let current_id = self.filtered_messages.get(self.index).map(|m| m.id);
+        let msg_changed = current_id != self.right_pane_msg_id;
+        self.right_pane_msg_id = current_id;
+
         self.right.set_text(&lines.join("\n"));
-        self.right.ix = 0;
+        if msg_changed {
+            self.right.ix = 0;
+        }
         self.right.full_refresh();
         if self.right.border { self.right.border_refresh(); }
     }
@@ -2697,7 +2706,7 @@ impl App {
                 // Get best HTML to display: html_content > MIME extraction > raw content
                 let html = if let Some(ref h) = msg.html_content {
                     h.clone()
-                } else if msg.content.contains("Content-Type:") || msg.content.lines().any(|l| l.starts_with("--") && l.len() > 4) {
+                } else if msg.content.contains("Content-Type:") || msg.content.lines().any(|l| l.starts_with("--") && l.len() > 5) {
                     extract_mime_html(&msg.content).unwrap_or_else(|| {
                         // Wrap raw text in HTML as last resort
                         let text = msg.content.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
@@ -2726,7 +2735,7 @@ impl App {
             } else {
                 let html = if let Some(ref h) = msg.html_content {
                     Some(h.clone())
-                } else if msg.content.contains("Content-Type:") || msg.content.lines().any(|l| l.starts_with("--") && l.len() > 4) {
+                } else if msg.content.contains("Content-Type:") || msg.content.lines().any(|l| l.starts_with("--") && l.len() > 5) {
                     Some(extract_mime_html(&msg.content).unwrap_or_else(|| {
                         let text = msg.content.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
                         format!("<html><head><meta charset=\"utf-8\"><style>body{{font-family:monospace;white-space:pre-wrap;padding:1em}}</style></head><body>{}</body></html>", text)
@@ -3450,10 +3459,21 @@ impl App {
 // --- Compose / Reply / Forward ---
 
 impl App {
+    /// Get the current folder of the selected message (for identity resolution).
+    fn current_folder(&self) -> Option<String> {
+        self.filtered_messages.get(self.index)
+            .and_then(|m| m.folder.clone())
+    }
+
+    /// Get the identity for the current context (folder-hook match).
+    fn current_identity(&self) -> Option<&Identity> {
+        let folder = self.current_folder();
+        self.config.identity_for_folder(folder.as_deref())
+    }
+
     /// Get the "From:" identity string for composing.
-    /// Uses default_email, or the first identity if configured.
     fn compose_from(&self) -> String {
-        if let Some((_key, ident)) = self.config.identities.iter().next() {
+        if let Some(ident) = self.current_identity() {
             if !ident.name.is_empty() {
                 format!("{} <{}>", ident.name, ident.email)
             } else {
@@ -3466,7 +3486,7 @@ impl App {
 
     /// Get the email address (bare) for the identity.
     fn compose_email(&self) -> String {
-        if let Some((_key, ident)) = self.config.identities.iter().next() {
+        if let Some(ident) = self.current_identity() {
             ident.email.clone()
         } else {
             self.config.default_email.clone()
@@ -3475,12 +3495,24 @@ impl App {
 
     /// Get signature text for the identity, if any.
     fn compose_signature(&self) -> String {
-        if let Some((_key, ident)) = self.config.identities.iter().next() {
-            if !ident.signature.is_empty() {
-                return format!("-- \n{}", ident.signature);
+        if let Some(ident) = self.current_identity() {
+            let sig = ident.signature();
+            if !sig.is_empty() {
+                return format!("-- \n{}", sig);
             }
         }
         String::new()
+    }
+
+    /// Get the SMTP command for the current identity.
+    fn compose_smtp(&self) -> String {
+        if let Some(ident) = self.current_identity() {
+            if let Some(ref smtp) = ident.smtp {
+                return smtp.clone();
+            }
+        }
+        let home = std::env::var("HOME").unwrap_or_default();
+        self.config.smtp_command.replace("~/", &format!("{}/", home))
     }
 
     /// Ensure the selected message has full content loaded.
@@ -3536,7 +3568,7 @@ impl App {
             template.push('\n');
         }
 
-        self.run_editor_compose(&template);
+        self.run_editor_compose_at(&template, None);
     }
 
     fn reply_all(&mut self) {
@@ -3593,7 +3625,7 @@ impl App {
             template.push('\n');
         }
 
-        self.run_editor_compose(&template);
+        self.run_editor_compose_at(&template, None);
     }
 
     fn forward(&mut self) {
@@ -3638,7 +3670,7 @@ impl App {
             template.push('\n');
         }
 
-        self.run_editor_compose(&template);
+        self.run_editor_compose_at(&template, None);
     }
 
     fn compose_to(&mut self, to: &str, subject: &str) {
@@ -3661,7 +3693,7 @@ impl App {
             template.push('\n');
         }
 
-        self.run_editor_compose(&template);
+        self.run_editor_compose_at(&template, None);
     }
 
     fn compose_new(&mut self) {
@@ -3682,7 +3714,7 @@ impl App {
                     if let Some((draft_id, data)) = draft {
                         let _ = conn.execute("DELETE FROM postponed WHERE id = ?", rusqlite::params![draft_id]);
                         drop(conn);
-                        self.run_editor_compose(&data);
+                        self.run_editor_compose_at(&data, None);
                         return;
                     }
                 }
@@ -3709,7 +3741,7 @@ impl App {
             template.push('\n');
         }
 
-        self.run_editor_compose(&template);
+        self.run_editor_compose_at(&template, Some(2)); // cursor on To: line
     }
 
     /// Get displayable text content from a message, converting HTML if needed.
@@ -3753,7 +3785,7 @@ impl App {
         plugins
     }
 
-    fn run_editor_compose(&mut self, template: &str) {
+    fn run_editor_compose_at(&mut self, template: &str, start_line: Option<usize>) {
         let tmpfile = format!("/tmp/kastrup_compose_{}.eml", std::process::id());
         if std::fs::write(&tmpfile, template).is_err() {
             self.set_feedback("Failed to create temp file", 196);
@@ -3765,12 +3797,10 @@ impl App {
 
         Crust::cleanup();
 
-        // Find cursor position (line after first blank line = body start)
-        let cursor_line = template
-            .lines()
-            .position(|l| l.is_empty())
-            .unwrap_or(0)
-            + 2;
+        // Cursor position: explicit or default to body start (after first blank line)
+        let cursor_line = start_line.unwrap_or_else(|| {
+            template.lines().position(|l| l.is_empty()).unwrap_or(0) + 2
+        });
 
         // Build full command string and pass through sh -c to handle quoted args properly
         let escaped_file = crust::shell_escape(&tmpfile);
@@ -3819,7 +3849,7 @@ impl App {
                                 }
                                 "e" => {
                                     let _ = std::fs::remove_file(&tmpfile);
-                                    self.run_editor_compose(&content);
+                                    self.run_editor_compose_at(&content, None);
                                     return;
                                 }
                                 "p" => {
@@ -4831,7 +4861,7 @@ fn extract_mime_text(raw: &str) -> Option<String> {
     } else {
         // Look for first line starting with "--" (common in body-only MIME content)
         raw.lines()
-            .find(|l| l.starts_with("--") && l.len() > 4 && !l.starts_with("---"))
+            .find(|l| l.starts_with("--") && l.len() > 5)
             .map(|l| l[2..].trim_end_matches(':').trim().to_string())?
     };
 
@@ -4869,7 +4899,7 @@ fn extract_mime_html(raw: &str) -> Option<String> {
             .or_else(|| rest.split_whitespace().next())?.to_string()
     } else {
         raw.lines()
-            .find(|l| l.starts_with("--") && l.len() > 4 && !l.starts_with("---"))
+            .find(|l| l.starts_with("--") && l.len() > 5)
             .map(|l| l[2..].trim_end_matches(':').trim().to_string())?
     };
     let delimiter = format!("--{}", boundary);
