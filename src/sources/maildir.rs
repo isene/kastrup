@@ -242,7 +242,7 @@ pub fn decode_rfc2047(s: &str) -> String {
     result
 }
 
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let table: [u8; 128] = {
         let mut t = [255u8; 128];
         for (i, &c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".iter().enumerate() {

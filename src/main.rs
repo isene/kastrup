@@ -4868,27 +4868,42 @@ fn extract_mime_text(raw: &str) -> Option<String> {
     let delimiter = format!("--{}", boundary);
     let parts: Vec<&str> = raw.split(&delimiter).collect();
 
-    // Find text/plain part first, fall back to text/html
+    // Find text/plain part first, fall back to text/html, then text/calendar
     let mut text_part = None;
     let mut html_part = None;
+    let mut cal_part = None;
     for part in &parts {
         let lower = part.to_lowercase();
         if let Some(header_end) = part.find("\n\n").or_else(|| part.find("\r\n\r\n")) {
             let headers = &part[..header_end];
             let body_start = if part[header_end..].starts_with("\r\n\r\n") { header_end + 4 } else { header_end + 2 };
             let body = &part[body_start..];
-            let is_qp = headers.to_lowercase().contains("quoted-printable");
-            let decoded = if is_qp { decode_quoted_printable(body) } else { body.to_string() };
+            let headers_lower = headers.to_lowercase();
+            let is_qp = headers_lower.contains("quoted-printable");
+            let is_b64 = headers_lower.contains("base64");
 
-            if lower.contains("text/plain") && !decoded.trim().is_empty() {
-                text_part = Some(decoded);
+            if lower.contains("text/plain") {
+                let decoded = if is_qp { decode_quoted_printable(body) } else { body.to_string() };
+                if !decoded.trim().is_empty() { text_part = Some(decoded); }
             } else if lower.contains("text/html") {
+                let decoded = if is_qp { decode_quoted_printable(body) } else { body.to_string() };
                 html_part = Some(decoded);
+            } else if lower.contains("text/calendar") && cal_part.is_none() {
+                let decoded = if is_b64 {
+                    sources::maildir::base64_decode(body.trim())
+                        .and_then(|b| String::from_utf8(b).ok())
+                        .unwrap_or_default()
+                } else {
+                    body.to_string()
+                };
+                if !decoded.is_empty() { cal_part = Some(parse_ical_summary(&decoded)); }
             }
         }
     }
 
-    text_part.or_else(|| html_part.map(|h| html_to_text(&h)))
+    text_part
+        .or_else(|| html_part.map(|h| html_to_text(&h)))
+        .or(cal_part)
 }
 
 /// Extract raw HTML from MIME multipart content (for browser display).
@@ -4925,6 +4940,214 @@ fn extract_mime_html(raw: &str) -> Option<String> {
         format!("<html><head><meta charset=\"utf-8\"><style>body{{font-family:monospace;white-space:pre-wrap;padding:1em;background:#1a1a2e;color:#eee}}</style></head><body>{}</body></html>",
             text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"))
     })
+}
+
+/// Parse an iCalendar string and return a colored, human-readable summary.
+/// Matches VcalView output: WHAT/WHEN/WHERE/TIMEZONE/RECURRENCE/STATUS/ORGANIZER/PARTICIPANTS/DESCRIPTION.
+fn parse_ical_summary(ical: &str) -> String {
+    let mut method = String::new();
+    let mut summary = String::new();
+    let mut dtstart_raw = String::new();
+    let mut dtend_raw = String::new();
+    let mut timezone = String::new();
+    let mut location = String::new();
+    let mut organizer = String::new();
+    let mut attendees: Vec<(String, String)> = Vec::new(); // (name, status)
+    let mut status = String::new();
+    let mut priority = String::new();
+    let mut rrule = String::new();
+    let mut description = String::new();
+    let mut all_day = false;
+
+    // Unfold continuation lines (RFC 5545)
+    let unfolded = ical.replace("\r\n ", "").replace("\r\n\t", "").replace("\n ", "").replace("\n\t", "");
+
+    for line in unfolded.lines() {
+        let l = line.trim();
+        if l.starts_with("METHOD:") { method = l[7..].to_string(); }
+        else if l.starts_with("SUMMARY;") {
+            if let Some(pos) = l.find(':') { summary = l[pos+1..].replace("\\n", "\n").replace("\\,", ","); }
+        }
+        else if l.starts_with("SUMMARY:") { summary = l[8..].replace("\\n", "\n").replace("\\,", ","); }
+        else if l.starts_with("DTSTART") {
+            if l.contains("VALUE=DATE:") { all_day = true; }
+            if l.contains("TZID=") {
+                if let Some(tz_start) = l.find("TZID=") {
+                    let rest = &l[tz_start+5..];
+                    timezone = rest.split(':').next().unwrap_or("").to_string();
+                }
+            }
+            if let Some(pos) = l.find(':') { dtstart_raw = l[pos+1..].to_string(); }
+        }
+        else if l.starts_with("DTEND") {
+            if let Some(pos) = l.find(':') { dtend_raw = l[pos+1..].to_string(); }
+        }
+        else if l.starts_with("LOCATION:") { location = l[9..].replace("\\n", " ").replace("\\,", ","); }
+        else if l.starts_with("ORGANIZER") {
+            if let Some(cn) = l.find("CN=") {
+                let rest = &l[cn+3..];
+                let name = rest.split(|c: char| c == ';' || c == ':').next().unwrap_or("");
+                let email = if let Some(mailto) = l.to_lowercase().find("mailto:") {
+                    let e = &l[mailto+7..];
+                    format!(" <{}>", e.split(|c: char| c == ';' || c == '>' || c == '\n').next().unwrap_or(""))
+                } else { String::new() };
+                organizer = format!("{}{}", name, email);
+            } else if let Some(mailto) = l.to_lowercase().find("mailto:") {
+                organizer = l[mailto+7..].to_string();
+            }
+        }
+        else if l.starts_with("ATTENDEE") {
+            let name = if let Some(cn) = l.find("CN=") {
+                let rest = &l[cn+3..];
+                rest.split(|c: char| c == ';' || c == ':').next().unwrap_or("").to_string()
+            } else if let Some(mailto) = l.to_lowercase().find("mailto:") {
+                l[mailto+7..].split(|c: char| c == ';' || c == '\n').next().unwrap_or("").to_string()
+            } else { continue; };
+            let pstat = if l.contains("ACCEPTED") { "accepted".into() }
+                else if l.contains("DECLINED") { "declined".into() }
+                else if l.contains("TENTATIVE") { "tentative".into() }
+                else if l.contains("NEEDS-ACTION") { "needs action".into() }
+                else { String::new() };
+            attendees.push((name, pstat));
+        }
+        else if l.starts_with("STATUS:") { status = l[7..].to_string(); }
+        else if l.starts_with("PRIORITY:") {
+            priority = match l[9..].trim() {
+                "1" | "2" => "High".into(),
+                "3" | "4" | "5" => "Normal".into(),
+                "6" | "7" | "8" | "9" => "Low".into(),
+                v => v.to_string(),
+            };
+        }
+        else if l.starts_with("RRULE:") { rrule = parse_rrule_display(&l[6..]); }
+        else if l.starts_with("DESCRIPTION:") {
+            description = l[12..].replace("\\n", "\n").replace("\\,", ",").replace("\\;", ";");
+        }
+    }
+
+    // Format date/time
+    let fmt_dt = |s: &str| -> String {
+        if s.len() >= 8 {
+            let date = format!("{}-{}-{}", &s[0..4], &s[4..6], &s[6..8]);
+            if s.len() >= 13 && s.contains('T') {
+                let t_pos = s.find('T').unwrap_or(8);
+                let time_part = &s[t_pos+1..];
+                if time_part.len() >= 4 {
+                    format!("{} {}:{}", date, &time_part[0..2], &time_part[2..4])
+                } else { date }
+            } else { date }
+        } else { s.to_string() }
+    };
+
+    let weekday = if dtstart_raw.len() >= 8 {
+        let y: i32 = dtstart_raw[0..4].parse().unwrap_or(2026);
+        let m: u32 = dtstart_raw[4..6].parse().unwrap_or(1);
+        let d: u32 = dtstart_raw[6..8].parse().unwrap_or(1);
+        // Zeller's formula for day of week (0=Sun..6=Sat -> name)
+        let (yy, mm) = if m <= 2 { (y - 1, m + 12) } else { (y, m) };
+        let q = d as i32;
+        let k = yy % 100; let j = yy / 100;
+        let h = (q + (13 * (mm as i32 + 1)) / 5 + k + k / 4 + j / 4 + 5 * j) % 7;
+        match ((h + 5) % 7 + 1) as u32 {
+            1 => "Monday", 2 => "Tuesday", 3 => "Wednesday", 4 => "Thursday",
+            5 => "Friday", 6 => "Saturday", _ => "Sunday",
+        }
+    } else { "" };
+
+    let when = if all_day {
+        if dtstart_raw == dtend_raw || dtend_raw.is_empty() {
+            format!("{} ({}) - All day", fmt_dt(&dtstart_raw), weekday)
+        } else {
+            format!("{} to {} - All day", fmt_dt(&dtstart_raw), fmt_dt(&dtend_raw))
+        }
+    } else if !dtstart_raw.is_empty() {
+        if dtend_raw.is_empty() {
+            format!("{} ({})", fmt_dt(&dtstart_raw), weekday)
+        } else {
+            let sd = fmt_dt(&dtstart_raw);
+            let ed = fmt_dt(&dtend_raw);
+            if sd.len() > 10 && ed.len() > 10 && sd[..10] == ed[..10] {
+                // Same day: show date once with time range
+                format!("{} - {} ({})", sd, &ed[11..], weekday)
+            } else {
+                format!("{} - {} ({})", sd, ed, weekday)
+            }
+        }
+    } else { String::new() };
+
+    let kind = match method.to_uppercase().as_str() {
+        "REPLY" => "Calendar Reply",
+        "REQUEST" => "Calendar Invite",
+        "CANCEL" => "Cancellation",
+        "PUBLISH" => "Calendar Event",
+        _ => "Calendar Event",
+    };
+
+    // Build colored output
+    let lbl = |s: &str| style::fg(s, 51);   // cyan labels
+    let val = |s: &str| style::fg(s, 252);   // light text
+    let hi  = |s: &str| style::bold(&style::fg(s, 156)); // green bold
+
+    let mut lines = Vec::new();
+    lines.push(style::bold(&style::fg(&format!("[{}]", kind), 226)));
+    lines.push(String::new());
+    if !summary.is_empty() { lines.push(format!("{}  {}", lbl("WHAT:"), hi(&summary))); }
+    if !when.is_empty() { lines.push(format!("{}  {}", lbl("WHEN:"), val(&when))); }
+    if !timezone.is_empty() { lines.push(format!("{}  {}", lbl("  TZ:"), style::fg(&timezone, 245))); }
+    if !location.is_empty() { lines.push(format!("{} {}", lbl("WHERE:"), val(&location))); }
+    if !rrule.is_empty() { lines.push(format!("{} {}", lbl("RECUR:"), val(&rrule))); }
+    if !status.is_empty() {
+        let sc = match status.to_uppercase().as_str() {
+            "CONFIRMED" => 46, "CANCELLED" | "CANCELED" => 196, "TENTATIVE" => 226,
+            _ => 252,
+        };
+        lines.push(format!("{}  {}", lbl("STATUS:"), style::fg(&status, sc)));
+    }
+    if !priority.is_empty() { lines.push(format!("{}  {}", lbl("PRIORITY:"), val(&priority))); }
+    lines.push(String::new());
+    if !organizer.is_empty() { lines.push(format!("{} {}", lbl("ORGANIZER:"), val(&organizer))); }
+    if !attendees.is_empty() {
+        lines.push(format!("{}", lbl("PARTICIPANTS:")));
+        for (name, pstat) in &attendees {
+            let status_str = if pstat.is_empty() { String::new() }
+                else {
+                    let sc = match pstat.as_str() {
+                        "accepted" => 46, "declined" => 196, "tentative" => 226, _ => 245,
+                    };
+                    format!(" ({})", style::fg(pstat, sc))
+                };
+            lines.push(format!("  {}{}", val(name), status_str));
+        }
+    }
+    if !description.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("{}", lbl("DESCRIPTION:")));
+        for dline in description.lines() {
+            lines.push(style::fg(dline, 248));
+        }
+    }
+    lines.join("\n")
+}
+
+fn parse_rrule_display(rrule: &str) -> String {
+    let mut parts = std::collections::HashMap::new();
+    for p in rrule.split(';') {
+        if let Some((k, v)) = p.split_once('=') { parts.insert(k.to_string(), v.to_string()); }
+    }
+    let interval = parts.get("INTERVAL").map(|v| v.as_str()).unwrap_or("1");
+    let freq = parts.get("FREQ").map(|v| v.as_str()).unwrap_or("");
+    let mut s = match freq {
+        "DAILY" => if interval == "1" { "Daily".into() } else { format!("Every {} days", interval) },
+        "WEEKLY" => if interval == "1" { "Weekly".into() } else { format!("Every {} weeks", interval) },
+        "MONTHLY" => if interval == "1" { "Monthly".into() } else { format!("Every {} months", interval) },
+        "YEARLY" => if interval == "1" { "Yearly".into() } else { format!("Every {} years", interval) },
+        _ => freq.to_string(),
+    };
+    if let Some(count) = parts.get("COUNT") { s += &format!(" ({} times)", count); }
+    if let Some(until) = parts.get("UNTIL") {
+        if until.len() >= 8 { s += &format!(" (until {}-{}-{})", &until[0..4], &until[4..6], &until[6..8]); }
+    }
+    s
 }
 
 /// Decode quoted-printable encoding: =XX hex escapes, =\n soft line breaks
