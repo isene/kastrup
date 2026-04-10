@@ -62,6 +62,7 @@ impl Poller {
 
                     let count = messages.len();
                     if count > 0 {
+                        crate::log::info(&format!("Poller: {} new messages from source {}", count, source.name));
                         // Add new external_ids to cache (exact + base without flags)
                         for msg in &messages {
                             known.insert(msg.external_id.clone());

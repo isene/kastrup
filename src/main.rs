@@ -1,5 +1,6 @@
 mod config;
 mod database;
+mod log;
 mod message;
 mod organizer;
 mod poller;
@@ -184,6 +185,9 @@ struct App {
 
     showing_image: bool,
     right_pane_msg_id: Option<i64>,
+    pending_forward_ids: Vec<i64>,
+    pending_forward_attachments: Vec<String>,
+    compose_source_type: Option<String>,
     image_display: Option<glow::Display>,
 
     // Threading state
@@ -200,9 +204,11 @@ struct App {
     // Help state
     showing_help: bool,
     help_extended: bool,
+    right_pane_locked: bool,
 }
 
 fn main() {
+    log::info(&format!("Kastrup v{} starting", env!("CARGO_PKG_VERSION")));
     // Parse CLI args: --compose-to EMAIL --subject SUBJECT, or mailto:URL
     let args: Vec<String> = std::env::args().collect();
     let mut compose_to: Option<String> = None;
@@ -305,6 +311,9 @@ fn main() {
         feedback_expires: None,
         showing_image: false,
         right_pane_msg_id: None,
+        pending_forward_ids: Vec::new(),
+        pending_forward_attachments: Vec::new(),
+        compose_source_type: None,
         image_display: None,
         show_threaded: false,
         group_by_folder: false,
@@ -315,6 +324,7 @@ fn main() {
         write_tx,
         showing_help: false,
         help_extended: false,
+        right_pane_locked: false,
     };
 
     // Apply config defaults
@@ -377,7 +387,7 @@ fn main() {
                     app.refresh_current_view();
                 }
                 // Periodic DB refresh (skip when showing inline images)
-                if !app.showing_image && app.last_db_refresh.elapsed().as_secs() >= 5 {
+                if !app.showing_image && app.delete_marked.is_empty() && app.last_db_refresh.elapsed().as_secs() >= 5 {
                     app.last_db_refresh = std::time::Instant::now();
                     app.refresh_current_view();
                 }
@@ -496,7 +506,22 @@ impl App {
             "r" => { self.reply(false); }
             "e" => { self.reply(true); }
             "g" => { self.reply_all(); }
-            "f" => { self.forward(); }
+            "f" => {
+                self.bottom.say(&style::fg(" Forward: i=Inline  a=Attach as .eml", 226));
+                if let Some(mode) = Input::getchr(Some(5)) {
+                    match mode.as_str() {
+                        "i" => {
+                            if self.tagged.is_empty() { self.forward_inline(); }
+                            else { self.forward_tagged_inline(); }
+                        }
+                        "a" => {
+                            if self.tagged.is_empty() { self.forward_attach(); }
+                            else { self.forward_tagged_attach(); }
+                        }
+                        _ => { self.render_bottom_bar(); }
+                    }
+                } else { self.render_bottom_bar(); }
+            }
             "m" => { self.compose_new(); }
             "E" => { self.edit_message(); }
 
@@ -533,16 +558,19 @@ impl App {
                 } else if self.showing_help && self.help_extended {
                     self.showing_help = false;
                     self.help_extended = false;
+                    self.right_pane_locked = false;
                     self.render_message_content();
                 } else {
                     self.show_help();
                     self.showing_help = true;
                     self.help_extended = false;
+                    self.right_pane_locked = true;
                 }
             }
             "y" => { self.copy_message_id(); }
             "Y" => { self.copy_right_pane(); }
             "B" => { self.show_folder_browser(); }
+
             "C-B" => { self.cycle_border(); }
 
             // Right pane scroll
@@ -648,7 +676,9 @@ impl App {
             self.render_source_info();
         } else {
             self.render_message_list();
-            self.render_message_content();
+            if !self.right_pane_locked {
+                self.render_message_content();
+            }
         }
         self.render_bottom_bar();
     }
@@ -807,9 +837,14 @@ impl App {
             " ".to_string()
         };
 
-        // Replied flag
-        let rflag = if msg.replied {
-            style::fg("\u{2190}", self.config.theme_colors.replied)
+        // Replied/forwarded flag
+        let forwarded = msg.metadata.get("forwarded").and_then(|v| v.as_bool()).unwrap_or(false);
+        let rflag = if msg.replied && forwarded {
+            style::fg("\u{2194}", self.config.theme_colors.replied) // ↔ both
+        } else if msg.replied {
+            style::fg("\u{2190}", self.config.theme_colors.replied) // ← replied
+        } else if forwarded {
+            style::fg("\u{2192}", self.config.theme_colors.replied) // → forwarded
         } else {
             " ".to_string()
         };
@@ -1136,9 +1171,19 @@ impl App {
                 .or_else(|| raw.find("\r\n\r\n").map(|p| p + 4))
                 .unwrap_or(0);
             decode_quoted_printable(&raw[body_start..])
+        } else if looks_base64(raw) {
+            // Raw base64 body (no MIME headers)
+            sources::maildir::base64_decode(raw.trim())
+                .and_then(|bytes| String::from_utf8(bytes).ok()
+                    .or_else(|| Some(latin1_to_utf8(&sources::maildir::base64_decode(raw.trim()).unwrap_or_default()))))
+                .unwrap_or_else(|| raw.clone())
         } else {
             raw.clone()
         };
+        // Decode any remaining QP soft line breaks (=\n) in the extracted text
+        let extracted = if extracted.contains("=\n") || extracted.contains("=\r\n") {
+            decode_quoted_printable(&extracted)
+        } else { extracted };
         let content = if let Some(ref html) = msg.html_content {
             if extracted.is_empty() || extracted.contains("HTML messages are not support")
                 || extracted.contains("not displayed") || extracted.trim().len() < 20 {
@@ -1156,7 +1201,17 @@ impl App {
             extracted
         };
         let mut in_signature = false;
+        let mut prev_blank = false;
         for line in content.lines() {
+            // Collapse consecutive blank lines to at most one
+            if line.trim().is_empty() {
+                if prev_blank { continue; }
+                prev_blank = true;
+                lines.push(String::new());
+                continue;
+            }
+            prev_blank = false;
+
             if line.starts_with("-- ") || line == "--" {
                 in_signature = true;
             }
@@ -1300,6 +1355,12 @@ impl App {
 // --- Navigation ---
 
 impl App {
+    fn unlock_right_pane(&mut self) {
+        self.right_pane_locked = false;
+        self.showing_help = false;
+        self.help_extended = false;
+    }
+
     fn move_down(&mut self) {
         let limit = if self.in_source_view {
             self.sources_list.len()
@@ -1314,6 +1375,7 @@ impl App {
         } else {
             self.index = 0; // Wrap around
         }
+        self.unlock_right_pane();
         if self.in_source_view {
             self.render_source_list();
             self.render_source_info();
@@ -1337,6 +1399,7 @@ impl App {
             };
             if limit > 0 { self.index = limit - 1; }
         }
+        self.unlock_right_pane();
         if self.in_source_view {
             self.render_source_list();
             self.render_source_info();
@@ -1399,6 +1462,7 @@ impl App {
 
 impl App {
     fn switch_to_view(&mut self, key: &str) {
+        log::info(&format!("Switch to view: {}", key));
         self.current_view = key.to_string();
         self.in_source_view = false;
         self.index = 0;
@@ -2574,68 +2638,67 @@ impl App {
     fn show_help(&mut self) {
         let help = format!("{}\n\n\
 {}\n\
-  j/k, Up/Down   Navigate messages\n\
-  h/Left          Collapse thread\n\
-  Space            Toggle collapse\n\
+  j/k Up/Down    Navigate messages\n\
+  h/Left         Collapse thread\n\
+  Space          Toggle collapse\n\
   PgDn/PgUp      Page down/up\n\
-  Home/End        First/last message\n\
-  Enter           Open message (mark read)\n\
-  n/p             Next/prev unread\n\
-  J               Jump to date\n\
-  G               Toggle threaded/flat view\n\n\
+  Home/End       First/last message\n\
+  Enter          Open message (mark read)\n\
+  n/p            Next/prev unread\n\
+  J              Jump to date\n\
+  G              Toggle threaded/flat view\n\n\
 {}\n\
-  A               All messages\n\
-  N               New (unread)\n\
-  S               Sources\n\
-  0-9             Custom views\n\
-  F1-F12          Extended views\n\
-  F               Favorites browser\n\
-  L               Load more messages\n\
-  Ctrl-R          Refresh current view\n\
-  Ctrl-F          Filter editor\n\
-  K               Kill (close) view\n\n\
+  A              All messages\n\
+  N              New (unread)\n\
+  S              Sources\n\
+  0-9            Custom views\n\
+  F1-F12         Extended views\n\
+  F              Favorites browser\n\
+  L              Load more messages\n\
+  Ctrl-R         Refresh current view\n\
+  Ctrl-F         Filter editor\n\
+  K              Kill (close) view\n\n\
 {}\n\
-  R               Toggle read/unread\n\
-  M               Mark all read\n\
-  */- toggle star\n\
-  t/T             Tag / tag all\n\
-  Ctrl-T          Tag by regex\n\
-  d               Mark for deletion\n\
-  <               Purge deleted\n\
-  u/U             Mark unseen\n\
-  Shift-Space     Mark browsed\n\n\
+  R              Toggle read/unread\n\
+  M              Mark all read\n\
+  */-            Toggle star\n\
+  t/T            Tag / tag all\n\
+  Ctrl-T         Tag by regex\n\
+  d              Mark for deletion\n\
+  <              Purge deleted\n\
+  u/U            Mark unseen\n\
+  Shift-Space    Mark browsed\n\n\
 {}\n\
-  r               Reply\n\
-  e               Reply in editor\n\
-  g               Reply-all\n\
-  f               Forward\n\
-  m               Compose new\n\
-  E               Edit draft\n\n\
+  r              Reply\n\
+  e              Reply in editor\n\
+  g              Reply-all\n\
+  f              Forward\n\
+  m              Compose new\n\
+  E              Edit draft\n\n\
 {}\n\
-  v               View/save attachments\n\
-  V               Inline image\n\
-  x               Open in external app\n\
-  X               Open HTML in browser\n\n\
+  v              View/save attachments\n\
+  V              Inline image\n\
+  x              Open in external app\n\
+  X              Open HTML in browser\n\n\
 {}\n\
-  /               Search messages\n\
-  @               Address book\n\
-  l               Label message\n\
-  s               File/save message\n\
-  +               Add to favorites\n\
-  I               AI assistant\n\
-  Z               Timely actions\n\n\
+  /              Search messages\n\
+  l              Label message\n\
+  s              File/save message\n\
+  +              Add to favorites\n\
+  I              AI assistant / plugins\n\
+  Z              Timely actions\n\n\
 {}\n\
-  o               Cycle sort order\n\
-  i               Invert sort\n\
-  w               Cycle pane width\n\
-  c               Set top bar color\n\
-  B               Folder browser\n\
-  Ctrl-B          Cycle border style\n\
-  D               Cycle date format\n\
-  P               Preferences\n\
-  y/Y             Copy ID / copy content\n\
-  Ctrl-L          Redraw\n\
-  q               Quit",
+  o              Cycle sort order\n\
+  i              Invert sort\n\
+  w              Cycle pane width\n\
+  c              Set top bar color\n\
+  B              Folder browser\n\
+  Ctrl-B         Cycle border style\n\
+  D              Cycle date format\n\
+  P              Preferences\n\
+  y/Y            Copy ID / copy content\n\
+  Ctrl-L         Redraw\n\
+  q              Quit",
             style::bold("Kastrup - Messaging Hub"),
             style::fg("Navigation", self.config.theme_colors.feedback_warn),
             style::fg("Views", self.config.theme_colors.feedback_warn),
@@ -2682,6 +2745,9 @@ impl App {
     }
 
     fn set_feedback(&mut self, msg: &str, color: u8) {
+        // Auto-log errors and warnings
+        if color == 196 { log::error(msg); }
+        else if color == self.config.theme_colors.feedback_warn { log::warn(msg); }
         self.feedback_message = Some((msg.to_string(), color));
         self.feedback_expires = Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
         self.render_bottom_bar();
@@ -2692,6 +2758,8 @@ impl App {
         let result = self.bottom.ask_with_bg(label, default, self.config.theme_colors.cmd_bg);
         // Restore bottom bar bg (ask_with_bg changes it to cmd_bg)
         self.bottom.bg = self.config.theme_colors.bottom_bg;
+        // Force full redraw: editline bypasses prev_frame, so diff render misses the change
+        self.bottom.full_refresh();
         self.render_bottom_bar();
         result
     }
@@ -3568,6 +3636,7 @@ impl App {
         if self.filtered_messages.is_empty() { return; }
         self.ensure_full_content();
         let msg = &self.filtered_messages[self.index];
+        self.compose_source_type = Some(msg.source_type.clone());
 
         let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
         let subject = msg.subject.as_deref().unwrap_or("");
@@ -3611,6 +3680,7 @@ impl App {
         if self.filtered_messages.is_empty() { return; }
         self.ensure_full_content();
         let msg = &self.filtered_messages[self.index];
+        self.compose_source_type = Some(msg.source_type.clone());
 
         let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
         let subject = msg.subject.as_deref().unwrap_or("");
@@ -3664,10 +3734,12 @@ impl App {
         self.run_editor_compose_at(&template, None);
     }
 
-    fn forward(&mut self) {
+    fn forward_inline(&mut self) {
         if self.filtered_messages.is_empty() { return; }
+        self.compose_source_type = Some("email".to_string()); // forwarding is always email
         self.ensure_full_content();
         let msg = &self.filtered_messages[self.index];
+        self.pending_forward_ids = vec![msg.id];
 
         let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
         let subject = msg.subject.as_deref().unwrap_or("");
@@ -3706,7 +3778,184 @@ impl App {
             template.push('\n');
         }
 
+        // Collect original message attachments for forwarding
+        self.pending_forward_attachments.clear();
+        if let Some(m) = self.filtered_messages.get(self.index) {
+            for att in &m.attachments {
+                if let Some(path) = att.get("source_file").and_then(|v| v.as_str()) {
+                    if std::path::Path::new(path).exists() {
+                        self.pending_forward_attachments.push(path.to_string());
+                    }
+                }
+            }
+        }
+
         self.run_editor_compose_at(&template, Some(2)); // cursor on To: line
+    }
+
+    fn forward_tagged_inline(&mut self) {
+        let tagged_ids: Vec<i64> = self.tagged.iter().copied().collect();
+        if tagged_ids.is_empty() { return; }
+        self.pending_forward_ids = tagged_ids.clone();
+
+        let from = self.compose_from();
+        let reply_to = self.compose_email();
+        let sig = self.compose_signature();
+
+        let subject = if tagged_ids.len() == 1 {
+            let msg = self.filtered_messages.iter().find(|m| m.id == tagged_ids[0]);
+            let subj = msg.and_then(|m| m.subject.as_deref()).unwrap_or("");
+            format!("Fwd: {}", subj)
+        } else {
+            format!("Fwd: {} messages", tagged_ids.len())
+        };
+
+        let mut template = String::new();
+        template.push_str(&format!("From: {}\n", from));
+        template.push_str("To: \n");
+        template.push_str("Cc: \n");
+        template.push_str("Bcc: \n");
+        template.push_str(&format!("Reply-To: {}\n", reply_to));
+        template.push_str(&format!("Subject: {}\n", subject));
+        template.push('\n');
+        template.push('\n');
+
+        // Load full content for each tagged message and append
+        for &id in &tagged_ids {
+            // Load content if needed
+            if let Some(msg) = self.filtered_messages.iter_mut().find(|m| m.id == id) {
+                if !msg.full_loaded {
+                    if let Some((content, html)) = self.db.get_message_content(id) {
+                        msg.content = content;
+                        msg.html_content = html;
+                        msg.full_loaded = true;
+                    }
+                }
+            }
+            if let Some(msg) = self.filtered_messages.iter().find(|m| m.id == id) {
+                let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
+                let subj = msg.subject.as_deref().unwrap_or("");
+                let date = format_timestamp(msg.timestamp, "%Y-%m-%d %H:%M");
+
+                template.push_str("---------- Forwarded message ----------\n");
+                template.push_str(&format!("From: {}\n", sender));
+                template.push_str(&format!("Date: {}\n", date));
+                template.push_str(&format!("Subject: {}\n", subj));
+                template.push('\n');
+
+                let content = self.get_display_content(msg);
+                template.push_str(&content);
+                template.push_str("\n\n");
+            }
+        }
+
+        if !sig.is_empty() {
+            template.push_str(&sig);
+            template.push('\n');
+        }
+
+        self.run_editor_compose_at(&template, Some(2));
+    }
+
+    fn forward_attach(&mut self) {
+        if self.filtered_messages.is_empty() { return; }
+        let msg = &self.filtered_messages[self.index];
+        self.compose_source_type = Some("email".to_string()); // forwarding is always email
+        self.pending_forward_ids = vec![msg.id];
+
+        let subject = msg.subject.as_deref().unwrap_or("");
+        let fwd_subject = if subject.starts_with("Fwd:") { subject.to_string() } else { format!("Fwd: {}", subject) };
+        let from = self.compose_from();
+        let reply_to = self.compose_email();
+        let sig = self.compose_signature();
+
+        // Collect the maildir file as attachment
+        self.pending_forward_attachments.clear();
+        if let Some(file) = msg.metadata.get("maildir_file").and_then(|v| v.as_str()) {
+            if std::path::Path::new(file).exists() {
+                // Copy to temp with .eml extension
+                let name = msg.subject.as_deref().unwrap_or("message").replace('/', "_");
+                let eml_path = format!("/tmp/kastrup_fwd_{}.eml", msg.id);
+                let _ = std::fs::copy(file, &eml_path);
+                self.pending_forward_attachments.push(eml_path);
+            }
+        }
+        // Also include any extracted MIME attachments
+        for att in &msg.attachments {
+            if let Some(path) = att.get("source_file").and_then(|v| v.as_str()) {
+                if std::path::Path::new(path).exists() {
+                    self.pending_forward_attachments.push(path.to_string());
+                }
+            }
+        }
+
+        let mut template = String::new();
+        template.push_str(&format!("From: {}\n", from));
+        template.push_str("To: \n");
+        template.push_str("Cc: \n");
+        template.push_str("Bcc: \n");
+        template.push_str(&format!("Reply-To: {}\n", reply_to));
+        template.push_str(&format!("Subject: {}\n", fwd_subject));
+        template.push('\n');
+        let att_count = self.pending_forward_attachments.len();
+        if att_count == 1 {
+            template.push_str("[Forwarded message attached]\n");
+        } else if att_count > 1 {
+            template.push_str(&format!("[{} forwarded attachments]\n", att_count));
+        }
+        template.push('\n');
+        if !sig.is_empty() {
+            template.push_str(&sig);
+            template.push('\n');
+        }
+        self.run_editor_compose_at(&template, Some(2));
+    }
+
+    fn forward_tagged_attach(&mut self) {
+        let tagged_ids: Vec<i64> = self.tagged.iter().copied().collect();
+        if tagged_ids.is_empty() { return; }
+        self.pending_forward_ids = tagged_ids.clone();
+
+        let from = self.compose_from();
+        let reply_to = self.compose_email();
+        let sig = self.compose_signature();
+        let subject = format!("Fwd: {} messages", tagged_ids.len());
+
+        self.pending_forward_attachments.clear();
+        for &id in &tagged_ids {
+            if let Some(msg) = self.filtered_messages.iter().find(|m| m.id == id) {
+                if let Some(file) = msg.metadata.get("maildir_file").and_then(|v| v.as_str()) {
+                    if std::path::Path::new(file).exists() {
+                        let eml_path = format!("/tmp/kastrup_fwd_{}.eml", id);
+                        let _ = std::fs::copy(file, &eml_path);
+                        self.pending_forward_attachments.push(eml_path);
+                    }
+                }
+                for att in &msg.attachments {
+                    if let Some(path) = att.get("source_file").and_then(|v| v.as_str()) {
+                        if std::path::Path::new(path).exists() {
+                            self.pending_forward_attachments.push(path.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut template = String::new();
+        template.push_str(&format!("From: {}\n", from));
+        template.push_str("To: \n");
+        template.push_str("Cc: \n");
+        template.push_str("Bcc: \n");
+        template.push_str(&format!("Reply-To: {}\n", reply_to));
+        template.push_str(&format!("Subject: {}\n", subject));
+        template.push('\n');
+        template.push_str(&format!("[{} forwarded messages attached]\n", tagged_ids.len()));
+        template.push('\n');
+        if !sig.is_empty() {
+            template.push_str(&sig);
+            template.push('\n');
+        }
+        self.run_editor_compose_at(&template, Some(2));
     }
 
     fn compose_to(&mut self, to: &str, subject: &str) {
@@ -3757,6 +4006,13 @@ impl App {
             }
         }
 
+        // Set compose source type from current message context
+        self.compose_source_type = if !self.filtered_messages.is_empty() {
+            Some(self.filtered_messages[self.index].source_type.clone())
+        } else {
+            Some("email".to_string())
+        };
+
         // Normal compose
         let from = self.compose_from();
         let reply_to = self.compose_email();
@@ -3793,6 +4049,10 @@ impl App {
                 .or_else(|| raw.find("\r\n\r\n").map(|p| p + 4))
                 .unwrap_or(0);
             decode_quoted_printable(&raw[body_start..])
+        } else if looks_base64(raw) {
+            sources::maildir::base64_decode(raw.trim())
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .unwrap_or_else(|| raw.clone())
         } else {
             raw.clone()
         };
@@ -3807,6 +4067,268 @@ impl App {
             html_to_text(&extracted)
         } else {
             extracted
+        }
+    }
+
+    /// Show composed message summary in the right pane for review before sending.
+    /// Mark pending_forward_ids as forwarded in metadata.
+    fn mark_forwarded(&mut self) {
+        for &id in &self.pending_forward_ids {
+            // Update metadata in DB
+            let conn = self.db.conn.lock().unwrap();
+            let meta: Option<String> = conn.query_row(
+                "SELECT metadata FROM messages WHERE id = ?", rusqlite::params![id],
+                |r| r.get(0)
+            ).ok();
+            if let Some(meta_str) = meta {
+                let mut meta_val: serde_json::Value = serde_json::from_str(&meta_str)
+                    .unwrap_or(serde_json::json!({}));
+                meta_val["forwarded"] = serde_json::json!(true);
+                let _ = conn.execute("UPDATE messages SET metadata = ? WHERE id = ?",
+                    rusqlite::params![meta_val.to_string(), id]);
+            }
+            drop(conn);
+            // Update in-memory
+            for msg in &mut self.filtered_messages {
+                if msg.id == id {
+                    msg.metadata["forwarded"] = serde_json::json!(true);
+                }
+            }
+        }
+        self.pending_forward_ids.clear();
+    }
+
+    fn show_compose_review(&mut self, content: &str, attachments: &[String]) {
+        let tc = self.config.theme_colors.clone();
+        let mut lines = Vec::new();
+        let mut from = String::new();
+        let mut to = String::new();
+        let mut cc = String::new();
+        let mut bcc = String::new();
+        let mut subject = String::new();
+        let mut body_lines = Vec::new();
+        let mut in_body = false;
+
+        for line in content.lines() {
+            if in_body {
+                body_lines.push(line);
+            } else if line.trim().is_empty() {
+                in_body = true;
+            } else if let Some(v) = line.strip_prefix("From: ") { from = v.to_string(); }
+            else if let Some(v) = line.strip_prefix("To: ") { to = v.to_string(); }
+            else if let Some(v) = line.strip_prefix("Cc: ") { cc = v.to_string(); }
+            else if let Some(v) = line.strip_prefix("Bcc: ") { bcc = v.to_string(); }
+            else if let Some(v) = line.strip_prefix("Subject: ") { subject = v.to_string(); }
+        }
+
+        lines.push(style::bold(&style::fg("Review message before sending", tc.unread)));
+        lines.push(style::fg(&"\u{2500}".repeat(40), tc.separator));
+        lines.push(format!("{} {}", style::fg("From:", tc.header_from), style::fg(&from, tc.header_from)));
+        lines.push(format!("{} {}", style::bold(&style::fg("To:", 46)), style::bold(&style::fg(&to, 46))));
+        if !cc.is_empty() {
+            lines.push(format!("{} {}", style::fg("Cc:", 51), style::fg(&cc, 51)));
+        }
+        if !bcc.is_empty() {
+            lines.push(format!("{} {}", style::fg("Bcc:", 245), style::fg(&bcc, 245)));
+        }
+        lines.push(format!("{} {}", style::bold(&style::fg("Subject:", tc.header_subj)), style::bold(&style::fg(&subject, tc.header_subj))));
+        lines.push(style::fg(&"\u{2500}".repeat(40), tc.separator));
+
+        if !attachments.is_empty() {
+            lines.push(style::bold(&style::fg(&format!("Attachments ({})", attachments.len()), tc.attachment)));
+            for (i, a) in attachments.iter().enumerate() {
+                let name = std::path::Path::new(a).file_name()
+                    .map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| a.clone());
+                let size = std::fs::metadata(a).map(|m| format_file_size(m.len())).unwrap_or_default();
+                lines.push(style::fg(&format!("  [{}] {} {}", i + 1, name, size), tc.attachment));
+            }
+            lines.push(String::new());
+        }
+
+        // Show body preview (first 30 lines)
+        for (i, line) in body_lines.iter().enumerate() {
+            if i > 30 { lines.push(style::fg("  ...", 245)); break; }
+            lines.push(line.to_string());
+        }
+
+        self.right.set_text(&lines.join("\n"));
+        self.right.ix = 0;
+        self.right.full_refresh();
+        if self.right.border { self.right.border_refresh(); }
+    }
+
+    /// Expand short names in To/Cc/Bcc to full addresses.
+    /// For ambiguous matches, shows an interactive picker.
+    fn expand_compose_addresses(&mut self, content: &str) -> String {
+        let mut result = String::new();
+        let mut in_body = false;
+        for line in content.lines() {
+            if in_body {
+                result.push_str(line);
+                result.push('\n');
+            } else if line.trim().is_empty() {
+                in_body = true;
+                result.push('\n');
+            } else if let Some(val) = line.strip_prefix("To: ") {
+                result.push_str(&format!("To: {}\n", self.expand_address_field_interactive(val)));
+            } else if let Some(val) = line.strip_prefix("Cc: ") {
+                result.push_str(&format!("Cc: {}\n", self.expand_address_field_interactive(val)));
+            } else if let Some(val) = line.strip_prefix("Bcc: ") {
+                result.push_str(&format!("Bcc: {}\n", self.expand_address_field_interactive(val)));
+            } else {
+                result.push_str(line);
+                result.push('\n');
+            }
+        }
+        result
+    }
+
+    /// Expand addresses with interactive picker for ambiguous names.
+    fn expand_address_field_interactive(&mut self, field: &str) -> String {
+        field.split(',').map(|addr| {
+            let addr = addr.trim();
+            if addr.is_empty() || addr.contains('@') || addr.contains('<') {
+                return addr.to_string();
+            }
+            // Try auto-expand first (single match)
+            let expanded = self.expand_address_field(addr);
+            if expanded != addr {
+                return expanded;
+            }
+            // Multiple or no matches: show picker
+            self.pick_address(addr).unwrap_or_else(|| addr.to_string())
+        }).collect::<Vec<_>>().join(", ")
+    }
+
+    /// Expand a comma-separated address field. Each part that doesn't contain '@'
+    /// is looked up in message history (case-insensitive substring match on sender_name).
+    /// If exactly one match: auto-expand. If multiple: show picker in right pane.
+    fn expand_address_field(&self, field: &str) -> String {
+        field.split(',').map(|addr| {
+            let addr = addr.trim();
+            if addr.is_empty() || addr.contains('@') || addr.contains('<') {
+                return addr.to_string();
+            }
+            // Look up in messages by sender_name, filtered by compose context
+            let conn = self.db.conn.lock().unwrap();
+            let is_email = self.compose_source_type.as_deref().unwrap_or("email") == "email";
+            let matches: Vec<(String, String)> = if is_email {
+                conn.prepare(
+                    "SELECT DISTINCT sender, sender_name FROM messages \
+                     WHERE (sender_name LIKE ?1 OR sender LIKE ?1) AND sender LIKE '%@%' \
+                     ORDER BY timestamp DESC LIMIT 20"
+                ).ok().and_then(|mut stmt| {
+                    let pattern = format!("%{}%", addr);
+                    stmt.query_map(rusqlite::params![pattern], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1).unwrap_or_default()))
+                    }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect())
+                }).unwrap_or_default()
+            } else {
+                let stype = self.compose_source_type.as_deref().unwrap_or("");
+                conn.prepare(
+                    "SELECT DISTINCT m.sender, m.sender_name FROM messages m \
+                     JOIN sources s ON m.source_id = s.id \
+                     WHERE (m.sender_name LIKE ?1 OR m.sender LIKE ?1) AND s.source_type = ?2 \
+                     ORDER BY m.timestamp DESC LIMIT 20"
+                ).ok().and_then(|mut stmt| {
+                    let pattern = format!("%{}%", addr);
+                    stmt.query_map(rusqlite::params![pattern, stype], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1).unwrap_or_default()))
+                    }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect())
+                }).unwrap_or_default()
+            };
+            drop(conn);
+
+            // Deduplicate by sender
+            let mut seen = std::collections::HashSet::new();
+            let unique: Vec<_> = matches.into_iter().filter(|(email, _)| {
+                let key = email.to_lowercase();
+                if seen.contains(&key) { false } else { seen.insert(key); true }
+            }).collect();
+
+            if unique.len() == 1 {
+                let (email, name) = &unique[0];
+                if !name.is_empty() { format!("{} <{}>", name, email) }
+                else { email.clone() }
+            } else if unique.len() > 1 {
+                // Multiple matches: user must pick (handled in show_compose_review)
+                // For now, return as-is; the review screen will flag it
+                addr.to_string()
+            } else {
+                addr.to_string()
+            }
+        }).collect::<Vec<_>>().join(", ")
+    }
+
+    /// Show address picker when a To/Cc field has an unresolved name.
+    /// Called when user presses 'e' to re-edit from the review screen.
+    fn pick_address(&mut self, query: &str) -> Option<String> {
+        let conn = self.db.conn.lock().unwrap();
+        let is_email = self.compose_source_type.as_deref().unwrap_or("email") == "email";
+        let matches: Vec<(String, String)> = if is_email {
+            conn.prepare(
+                "SELECT DISTINCT sender, sender_name FROM messages \
+                 WHERE (sender_name LIKE ?1 OR sender LIKE ?1) AND sender LIKE '%@%' \
+                 ORDER BY timestamp DESC LIMIT 20"
+            ).ok().and_then(|mut stmt| {
+                let pattern = format!("%{}%", query);
+                stmt.query_map(rusqlite::params![pattern], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1).unwrap_or_default()))
+                }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect())
+            }).unwrap_or_default()
+        } else {
+            let stype = self.compose_source_type.as_deref().unwrap_or("");
+            conn.prepare(
+                "SELECT DISTINCT m.sender, m.sender_name FROM messages m \
+                 JOIN sources s ON m.source_id = s.id \
+                 WHERE (m.sender_name LIKE ?1 OR m.sender LIKE ?1) AND s.source_type = ?2 \
+                 ORDER BY m.timestamp DESC LIMIT 20"
+            ).ok().and_then(|mut stmt| {
+                let pattern = format!("%{}%", query);
+                stmt.query_map(rusqlite::params![pattern, stype], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1).unwrap_or_default()))
+                }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect())
+            }).unwrap_or_default()
+        };
+        drop(conn);
+
+        let mut seen = std::collections::HashSet::new();
+        let unique: Vec<_> = matches.into_iter().filter(|(email, _)| {
+            let key = email.to_lowercase();
+            if seen.contains(&key) { false } else { seen.insert(key); true }
+        }).collect();
+
+        if unique.is_empty() { return None; }
+        if unique.len() == 1 {
+            let (email, name) = &unique[0];
+            return Some(if !name.is_empty() { format!("{} <{}>", name, email) } else { email.clone() });
+        }
+
+        // Show picker in right pane
+        let tc = self.config.theme_colors.clone();
+        let mut lines = Vec::new();
+        lines.push(style::bold(&style::fg(&format!("Select address for \"{}\":", query), tc.unread)));
+        lines.push(String::new());
+        for (i, (email, name)) in unique.iter().enumerate() {
+            let display = if !name.is_empty() { format!("{} <{}>", name, email) } else { email.clone() };
+            lines.push(format!("  {} {}", style::fg(&format!("{}", i + 1), 220), display));
+        }
+        lines.push(String::new());
+        lines.push(style::fg("Press number to select, ESC to cancel", 245));
+
+        self.right.set_text(&lines.join("\n"));
+        self.right.ix = 0;
+        self.right.full_refresh();
+
+        loop {
+            let Some(key) = Input::getchr(None) else { return None };
+            if key == "ESC" { return None; }
+            if let Ok(n) = key.parse::<usize>() {
+                if n >= 1 && n <= unique.len() {
+                    let (email, name) = &unique[n - 1];
+                    return Some(if !name.is_empty() { format!("{} <{}>", name, email) } else { email.clone() });
+                }
+            }
         }
     }
 
@@ -3875,10 +4397,19 @@ impl App {
                     if content.trim() != template.trim() {
                         let tc = self.config.theme_colors.clone();
                         self.handle_resize();
+
+                        // Expand addresses in the composed content
+                        let mut final_content = content.clone();
+                        final_content = self.expand_compose_addresses(&final_content);
+                        let _ = std::fs::write(&tmpfile, &final_content);
+
                         // Post-editor loop with compose plugins and attachments
-                        let mut attachments: Vec<String> = Vec::new();
+                        let mut attachments: Vec<String> = std::mem::take(&mut self.pending_forward_attachments);
                         let plugins = self.load_compose_plugins();
                         loop {
+                            // Show message summary in right pane
+                            self.show_compose_review(&final_content, &attachments);
+
                             let plugin_hints: String = plugins.iter()
                                 .map(|(k, l, _)| format!(" {}:{}", k, l)).collect();
                             let att_hint = if attachments.is_empty() { String::new() }
@@ -3886,7 +4417,7 @@ impl App {
                             let prompt_text = format!(
                                 " Enter:Send  e:Re-edit  p:Postpone  a:Attach{}{} ESC:Cancel",
                                 plugin_hints, att_hint);
-                            self.bottom.say(&style::fg(&prompt_text, tc.hint_fg));
+                            self.bottom.say(&style::fg(&prompt_text, 226));
                             let Some(key) = Input::getchr(None) else { continue };
                             match key.as_str() {
                                 "ENTER" => {
@@ -3996,7 +4527,12 @@ impl App {
             self.set_feedback("Cancelled (empty To or body)", self.config.theme_colors.feedback_warn);
             return;
         }
-        if self.config.smtp_command.is_empty() {
+        // Per-identity SMTP: check From header against identities
+        let smtp = self.config.identities.iter()
+            .find(|(_, id)| from.contains(&id.email))
+            .and_then(|(_, id)| id.smtp.as_ref())
+            .unwrap_or(&self.config.smtp_command);
+        if smtp.is_empty() {
             self.set_feedback("No SMTP command configured (set in Preferences)", self.config.theme_colors.feedback_warn);
             return;
         }
@@ -4036,14 +4572,44 @@ impl App {
             self.set_feedback("Failed to write send file", 196);
             return;
         }
-        let result = std::process::Command::new("sh").arg("-c")
-            .arg(&format!("{} < '{}'", self.config.smtp_command, smtp_tmpfile)).status();
-        let _ = std::fs::remove_file(&smtp_tmpfile);
+        self.bottom.say(&style::fg(&format!(" Sending to {}...", to), 226));
+        let home = std::env::var("HOME").unwrap_or_default();
+        let smtp_expanded = smtp.replace("~/", &format!("{}/", home));
+        let from_email = if let Some(lt) = from.find('<') {
+            from[lt+1..].trim_end_matches('>').to_string()
+        } else { from.clone() };
+        let mut recipients = Vec::new();
+        for addr in to.split(',').chain(cc.split(',')).chain(bcc.split(',')) {
+            let addr = addr.trim();
+            if addr.is_empty() { continue; }
+            let email = if let Some(lt) = addr.find('<') {
+                addr[lt+1..].trim_end_matches('>').to_string()
+            } else { addr.to_string() };
+            if email.contains('@') { recipients.push(email); }
+        }
+        let cmd = format!("{} -f {} -i {} < '{}'",
+            smtp_expanded, from_email, recipients.join(" "), smtp_tmpfile);
+        log::info(&format!("SMTP (with attachments): {} -> {} ({} att)", from_email, recipients.join(", "), attachments.len()));
+        let result = std::process::Command::new("sh").arg("-c").arg(&cmd).output();
         match result {
-            Ok(s) if s.success() => {
+            Ok(output) if output.status.success() => {
+                let _ = std::fs::remove_file(&smtp_tmpfile);
+                log::info(&format!("SMTP sent OK to {}", to));
                 self.set_feedback(&format!("Sent to {} ({} attachment(s))", to, attachments.len()), self.config.theme_colors.feedback_ok);
+                self.mark_forwarded();
             }
-            _ => { self.set_feedback("Send failed", 196); }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let msg = if stderr.trim().is_empty() {
+                    format!("Send failed (exit {}). File: {}", output.status.code().unwrap_or(-1), smtp_tmpfile)
+                } else {
+                    format!("Send failed: {}", stderr.lines().next().unwrap_or("unknown error"))
+                };
+                self.set_feedback(&msg, 196);
+            }
+            Err(e) => {
+                self.set_feedback(&format!("Send failed: {}", e), 196);
+            }
         }
     }
 
@@ -4127,21 +4693,56 @@ impl App {
             return;
         }
 
+        // Show sending feedback
+        self.bottom.say(&style::fg(&format!(" Sending to {}...", to), 226));
+
+        let home = std::env::var("HOME").unwrap_or_default();
+        let smtp_expanded = smtp.replace("~/", &format!("{}/", home));
+        // Extract bare from email for -f flag
+        let from_email = if let Some(lt) = from.find('<') {
+            from[lt+1..].trim_end_matches('>').to_string()
+        } else { from.clone() };
+        // Build recipient list: to + cc + bcc
+        let mut recipients = Vec::new();
+        for addr in to.split(',').chain(cc.split(',')).chain(bcc.split(',')) {
+            let addr = addr.trim();
+            if addr.is_empty() { continue; }
+            let email = if let Some(lt) = addr.find('<') {
+                addr[lt+1..].trim_end_matches('>').to_string()
+            } else { addr.to_string() };
+            if email.contains('@') { recipients.push(email); }
+        }
+        let cmd = format!("{} -f {} -i {} < '{}'",
+            smtp_expanded, from_email, recipients.join(" "), smtp_tmpfile);
+        log::info(&format!("SMTP: {} -> {}", from_email, recipients.join(", ")));
         let result = std::process::Command::new("sh")
             .arg("-c")
-            .arg(&format!("{} < '{}'", smtp, smtp_tmpfile))
-            .status();
-        let _ = std::fs::remove_file(&smtp_tmpfile);
+            .arg(&cmd)
+            .output();
 
         match result {
-            Ok(s) if s.success() => {
+            Ok(output) if output.status.success() => {
+                let _ = std::fs::remove_file(&smtp_tmpfile);
+                log::info(&format!("SMTP sent OK to {}", to));
                 self.set_feedback(
                     &format!("Sent to {}", to),
                     self.config.theme_colors.feedback_ok,
                 );
+                // Mark forwarded messages
+                self.mark_forwarded();
             }
-            _ => {
-                self.set_feedback("Send failed", 196);
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let msg = if stderr.trim().is_empty() {
+                    format!("Send failed (exit {}). File: {}", output.status.code().unwrap_or(-1), smtp_tmpfile)
+                } else {
+                    format!("Send failed: {}", stderr.lines().next().unwrap_or("unknown error"))
+                };
+                self.set_feedback(&msg, 196);
+                // Keep the file for debugging
+            }
+            Err(e) => {
+                self.set_feedback(&format!("Send failed: {}", e), 196);
             }
         }
     }
@@ -4622,7 +5223,45 @@ impl App {
 // --- Batch I-N feature methods ---
 
 impl App {
-    // Batch J: AI Assistant
+    // Load AI/tool plugins from ~/.kastrup/plugins/ or ~/.heathrow/plugins/
+    fn load_ai_plugins(&self) -> Vec<(String, String, String)> {
+        let dirs = [
+            home_dir().join(".kastrup/plugins"),
+            home_dir().join(".heathrow/plugins"),
+        ];
+        let mut plugins = Vec::new();
+        for dir in &dirs {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() { continue; }
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        let key = regex::Regex::new(r"key:\s*'([^']+)'").ok()
+                            .and_then(|r| r.captures(&content))
+                            .and_then(|c| c.get(1))
+                            .map(|m| m.as_str().to_string());
+                        let label = regex::Regex::new(r"label:\s*'([^']+)'").ok()
+                            .and_then(|r| r.captures(&content))
+                            .and_then(|c| c.get(1))
+                            .map(|m| m.as_str().to_string());
+                        let command = regex::Regex::new(r"command:\s*'([^']+)'").ok()
+                            .and_then(|r| r.captures(&content))
+                            .and_then(|c| c.get(1))
+                            .map(|m| m.as_str().to_string());
+                        if let (Some(k), Some(l), Some(c)) = (key, label, command) {
+                            // Skip if key already taken by another plugin
+                            if !plugins.iter().any(|(pk, _, _): &(String, String, String)| pk == &k) {
+                                plugins.push((k, l, c));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        plugins
+    }
+
+    // Batch J: AI Assistant + plugins
     fn ai_assistant(&mut self) {
         let (is_header, sender, subject, content) = match self.filtered_messages.get(self.index) {
             Some(m) => (
@@ -4635,13 +5274,25 @@ impl App {
         };
         if is_header { return; }
 
+        let plugins = self.load_ai_plugins();
         let tc = self.config.theme_colors.clone();
-        self.set_feedback("AI: d=Draft  s=Summarize  t=Translate  a=Ask...", tc.unread);
+
+        let mut hint = String::from("AI: d=Draft  s=Summarize  t=Translate  a=Ask");
+        for (k, l, _) in &plugins {
+            hint.push_str(&format!("  {}={}", k, l));
+        }
+        self.set_feedback(&hint, tc.unread);
 
         let Some(key) = Input::getchr(Some(10)) else {
             self.render_bottom_bar();
             return;
         };
+
+        // Check plugins first
+        if let Some((_, label, command)) = plugins.iter().find(|(k, _, _)| k == key.as_str()).cloned() {
+            self.run_ai_plugin(&label, &command);
+            return;
+        }
 
         let ai_prompt = match key.as_str() {
             "d" => format!("Draft a professional reply to this email.\nFrom: {}\nSubject: {}\n\n{}", sender, subject, content),
@@ -4681,6 +5332,63 @@ impl App {
         self.right.full_refresh();
         if self.right.border { self.right.border_refresh(); }
         self.set_feedback("AI response shown in right pane", tc.feedback_ok);
+    }
+
+    fn run_ai_plugin(&mut self, label: &str, command: &str) {
+        log::info(&format!("Running plugin: {}", label));
+        let pick_file = format!("/tmp/kastrup_plugin_{}.txt", std::process::id());
+        let _ = std::fs::remove_file(&pick_file);
+        let cmd = command.replace("%{pick_file}", &pick_file);
+        Crust::cleanup();
+        print!("\x1b[2J\x1b[H");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let err_file = format!("/tmp/kastrup_plugin_err_{}.txt", std::process::id());
+        let wrapped = format!("{} 2>'{}'", cmd, err_file);
+        let status = std::process::Command::new("sh").arg("-c").arg(&wrapped).status();
+        Crust::init();
+        Crust::clear_screen();
+        if let Ok(s) = &status {
+            if !s.success() {
+                let stderr = std::fs::read_to_string(&err_file).unwrap_or_default();
+                let _ = std::fs::remove_file(&err_file);
+                self.handle_resize();
+                let first_line = stderr.lines().last().unwrap_or("unknown error");
+                self.set_feedback(&format!("{} failed: {}", label, first_line), 196);
+                return;
+            }
+        }
+        let _ = std::fs::remove_file(&err_file);
+        // Read picked files if any
+        let mut picked = Vec::new();
+        if let Ok(files) = std::fs::read_to_string(&pick_file) {
+            picked = files.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+        }
+        let _ = std::fs::remove_file(&pick_file);
+        self.handle_resize();
+        if picked.is_empty() {
+            self.set_feedback(&format!("{}: done", label), self.config.theme_colors.feedback_info);
+        } else {
+            let tc = self.config.theme_colors.clone();
+            let mut lines = Vec::new();
+            lines.push(style::bold(&style::fg(label, tc.view_custom)));
+            lines.push(String::new());
+            for (i, path) in picked.iter().enumerate() {
+                let fname = std::path::Path::new(path).file_name()
+                    .and_then(|f| f.to_str()).unwrap_or(path);
+                lines.push(format!("  {} {}", style::fg(&format!("{}", i + 1), 220), fname));
+            }
+            lines.push(String::new());
+            lines.push(style::fg(&format!("{} file(s) selected", picked.len()), tc.hint_fg));
+            self.right.set_text(&lines.join("\n"));
+            self.right.ix = 0;
+            self.right.full_refresh();
+            if self.right.border { self.right.border_refresh(); }
+            self.right_pane_locked = true;
+            self.set_feedback(&format!("{}: {} file(s)", label, picked.len()), tc.feedback_ok);
+        }
     }
 
     fn ai_fallback_openai(&mut self, ai_prompt: &str) -> String {
@@ -4905,9 +5613,14 @@ fn extract_mime_text(raw: &str) -> Option<String> {
 }
 
 fn extract_mime_text_depth(raw: &str, depth: usize) -> Option<String> {
-    if depth > 5 { return None; } // prevent infinite recursion
-    // Detect MIME boundary: from boundary= header or first "--" line in content
-    let boundary = if let Some(pos) = raw.find("boundary=") {
+    if depth > 5 { return None; }
+    // Detect MIME boundary: prefer first "--" line if content starts with one,
+    // otherwise use boundary= attribute, fallback to first "--" line anywhere.
+    let first_line = raw.lines().find(|l| !l.trim().is_empty());
+    let boundary = if first_line.map(|l| l.starts_with("--") && l.len() > 5).unwrap_or(false) {
+        // Content starts with a boundary line: use it as the primary boundary
+        first_line.unwrap()[2..].trim_end_matches("--").trim().to_string()
+    } else if let Some(pos) = raw.find("boundary=") {
         let rest = &raw[pos + 9..];
         let b = rest.trim_start_matches('"').split('"').next()
             .or_else(|| rest.split_whitespace().next())
@@ -4915,7 +5628,6 @@ fn extract_mime_text_depth(raw: &str, depth: usize) -> Option<String> {
         if b.is_empty() { return None; }
         b.to_string()
     } else {
-        // Look for first line starting with "--" (common in body-only MIME content)
         raw.lines()
             .find(|l| l.starts_with("--") && l.len() > 5)
             .map(|l| l[2..].trim_end_matches(':').trim().to_string())?
@@ -4980,9 +5692,29 @@ fn extract_mime_text_depth(raw: &str, depth: usize) -> Option<String> {
         }
     }
 
-    text_part
+    // Skip text/plain if it's just a "your client doesn't support HTML" fallback
+    let text_is_fallback = text_part.as_ref().map(|t| {
+        let lower = t.to_lowercase();
+        lower.contains("html-e-poster") || lower.contains("html e-post")
+            || lower.contains("doesn't support html") || lower.contains("does not support html")
+            || lower.contains("not displayed") || lower.contains("html messages are not support")
+            || (t.trim().lines().count() <= 3 && html_part.is_some())
+    }).unwrap_or(false);
+
+    let effective_text = if text_is_fallback { None } else { text_part };
+
+    // If text_part contains HTML entities, decode them
+    let result = effective_text
+        .map(|t| {
+            let has_entities = regex::Regex::new(r"&[a-zA-Z]+;|&#\d+;|&#x[0-9a-fA-F]+;")
+                .map(|re| re.is_match(&t)).unwrap_or(false);
+            if has_entities {
+                html_to_text(&t)
+            } else { t }
+        })
         .or_else(|| html_part.map(|h| html_to_text(&h)))
-        .or(cal_part)
+        .or(cal_part);
+    result
 }
 
 /// Extract raw HTML from MIME multipart content (for browser display).
@@ -4992,7 +5724,10 @@ fn extract_mime_html(raw: &str) -> Option<String> {
 
 fn extract_mime_html_depth(raw: &str, depth: usize) -> Option<String> {
     if depth > 5 { return None; }
-    let boundary = if let Some(pos) = raw.find("boundary=") {
+    let first_line = raw.lines().find(|l| !l.trim().is_empty());
+    let boundary = if first_line.map(|l| l.starts_with("--") && l.len() > 5).unwrap_or(false) {
+        first_line.unwrap()[2..].trim_end_matches("--").trim().to_string()
+    } else if let Some(pos) = raw.find("boundary=") {
         let rest = &raw[pos + 9..];
         rest.trim_start_matches('"').split('"').next()
             .or_else(|| rest.split_whitespace().next())?.to_string()
@@ -5296,9 +6031,10 @@ fn extract_mime_attachments(content: &str, msg_id: i64) -> Vec<serde_json::Value
 
             // Get filename from name= or filename=
             let name_re = regex::Regex::new(r#"(?i)(?:name|filename)="([^"]+)""#).unwrap();
-            let filename = name_re.captures(headers)
+            let filename_raw = name_re.captures(headers)
                 .map(|c| c.get(1).unwrap().as_str().to_string())
                 .unwrap_or_else(|| format!("attachment_{}", atts.len() + 1));
+            let filename = sources::maildir::decode_rfc2047(&filename_raw);
 
             // Skip if already found this filename
             if atts.iter().any(|a: &serde_json::Value| a["name"].as_str() == Some(&filename)) { continue; }
@@ -5327,6 +6063,25 @@ fn extract_mime_attachments(content: &str, msg_id: i64) -> Vec<serde_json::Value
         }
     }
     atts
+}
+
+/// Check if content looks like raw base64 (no MIME headers, just base64 lines).
+fn looks_base64(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.len() < 20 { return false; }
+    // Check first few lines: should be long lines of base64 chars only
+    let mut b64_lines = 0;
+    for line in trimmed.lines().take(5) {
+        let l = line.trim();
+        if l.is_empty() { continue; }
+        if l.len() < 20 { return false; }
+        if l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=') {
+            b64_lines += 1;
+        } else {
+            return false;
+        }
+    }
+    b64_lines >= 2
 }
 
 /// Convert ISO-8859-1 / Windows-1252 bytes to UTF-8 string.
