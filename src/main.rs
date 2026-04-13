@@ -160,6 +160,7 @@ struct App {
     // State
     running: bool,
     current_view: String,
+    active_folder: Option<String>,
     in_source_view: bool,
     index: usize,
 
@@ -292,6 +293,7 @@ fn main() {
         last_db_refresh: std::time::Instant::now(),
         running: true,
         current_view: "A".to_string(),
+        active_folder: None,
         in_source_view: false,
         index: 0,
         filtered_messages: Vec::new(),
@@ -1184,9 +1186,15 @@ impl App {
         let extracted = if extracted.contains("=\n") || extracted.contains("=\r\n") {
             decode_quoted_printable(&extracted)
         } else { extracted };
+        let is_html_fallback = {
+            let lc = extracted.to_lowercase();
+            extracted.trim().is_empty() || lc.contains("html messages are not support")
+                || lc.contains("not displayed") || lc.contains("html-e-post")
+                || lc.contains("støtter ikke html") || lc.contains("does not support html")
+                || extracted.trim().len() < 20
+        };
         let content = if let Some(ref html) = msg.html_content {
-            if extracted.is_empty() || extracted.contains("HTML messages are not support")
-                || extracted.contains("not displayed") || extracted.trim().len() < 20 {
+            if is_html_fallback {
                 html_to_text(html)
             } else if extracted.contains("<br") || extracted.contains("<p>") || extracted.contains("<p ") ||
                 (extracted.trim_start().starts_with('<') && (extracted.contains("<html") || extracted.contains("<body") || extracted.contains("<div") || extracted.contains("<table"))) {
@@ -1238,9 +1246,11 @@ impl App {
         self.right.set_text(&lines.join("\n"));
         if msg_changed {
             self.right.ix = 0;
+            self.right.full_refresh();
+            if self.right.border { self.right.border_refresh(); }
+        } else {
+            self.right.refresh();
         }
-        self.right.full_refresh();
-        if self.right.border { self.right.border_refresh(); }
 
         // Inject MIME attachments into message (deferred to avoid borrow conflict)
         if let Some(atts) = mime_atts_to_inject {
@@ -1464,6 +1474,7 @@ impl App {
     fn switch_to_view(&mut self, key: &str) {
         log::info(&format!("Switch to view: {}", key));
         self.current_view = key.to_string();
+        self.active_folder = None;
         self.in_source_view = false;
         self.index = 0;
 
@@ -1558,6 +1569,8 @@ impl App {
     fn refresh_current_view(&mut self) {
         let saved_id = self.filtered_messages.get(self.index).map(|m| m.id);
         let saved_index = self.index;
+        let old_ids: Vec<i64> = self.filtered_messages.iter().map(|m| m.id).collect();
+        let old_read: Vec<bool> = self.filtered_messages.iter().map(|m| m.read).collect();
 
         // Rebuild filters for the current view (same logic as switch_to_view but no index=0)
         let key = self.current_view.clone();
@@ -1565,7 +1578,12 @@ impl App {
         match key.as_str() {
             "N" => { filters.is_read = Some(false); }
             "*" => { filters.is_starred = Some(true); }
-            "A" => {}
+            "A" => {
+                // Preserve active folder filter (from folder browser)
+                if let Some(ref folder) = self.active_folder {
+                    filters.folder = Some(folder.clone());
+                }
+            }
             _ => {
                 if let Some(view) = self.views.iter().find(|v| v.key_binding.as_deref() == Some(&key)) {
                     if let Ok(f) = serde_json::from_str::<serde_json::Value>(&view.filters) {
@@ -1608,6 +1626,13 @@ impl App {
             }
         } else {
             self.index = saved_index.min(self.filtered_messages.len().saturating_sub(1));
+        }
+
+        // Skip render if nothing changed (avoids flicker on periodic refresh)
+        let new_ids: Vec<i64> = self.filtered_messages.iter().map(|m| m.id).collect();
+        let new_read: Vec<bool> = self.filtered_messages.iter().map(|m| m.read).collect();
+        if new_ids == old_ids && new_read == old_read {
+            return;
         }
 
         self.stats_cache = None;
@@ -1932,6 +1957,7 @@ impl App {
 
     fn open_folder(&mut self, folder: &str) {
         self.current_view = "A".to_string();
+        self.active_folder = Some(folder.to_string());
         self.in_source_view = false;
         self.index = 0;
 
@@ -2214,7 +2240,16 @@ impl App {
     }
 
     fn toggle_delete_mark(&mut self) {
-        if let Some(msg) = self.filtered_messages.get(self.index) {
+        if !self.tagged.is_empty() {
+            // Mark all tagged messages for deletion
+            for id in &self.tagged {
+                self.delete_marked.insert(*id);
+            }
+            let count = self.tagged.len();
+            self.tagged.clear();
+            self.set_feedback(&format!("{} messages marked for deletion", count), self.config.theme_colors.feedback_warn);
+            self.render_all();
+        } else if let Some(msg) = self.filtered_messages.get(self.index) {
             let id = msg.id;
             if self.delete_marked.contains(&id) {
                 self.delete_marked.remove(&id);
@@ -2243,6 +2278,22 @@ impl App {
                     let path = std::path::Path::new(file);
                     if path.exists() {
                         let _ = std::fs::remove_file(path);
+                    } else if let Some(dir) = path.parent() {
+                        // Filename may have changed (flag suffix). Find by base name.
+                        let base = path.file_name().and_then(|f| f.to_str())
+                            .and_then(|f| f.split(":2,").next())
+                            .unwrap_or("");
+                        if !base.is_empty() {
+                            if let Ok(entries) = std::fs::read_dir(dir) {
+                                for entry in entries.flatten() {
+                                    let name = entry.file_name();
+                                    if name.to_str().map(|n| n.starts_with(base)).unwrap_or(false) {
+                                        let _ = std::fs::remove_file(entry.path());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2251,21 +2302,19 @@ impl App {
         let _ = self.write_tx.send(DbWriteOp::DeleteMessages(ids.clone()));
         let count = ids.len();
         self.delete_marked.clear();
+
+        // Find lowest position of a deleted message (before removing)
+        let min_deleted_pos = ids.iter().filter_map(|id| {
+            self.filtered_messages.iter().position(|m| m.id == *id)
+        }).min().unwrap_or(0);
+
         self.filtered_messages.retain(|m| !ids.contains(&m.id));
         if self.show_threaded {
             self.display_messages.retain(|m| !ids.contains(&m.id));
         }
 
-        // Restore to same message if it wasn't deleted, otherwise nearest position
-        if let Some(cid) = current_id {
-            if let Some(pos) = self.filtered_messages.iter().position(|m| m.id == cid) {
-                self.index = pos;
-            } else {
-                self.index = self.index.min(self.filtered_messages.len().saturating_sub(1));
-            }
-        } else {
-            self.index = self.index.min(self.filtered_messages.len().saturating_sub(1));
-        }
+        // Land on the item now at the first deleted position
+        self.index = min_deleted_pos.min(self.filtered_messages.len().saturating_sub(1));
 
         self.set_feedback(&format!("Purged {} messages", count), self.config.theme_colors.feedback_ok);
         self.render_all();
@@ -2406,10 +2455,11 @@ impl App {
     fn file_single_message(&self, id: i64, dest: &str) -> Result<(), String> {
         // Get message from DB with metadata
         let msg = self.db.get_message(id).ok_or("Message not found")?;
+        let mut meta = msg.metadata.clone();
 
         // Move maildir file on disk if applicable
-        if let Some(file_path) = msg.metadata.get("maildir_file").and_then(|v| v.as_str()) {
-            if std::path::Path::new(file_path).exists() {
+        if let Some(file_path) = meta.get("maildir_file").and_then(|v| v.as_str()).map(String::from) {
+            if std::path::Path::new(&file_path).exists() {
                 let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
                 let maildir_root = std::path::PathBuf::from(&home).join("Main/Maildir");
                 let dest_dir = maildir_root.join(format!(".{}", dest));
@@ -2419,25 +2469,21 @@ impl App {
                 let _ = std::fs::create_dir_all(dest_dir.join("tmp"));
 
                 // Move file
-                let filename = std::path::Path::new(file_path)
+                let filename = std::path::Path::new(&file_path)
                     .file_name()
                     .and_then(|f| f.to_str())
                     .unwrap_or("msg");
                 let new_path = cur_dir.join(filename);
-                if std::fs::rename(file_path, &new_path).is_ok() {
-                    let mut new_meta = msg.metadata.clone();
-                    new_meta["maildir_file"] =
+                if std::fs::rename(&file_path, &new_path).is_ok() {
+                    meta["maildir_file"] =
                         serde_json::json!(new_path.to_string_lossy().to_string());
-                    new_meta["maildir_folder"] = serde_json::json!(dest);
-                    self.db.update_message_folder(id, dest, &new_meta);
+                    meta["maildir_folder"] = serde_json::json!(dest);
                 }
             }
         }
 
-        // Update folder + labels in DB
-        self.db.update_message_folder(id, dest, &msg.metadata);
-
-        // Mark as read
+        // Update folder + metadata in DB
+        self.db.update_message_folder(id, dest, &meta);
         self.db.mark_as_read(id);
 
         Ok(())
@@ -4057,8 +4103,11 @@ impl App {
             raw.clone()
         };
         if let Some(ref html) = msg.html_content {
-            if extracted.is_empty() || extracted.contains("HTML messages are not support")
-                || extracted.contains("not displayed") || extracted.trim().len() < 20 {
+            let lc = extracted.to_lowercase();
+            if extracted.trim().is_empty() || lc.contains("html messages are not support")
+                || lc.contains("not displayed") || lc.contains("html-e-post")
+                || lc.contains("støtter ikke html") || lc.contains("does not support html")
+                || extracted.trim().len() < 20 {
                 return html_to_text(html);
             }
         }
