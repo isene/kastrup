@@ -188,6 +188,7 @@ struct App {
     right_pane_msg_id: Option<i64>,
     pending_forward_ids: Vec<i64>,
     pending_forward_attachments: Vec<String>,
+    pending_reply_id: Option<i64>,
     compose_source_type: Option<String>,
     image_display: Option<glow::Display>,
 
@@ -315,6 +316,7 @@ fn main() {
         right_pane_msg_id: None,
         pending_forward_ids: Vec::new(),
         pending_forward_attachments: Vec::new(),
+        pending_reply_id: None,
         compose_source_type: None,
         image_display: None,
         show_threaded: false,
@@ -2878,7 +2880,8 @@ impl App {
         }
         if let Some(msg) = self.filtered_messages.get(self.index) {
             if let Some(link) = msg.metadata.get("link").and_then(|v| v.as_str()) {
-                let _ = std::process::Command::new("xdg-open").arg(link).spawn();
+                let _ = std::process::Command::new("xdg-open").arg(link)
+                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
                 self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
             } else {
                 // Get best HTML to display: html_content > MIME extraction > raw content
@@ -2898,7 +2901,8 @@ impl App {
                 };
                 let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
                 if std::fs::write(&path, &html).is_ok() {
-                    let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+                    let _ = std::process::Command::new("xdg-open").arg(&path)
+                        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
                     self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
                 }
             }
@@ -3711,6 +3715,7 @@ impl App {
         self.ensure_full_content();
         let msg = &self.filtered_messages[self.index];
         self.compose_source_type = Some(msg.source_type.clone());
+        self.pending_reply_id = Some(msg.id);
 
         let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
         let subject = msg.subject.as_deref().unwrap_or("");
@@ -3755,6 +3760,7 @@ impl App {
         self.ensure_full_content();
         let msg = &self.filtered_messages[self.index];
         self.compose_source_type = Some(msg.source_type.clone());
+        self.pending_reply_id = Some(msg.id);
 
         let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
         let subject = msg.subject.as_deref().unwrap_or("");
@@ -4056,6 +4062,7 @@ impl App {
     }
 
     fn compose_new(&mut self) {
+        self.pending_reply_id = None;
         // Check for postponed messages
         let conn = self.db.conn.lock().unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM postponed", [], |r| r.get(0)).unwrap_or(0);
@@ -4173,6 +4180,29 @@ impl App {
             }
         }
         self.pending_forward_ids.clear();
+    }
+
+    fn mark_replied(&mut self) {
+        let id = match self.pending_reply_id.take() {
+            Some(id) => id,
+            None => return,
+        };
+        // Update DB
+        let conn = self.db.conn.lock().unwrap();
+        let _ = conn.execute("UPDATE messages SET replied = 1 WHERE id = ?",
+            rusqlite::params![id]);
+        drop(conn);
+        // Update in-memory
+        for msg in &mut self.filtered_messages {
+            if msg.id == id {
+                msg.replied = true;
+            }
+        }
+        if self.show_threaded {
+            for msg in &mut self.display_messages {
+                if msg.id == id { msg.replied = true; }
+            }
+        }
     }
 
     fn show_compose_review(&mut self, content: &str, attachments: &[String]) {
@@ -4675,6 +4705,7 @@ impl App {
                 log::info(&format!("SMTP sent OK to {}", to));
                 self.set_feedback(&format!("Sent to {} ({} attachment(s))", to, attachments.len()), self.config.theme_colors.feedback_ok);
                 self.mark_forwarded();
+                self.mark_replied();
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4806,8 +4837,9 @@ impl App {
                     &format!("Sent to {}", to),
                     self.config.theme_colors.feedback_ok,
                 );
-                // Mark forwarded messages
+                // Mark forwarded/replied messages
                 self.mark_forwarded();
+                self.mark_replied();
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4831,6 +4863,18 @@ impl App {
 impl App {
     fn view_attachments(&mut self) {
         if self.filtered_messages.is_empty() { return; }
+        // Ensure full content loaded for MIME extraction
+        self.ensure_full_content();
+        // Try MIME extraction if attachments are empty
+        if self.filtered_messages[self.index].attachments.is_empty() {
+            let msg = &self.filtered_messages[self.index];
+            if msg.content.contains("Content-Type:") {
+                let atts = extract_mime_attachments(&msg.content, msg.id);
+                if !atts.is_empty() {
+                    self.filtered_messages[self.index].attachments = atts;
+                }
+            }
+        }
         let msg = &self.filtered_messages[self.index];
         if msg.attachments.is_empty() {
             self.set_feedback("No attachments", self.config.theme_colors.feedback_warn);
@@ -5080,7 +5124,11 @@ for part in msg.walk():
         }
 
         if open {
-            let _ = std::process::Command::new("xdg-open").arg(&dest).spawn();
+            let _ = std::process::Command::new("xdg-open")
+                .arg(&dest)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
             self.set_feedback(
                 &format!("Opened: {}", name),
                 self.config.theme_colors.feedback_ok,
@@ -5790,7 +5838,7 @@ fn extract_mime_text_depth(raw: &str, depth: usize) -> Option<String> {
                 html_to_text(&t)
             } else { t }
         })
-        .or_else(|| html_part.map(|h| html_to_text(&h)))
+        .or_else(|| html_part.map(|h| html_to_text(&h)).filter(|t| !t.trim().is_empty()))
         .or(cal_part);
     result
 }
@@ -6448,10 +6496,16 @@ fn truncate_str(s: &str, max: usize) -> String {
 /// Parse a JSON array string like `["a@b.com","c@d.com"]` into a comma-separated display string.
 /// Falls back to returning the raw string if parsing fails.
 fn parse_json_recipients(raw: &str) -> String {
-    if let Ok(arr) = serde_json::from_str::<Vec<String>>(raw) {
+    let joined = if let Ok(arr) = serde_json::from_str::<Vec<String>>(raw) {
         arr.join(", ")
     } else {
         raw.to_string()
+    };
+    // Decode any RFC 2047 encoded-words (e.g. =?iso-8859-1?Q?...?=)
+    if joined.contains("=?") {
+        sources::maildir::decode_rfc2047(&joined)
+    } else {
+        joined
     }
 }
 

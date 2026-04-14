@@ -76,7 +76,8 @@ fn parse_maildir_file(path: &Path, folder: &str, filename: &str) -> Option<Messa
     let mut body_lines = Vec::new();
     let mut current_header = String::new();
 
-    for line in content.lines() {
+    for raw_line in content.lines() {
+        let line = raw_line.trim_end_matches('\r');
         if in_headers {
             if line.is_empty() {
                 // Process last header
