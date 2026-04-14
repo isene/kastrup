@@ -690,7 +690,9 @@ impl App {
         let total = self.filtered_messages.len() as i64;
 
         let tc = &self.config.theme_colors;
-        let view_label = match self.current_view.as_str() {
+        let view_label = if let Some(ref folder) = self.active_folder {
+            style::fg(folder, tc.view_custom)
+        } else { match self.current_view.as_str() {
             "A" => style::fg("All", tc.view_all),
             "N" => style::fg("New", tc.view_new),
             "S" => style::fg("Sources", tc.view_sources),
@@ -703,10 +705,12 @@ impl App {
                     format!("{} {}", style::fg(&format!("[{}]", v), tc.hint_fg), style::fg(&format!("View {}", v), tc.view_custom))
                 }
             }
-        };
+        } };
 
         // Set terminal window title
-        let title_name = match self.current_view.as_str() {
+        let title_name = if let Some(ref folder) = self.active_folder {
+            folder.clone()
+        } else { match self.current_view.as_str() {
             "A" => "All".to_string(),
             "N" => "New".to_string(),
             "S" => "Sources".to_string(),
@@ -714,7 +718,7 @@ impl App {
             v => self.views.iter().find(|vw| vw.key_binding.as_deref() == Some(v))
                 .map(|vw| format!("{} {}", v, vw.name))
                 .unwrap_or_else(|| format!("View {}", v)),
-        };
+        } };
         Crust::set_title(&format!("Kastrup - {}", title_name));
 
         // Capitalize sort label
@@ -1562,6 +1566,8 @@ impl App {
         }
         self.sort_messages();
         self.rebuild_display();
+        self.left.full_refresh();
+        self.right.full_refresh();
         self.render_all();
     }
 
@@ -1977,7 +1983,27 @@ impl App {
         self.sort_messages();
         self.rebuild_display();
 
+        // Check if any custom view matches this folder and has a top_bg color
         self.top.bg = self.config.theme_colors.top_bg;
+        for view in &self.views {
+            if let Ok(f) = serde_json::from_str::<serde_json::Value>(&view.filters) {
+                let matches = f["rules"].as_array().map(|rules| {
+                    rules.iter().any(|r| {
+                        r["field"].as_str() == Some("folder")
+                            && r["value"].as_str().map(|v| folder.starts_with(v)).unwrap_or(false)
+                    })
+                }).unwrap_or(false);
+                if matches {
+                    if let Some(bg) = f["top_bg"].as_str().and_then(|s| s.parse::<u16>().ok()) {
+                        self.top.bg = bg;
+                    } else if let Some(bg) = f["top_bg"].as_u64() {
+                        self.top.bg = bg as u16;
+                    }
+                    break;
+                }
+            }
+        }
+
         self.set_feedback(
             &format!("Folder: {} ({} messages)", folder, self.filtered_messages.len()),
             self.config.theme_colors.feedback_ok,
@@ -4446,6 +4472,7 @@ impl App {
                     if content.trim() != template.trim() {
                         let tc = self.config.theme_colors.clone();
                         self.handle_resize();
+                        self.render_all(); // redraw full UI before address picker
 
                         // Expand addresses in the composed content
                         let mut final_content = content.clone();

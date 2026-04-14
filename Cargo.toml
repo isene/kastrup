@@ -1,6 +1,6 @@
 [package]
 name = "kastrup"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
 description = "Unified messaging hub TUI. Feature clone of Heathrow, built on crust."
