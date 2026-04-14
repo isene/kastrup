@@ -398,13 +398,15 @@ fn main() {
     }
 
     // Stop poller immediately (don't wait for drop)
+    log::info("Stopping poller...");
     if let Some(mut p) = app.poller.take() {
         p.stop();
     }
-    // Drop app (closes write_tx, ending writer thread)
+    log::info("Dropping app...");
     drop(app);
-
+    log::info("Cleanup...");
     Crust::cleanup();
+    log::info("Exit.");
 }
 
 fn create_panes(cols: u16, rows: u16, width: u16, border: u8, config: &Config) -> (Pane, Pane, Pane, Pane) {

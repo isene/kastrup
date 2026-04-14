@@ -1,6 +1,7 @@
 use super::MessageData;
+use std::collections::HashSet;
 
-pub fn sync_rss(feeds: &[serde_json::Value]) -> Vec<MessageData> {
+pub fn sync_rss(feeds: &[serde_json::Value], known_ids: &HashSet<String>) -> Vec<MessageData> {
     let mut messages = Vec::new();
 
     for feed_config in feeds {
@@ -19,7 +20,11 @@ pub fn sync_rss(feeds: &[serde_json::Value]) -> Vec<MessageData> {
         let xml = String::from_utf8_lossy(&output.stdout);
 
         let items = parse_feed_items(&xml, feed_title, url);
-        messages.extend(items);
+        for item in items {
+            if !known_ids.contains(&item.external_id) {
+                messages.push(item);
+            }
+        }
     }
 
     messages

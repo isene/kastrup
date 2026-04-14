@@ -52,7 +52,7 @@ impl Poller {
                                 .and_then(|v| v.as_array())
                                 .cloned()
                                 .unwrap_or_default();
-                            sources::rss::sync_rss(&feeds)
+                            sources::rss::sync_rss(&feeds, known)
                         }
                         "weechat" => sources::weechat::sync_weechat(&source.config, known),
                         "messenger" => sources::messenger::sync_messenger(&source.config, known),

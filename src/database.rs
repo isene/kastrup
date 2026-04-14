@@ -401,11 +401,21 @@ impl Database {
     pub fn delete_messages(&self, ids: &[i64]) {
         if ids.is_empty() { return; }
         let conn = self.conn.lock().unwrap();
+        // Save external_ids to prevent re-insertion by poller
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS deleted_external_ids (external_id TEXT PRIMARY KEY, source_id INTEGER, deleted_at INTEGER)"
+        );
         let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
-        let sql = format!("DELETE FROM messages WHERE id IN ({})", placeholders.join(","));
+        let select_sql = format!(
+            "INSERT OR IGNORE INTO deleted_external_ids (external_id, source_id, deleted_at) \
+             SELECT external_id, source_id, {} FROM messages WHERE id IN ({})",
+            now_secs(), placeholders.join(",")
+        );
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
-        let _ = conn.execute(&sql, param_refs.as_slice());
+        let _ = conn.execute(&select_sql, param_refs.as_slice());
+        let del_sql = format!("DELETE FROM messages WHERE id IN ({})", placeholders.join(","));
+        let _ = conn.execute(&del_sql, param_refs.as_slice());
     }
 
     /// Get all sources, optionally enabled only
@@ -585,13 +595,20 @@ impl Database {
     /// Get all known external_ids for a given source (used by poller to skip duplicates)
     pub fn get_known_external_ids(&self, source_id: i64) -> HashSet<String> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT external_id FROM messages WHERE source_id = ?"
-        ).unwrap();
-        stmt.query_map(params![source_id], |row| row.get::<_, String>(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
+        let mut ids: HashSet<String> = HashSet::new();
+        // Current messages
+        if let Ok(mut stmt) = conn.prepare("SELECT external_id FROM messages WHERE source_id = ?") {
+            if let Ok(rows) = stmt.query_map(params![source_id], |row| row.get::<_, String>(0)) {
+                for r in rows.flatten() { ids.insert(r); }
+            }
+        }
+        // Deleted messages (prevent re-insertion)
+        if let Ok(mut stmt) = conn.prepare("SELECT external_id FROM deleted_external_ids WHERE source_id = ?") {
+            if let Ok(rows) = stmt.query_map(params![source_id], |row| row.get::<_, String>(0)) {
+                for r in rows.flatten() { ids.insert(r); }
+            }
+        }
+        ids
     }
 
     /// Insert a new message from a source plugin
