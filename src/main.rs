@@ -2629,6 +2629,8 @@ impl App {
 impl App {
     fn cycle_width(&mut self) {
         self.width = if self.width >= 6 { 1 } else { self.width + 1 };
+        self.config.pane_width = self.width;
+        self.config.save();
         self.handle_resize();
         if self.left.border { self.left.border_refresh(); }
         if self.right.border { self.right.border_refresh(); }
@@ -2636,6 +2638,8 @@ impl App {
 
     fn cycle_width_reverse(&mut self) {
         self.width = if self.width <= 1 { 6 } else { self.width - 1 };
+        self.config.pane_width = self.width;
+        self.config.save();
         self.handle_resize();
         if self.left.border { self.left.border_refresh(); }
         if self.right.border { self.right.border_refresh(); }
@@ -2643,6 +2647,8 @@ impl App {
 
     fn cycle_border(&mut self) {
         self.border = (self.border + 1) % 4;
+        self.config.border_style = self.border;
+        self.config.save();
         self.handle_resize();
         if self.left.border { self.left.border_refresh(); }
         if self.right.border { self.right.border_refresh(); }
