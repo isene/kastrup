@@ -177,6 +177,7 @@ struct App {
     tagged: HashSet<i64>,
     delete_marked: HashSet<i64>,
     browsed_ids: HashSet<i64>,
+    unseen_ids: HashSet<i64>,
 
     folder_collapsed: HashMap<String, bool>,
     folder_count_cache: HashMap<String, (i64, i64)>,
@@ -308,6 +309,7 @@ fn main() {
         tagged: HashSet::new(),
         delete_marked: HashSet::new(),
         browsed_ids: HashSet::new(),
+        unseen_ids: HashSet::new(),
         folder_collapsed: HashMap::new(),
         folder_count_cache: HashMap::new(),
         feedback_message: None,
@@ -420,8 +422,8 @@ fn create_panes(cols: u16, rows: u16, width: u16, border: u8, config: &Config) -
 
     let left_w = (cols.saturating_sub(4)) * width / 10;
     let content_h = rows.saturating_sub(4);
-    let mut left = Pane::new(2, 3, left_w, content_h, 252, 0);
-    let mut right = Pane::new(left_w + 4, 3, cols.saturating_sub(left_w + 4), content_h, 252, 0);
+    let mut left = Pane::new(2, 3, left_w, content_h, config.theme_colors.list_fg as u16, config.theme_colors.list_bg as u16);
+    let mut right = Pane::new(left_w + 4, 3, cols.saturating_sub(left_w + 4), content_h, config.theme_colors.content_fg as u16, config.theme_colors.content_bg as u16);
 
     // Border styles: 0=none, 1=right only, 2=both, 3=left only
     left.border = matches!(border, 2 | 3);
@@ -554,9 +556,10 @@ impl App {
 
             // UI
             "w" => { self.cycle_width(); }
+            "W" => { self.cycle_width_reverse(); }
             "D" => { self.cycle_date_format(); }
             "c" => { self.set_view_color(); }
-            "P" => { self.show_preferences(); }
+            "C" => { self.show_preferences(); }
             "?" => {
                 if self.showing_help && !self.help_extended {
                     self.show_extended_help();
@@ -651,6 +654,7 @@ impl App {
             }
             // UI controls pass through
             "w" => { self.cycle_width(); }
+            "W" => { self.cycle_width_reverse(); }
             "C-B" => { self.cycle_border(); }
             "D" => { self.cycle_date_format(); }
             "C-L" => { self.force_redraw(); }
@@ -938,7 +942,11 @@ impl App {
             self.filtered_messages.get(self.index)
         };
         if let Some(msg) = msg_ref {
-            if !msg.read && !msg.is_header && msg.id > 0 {
+            // Clear unseen protection if user navigated away and came back
+            if self.unseen_ids.contains(&msg.id) && self.right_pane_msg_id != Some(msg.id) {
+                self.unseen_ids.remove(&msg.id);
+            }
+            if !msg.read && !msg.is_header && msg.id > 0 && !self.unseen_ids.contains(&msg.id) {
                 let id = msg.id;
                 let metadata = msg.metadata.clone();
                 // Fire-and-forget: DB write + maildir flag sync on background thread
@@ -2622,11 +2630,22 @@ impl App {
     fn cycle_width(&mut self) {
         self.width = if self.width >= 6 { 1 } else { self.width + 1 };
         self.handle_resize();
+        if self.left.border { self.left.border_refresh(); }
+        if self.right.border { self.right.border_refresh(); }
+    }
+
+    fn cycle_width_reverse(&mut self) {
+        self.width = if self.width <= 1 { 6 } else { self.width - 1 };
+        self.handle_resize();
+        if self.left.border { self.left.border_refresh(); }
+        if self.right.border { self.right.border_refresh(); }
     }
 
     fn cycle_border(&mut self) {
         self.border = (self.border + 1) % 4;
         self.handle_resize();
+        if self.left.border { self.left.border_refresh(); }
+        if self.right.border { self.right.border_refresh(); }
     }
 
     fn cycle_date_format(&mut self) {
@@ -2766,12 +2785,12 @@ impl App {
 {}\n\
   o              Cycle sort order\n\
   i              Invert sort\n\
-  w              Cycle pane width\n\
+  w/W            Cycle pane width forward/back\n\
   c              Set top bar color\n\
   B              Folder browser\n\
   Ctrl-B         Cycle border style\n\
   D              Cycle date format\n\
-  P              Preferences\n\
+  C              Preferences\n\
   y/Y            Copy ID / copy content\n\
   Ctrl-L         Redraw\n\
   q              Quit",
@@ -2818,6 +2837,8 @@ impl App {
 
     fn force_redraw(&mut self) {
         self.handle_resize();
+        if self.left.border { self.left.border_refresh(); }
+        if self.right.border { self.right.border_refresh(); }
     }
 
     fn set_feedback(&mut self, msg: &str, color: u8) {
@@ -3284,8 +3305,48 @@ impl App {
 
     fn unsee_message(&mut self) {
         if let Some(msg) = self.filtered_messages.get(self.index) {
-            self.browsed_ids.remove(&msg.id);
-            self.set_feedback("Message unseen", self.config.theme_colors.feedback_ok);
+            let id = msg.id;
+            let mut metadata = msg.metadata.clone();
+            self.browsed_ids.remove(&id);
+            self.unseen_ids.insert(id);
+            // Mark as unread in DB
+            let _ = self.write_tx.send(DbWriteOp::MarkUnread(id));
+            // Remove S flag from maildir filename on disk and update DB metadata
+            if let Some(file) = metadata.get("maildir_file").and_then(|v| v.as_str()).map(String::from) {
+                let old_path = std::path::Path::new(&file);
+                if old_path.exists() && file.contains(":2,") {
+                    // Remove S from flags portion
+                    let (base, flags) = file.rsplit_once(":2,").unwrap_or((&file, ""));
+                    let new_flags: String = flags.chars().filter(|&c| c != 'S').collect();
+                    let new_file = format!("{}:2,{}", base, new_flags);
+                    if new_file != file {
+                        let new_path = std::path::Path::new(&new_file);
+                        if std::fs::rename(old_path, new_path).is_ok() {
+                            // Update metadata and external_id in DB to match new filename
+                            metadata["maildir_file"] = serde_json::json!(&new_file);
+                            let new_fname = new_path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+                            let conn = self.db.conn.lock().unwrap();
+                            let _ = conn.execute(
+                                "UPDATE messages SET metadata = ?, external_id = ? WHERE id = ?",
+                                rusqlite::params![serde_json::to_string(&metadata).unwrap_or_default(), new_fname, id]
+                            );
+                            drop(conn);
+                        }
+                    }
+                }
+            }
+            if let Some(m) = self.filtered_messages.iter_mut().find(|m| m.id == id) {
+                m.read = false;
+                m.metadata = metadata;
+            }
+            if self.show_threaded {
+                if let Some(m) = self.display_messages.iter_mut().find(|m| m.id == id) {
+                    m.read = false;
+                }
+            }
+            self.stats_cache = None;
+            self.set_feedback("Message marked unread", self.config.theme_colors.feedback_ok);
+            self.render_all();
         }
     }
 
@@ -3425,8 +3486,8 @@ impl App {
     }
 
     fn show_preferences(&mut self) {
-        let pw = 60u16.min(self.cols - 4);
-        let ph = 18u16.min(self.rows - 6);
+        let pw = 80u16.min(self.cols.saturating_sub(4));
+        let ph = 20u16.min(self.rows.saturating_sub(6));
         let px = (self.cols.saturating_sub(pw)) / 2;
         let py = (self.rows.saturating_sub(ph)) / 2;
         let mut popup = Pane::new(px, py, pw, ph, 255, 235);
@@ -3459,10 +3520,11 @@ impl App {
 
             for (i, (label, ptype)) in items.iter().enumerate() {
                 let label_fmt = format!("{:<18}", label);
+                let max_val = (pw as usize).saturating_sub(26);
                 let value_str = match ptype {
                     PrefType::Bool(v) => if *v { style::fg("Yes", self.config.theme_colors.feedback_ok) } else { style::fg("No", 196) },
                     PrefType::Choice(_, current) => style::fg(current, self.config.theme_colors.view_custom),
-                    PrefType::Text(v) => if v.len() > 25 { format!("{}...", &v[..22]) } else { v.clone() },
+                    PrefType::Text(v) => if v.len() > max_val { format!("{}...", &v[..max_val.saturating_sub(3)]) } else { v.clone() },
                     PrefType::Num(v, _, _) => format!("{}", v),
                 };
                 if i == sel {
@@ -3472,7 +3534,7 @@ impl App {
                 }
             }
             lines.push(String::new());
-            lines.push(style::fg(" j/k navigate  l/h change  Enter edit  ESC save & close", self.config.theme_colors.hint_fg));
+            lines.push(style::fg(" j/k navigate  l/h change  Enter edit  W:Save  ESC:Close", self.config.theme_colors.hint_fg));
 
             popup.set_text(&lines.join("\n"));
             popup.ix = 0;
@@ -3480,7 +3542,8 @@ impl App {
 
             let Some(key) = Input::getchr(None) else { continue };
             match key.as_str() {
-                "ESC" | "q" => break,
+                "ESC" | "q" => { dirty = false; break; }
+                "W" => { break; } // dirty stays true, will save
                 "j" | "DOWN" => { if sel < items.len() - 1 { sel += 1; } }
                 "k" | "UP" => { if sel > 0 { sel -= 1; } }
                 "l" | "RIGHT" => { next_pref(&mut items[sel].1); dirty = true; if sel == 1 { theme_preset_changed = true; } }
@@ -3501,7 +3564,7 @@ impl App {
                                 let new_val = self.prompt(&format!("{}: ", label), val);
                                 if !new_val.is_empty() { *val = new_val; dirty = true; }
                                 // Restore popup's bottom hint (prompt overwrites status bar)
-                                self.bottom.say(&style::fg(" j/k navigate  l/h change  Enter edit  ESC save & close", self.config.theme_colors.hint_fg));
+                                self.bottom.say(&style::fg(" j/k navigate  l/h change  Enter edit  W:Save  ESC:Close", self.config.theme_colors.hint_fg));
                             }
                             _ => { next_pref(&mut items[sel].1); dirty = true; }
                         }
@@ -3525,8 +3588,14 @@ impl App {
                     ("Date format", PrefType::Choice(_, v)) => { self.date_format = v.clone(); self.config.date_format = v.clone(); }
                     ("Sort order", PrefType::Choice(_, v)) => self.sort_order = v.clone(),
                     ("Sort inverted", PrefType::Bool(v)) => self.sort_inverted = *v,
-                    ("Pane width", PrefType::Num(v, _, _)) => self.width = *v as u16,
-                    ("Border style", PrefType::Num(v, _, _)) => self.border = *v,
+                    ("Pane width", PrefType::Num(v, _, _)) => {
+                        self.width = *v as u16;
+                        self.handle_resize();
+                    }
+                    ("Border style", PrefType::Num(v, _, _)) => {
+                        self.border = *v;
+                        self.handle_resize();
+                    }
                     ("Confirm purge", PrefType::Bool(v)) => self.config.confirm_purge = *v,
                     ("Download folder", PrefType::Text(v)) => self.config.download_folder = v.clone(),
                     ("Editor args", PrefType::Text(v)) => self.config.editor_args = v.clone(),
@@ -3540,16 +3609,19 @@ impl App {
             self.rebuild_display();
         }
         self.handle_resize(); // Rebuild panes (restore_view_top_bg called inside)
+        if self.left.border { self.left.border_refresh(); }
+        if self.right.border { self.right.border_refresh(); }
         self.render_top_bar();
     }
 
     fn show_theme_colors_popup(&mut self) {
-        let pw = 50u16.min(self.cols - 4);
-        let ph = 30u16.min(self.rows - 4);
+        let pw = 50u16.min(self.cols.saturating_sub(4));
+        let ph = 34u16.min(self.rows.saturating_sub(4));
         let px = (self.cols.saturating_sub(pw)) / 2;
-        let py = (self.rows.saturating_sub(ph)) / 2;
+        let py = 3;
         let mut popup = Pane::new(px, py, pw, ph, 255, 235);
         popup.border = true;
+        popup.scroll = true;
         popup.border_refresh();
 
         // Build editable color list from theme_colors
@@ -3578,9 +3650,14 @@ impl App {
             ("Messenger", self.config.theme_colors.src_messenger),
             ("Instagram", self.config.theme_colors.src_instagram),
             ("WeeChat", self.config.theme_colors.src_weechat),
+            ("Content fg", self.config.theme_colors.content_fg),
+            ("Content bg", self.config.theme_colors.content_bg),
+            ("List fg", self.config.theme_colors.list_fg),
+            ("List bg", self.config.theme_colors.list_bg),
         ];
 
         let mut sel = 0usize;
+        let mut save = false;
 
         loop {
             let mut lines = Vec::new();
@@ -3596,15 +3673,23 @@ impl App {
                 }
             }
             lines.push(String::new());
-            lines.push(style::fg(" h/l:\u{00B1}1  H/L:\u{00B1}10  Enter:type  ESC:done", self.config.theme_colors.hint_fg));
+            lines.push(style::fg(" h/l:\u{00B1}1  H/L:\u{00B1}10  Enter:type  W:Save  ESC:Close", self.config.theme_colors.hint_fg));
 
             popup.set_text(&lines.join("\n"));
-            popup.ix = 0;
+            // Scroll to keep selected item visible (sel + 2 for header lines)
+            let vis_h = popup.h as usize;
+            let item_line = sel + 2; // 2 header lines before items
+            if item_line >= popup.ix + vis_h.saturating_sub(2) {
+                popup.ix = (item_line + 3).saturating_sub(vis_h);
+            } else if item_line < popup.ix + 1 {
+                popup.ix = item_line.saturating_sub(1);
+            }
             popup.full_refresh();
 
             let Some(key) = Input::getchr(None) else { continue };
             match key.as_str() {
-                "ESC" | "q" => break,
+                "ESC" | "q" => { save = false; break; }
+                "W" => { save = true; break; }
                 "j" | "DOWN" => { if sel < colors.len() - 1 { sel += 1; } }
                 "k" | "UP" => { if sel > 0 { sel -= 1; } }
                 "l" | "RIGHT" => { colors[sel].1 = (colors[sel].1 as u16 + 1).min(255) as u8; }
@@ -3620,6 +3705,8 @@ impl App {
             }
         }
 
+        if !save { return; }
+
         // Apply colors back
         let tc = &mut self.config.theme_colors;
         tc.unread = colors[0].1;   tc.read = colors[1].1;
@@ -3634,6 +3721,14 @@ impl App {
         tc.src_reddit = colors[18].1;   tc.src_rss = colors[19].1;
         tc.src_web = colors[20].1;      tc.src_messenger = colors[21].1;
         tc.src_instagram = colors[22].1; tc.src_weechat = colors[23].1;
+        tc.content_fg = colors[24].1;  tc.content_bg = colors[25].1;
+        tc.list_fg = colors[26].1;     tc.list_bg = colors[27].1;
+        // Apply pane colors
+        self.left.fg = tc.list_fg as u16;
+        self.left.bg = tc.list_bg as u16;
+        self.right.fg = tc.content_fg as u16;
+        self.right.bg = tc.content_bg as u16;
+        self.config.save();
         self.render_all();
     }
 }

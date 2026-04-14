@@ -63,9 +63,9 @@ cp target/release/kastrup ~/.local/bin/
 | B | Folder browser |
 | l | Manage labels |
 | I | AI assistant |
-| @ | Address book |
-| P | Preferences |
-| w | Adjust left pane width |
+| u/U | Mark message unseen |
+| C | Preferences |
+| w/W | Cycle pane width forward/back |
 | Ctrl+B | Toggle borders |
 | Ctrl+L | Refresh display |
 | ? | Help |

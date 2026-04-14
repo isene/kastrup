@@ -56,6 +56,10 @@ pub struct ThemeColors {
     pub src_instagram: u8,
     pub src_weechat: u8,
     pub src_default: u8,
+    pub content_fg: u8,
+    pub content_bg: u8,
+    pub list_fg: u8,
+    pub list_bg: u8,
 }
 
 impl Default for ThemeColors {
@@ -78,6 +82,7 @@ impl Default for ThemeColors {
             src_email: 39, src_discord: 99, src_slack: 35, src_telegram: 51,
             src_whatsapp: 40, src_reddit: 202, src_rss: 226, src_web: 208,
             src_messenger: 33, src_instagram: 205, src_weechat: 75, src_default: 15,
+            content_fg: 252, content_bg: 0, list_fg: 252, list_bg: 0,
         }
     }
 }
@@ -222,6 +227,8 @@ impl Config {
             "src_rss": tc.src_rss, "src_web": tc.src_web,
             "src_messenger": tc.src_messenger, "src_instagram": tc.src_instagram,
             "src_weechat": tc.src_weechat, "src_default": tc.src_default,
+            "content_fg": tc.content_fg, "content_bg": tc.content_bg,
+            "list_fg": tc.list_fg, "list_bg": tc.list_bg,
         });
         data["default_email"] = serde_json::json!(self.default_email);
         data["smtp_command"] = serde_json::json!(self.smtp_command);
@@ -341,6 +348,10 @@ impl Config {
             if let Some(v) = colors.get("src_instagram").and_then(|v| v.as_u64()) { tc.src_instagram = v as u8; }
             if let Some(v) = colors.get("src_weechat").and_then(|v| v.as_u64()) { tc.src_weechat = v as u8; }
             if let Some(v) = colors.get("src_default").and_then(|v| v.as_u64()) { tc.src_default = v as u8; }
+            if let Some(v) = colors.get("content_fg").and_then(|v| v.as_u64()) { tc.content_fg = v as u8; }
+            if let Some(v) = colors.get("content_bg").and_then(|v| v.as_u64()) { tc.content_bg = v as u8; }
+            if let Some(v) = colors.get("list_fg").and_then(|v| v.as_u64()) { tc.list_fg = v as u8; }
+            if let Some(v) = colors.get("list_bg").and_then(|v| v.as_u64()) { tc.list_bg = v as u8; }
         }
     }
 
@@ -437,7 +448,7 @@ impl Config {
 
             if let Some(caps) = set_re.captures(trimmed) {
                 let key = caps.get(1).unwrap().as_str();
-                let raw_val = caps.get(2).unwrap().as_str().trim();
+                let raw_val = strip_ruby_comment(caps.get(2).unwrap().as_str().trim());
                 let val = strip_ruby_quotes(raw_val);
 
                 match key {
@@ -516,6 +527,10 @@ impl Config {
                         "feedback_warn" => self.theme_colors.feedback_warn = cval as u8,
                         "feedback_ok" => self.theme_colors.feedback_ok = cval as u8,
                         "feedback_info" => self.theme_colors.feedback_info = cval as u8,
+                        "content_fg" => self.theme_colors.content_fg = cval as u8,
+                        "content_bg" => self.theme_colors.content_bg = cval as u8,
+                        "list_fg" => self.theme_colors.list_fg = cval as u8,
+                        "list_bg" => self.theme_colors.list_bg = cval as u8,
                         _ => {}
                     }
                 }
@@ -570,6 +585,24 @@ impl Config {
 }
 
 /// Strip surrounding Ruby quotes from a value string
+/// Strip Ruby inline comments: `'value' # comment` -> `'value'`
+/// Respects quotes (won't strip # inside strings).
+fn strip_ruby_comment(s: &str) -> &str {
+    let mut in_quote = false;
+    let mut quote_char = ' ';
+    for (i, ch) in s.char_indices() {
+        if in_quote {
+            if ch == quote_char { in_quote = false; }
+        } else if ch == '\'' || ch == '"' {
+            in_quote = true;
+            quote_char = ch;
+        } else if ch == '#' {
+            return s[..i].trim();
+        }
+    }
+    s
+}
+
 fn strip_ruby_quotes(s: &str) -> &str {
     let s = s.trim();
     if (s.starts_with('\'') && s.ends_with('\''))
