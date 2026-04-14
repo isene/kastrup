@@ -5228,6 +5228,47 @@ impl App {
             }
         }
 
+        // From MIME image parts (inline embedded images)
+        if urls.is_empty() && msg.content.contains("image/") {
+            let maildir_file = msg.metadata.get("maildir_file").and_then(|v| v.as_str()).map(String::from);
+            if let Some(ref mf) = maildir_file {
+                if std::path::Path::new(mf).exists() {
+                    let cache_dir = home_dir().join(".kastrup/image_cache");
+                    let _ = std::fs::create_dir_all(&cache_dir);
+                    let py = format!(r#"
+import email, sys, os
+with open(sys.argv[1], 'rb') as f:
+    msg = email.message_from_binary_file(f)
+dest = sys.argv[2]
+i = 0
+for part in msg.walk():
+    ct = part.get_content_type()
+    if ct.startswith('image/'):
+        data = part.get_payload(decode=True)
+        if data:
+            ext = ct.split('/')[-1].split(';')[0]
+            path = os.path.join(dest, f'mime_img_{{i}}.{{ext}}')
+            with open(path, 'wb') as out:
+                out.write(data)
+            print(path)
+            i += 1
+"#);
+                    if let Ok(output) = std::process::Command::new("python3")
+                        .arg("-c").arg(&py)
+                        .arg(mf).arg(cache_dir.to_string_lossy().as_ref())
+                        .output()
+                    {
+                        for line in String::from_utf8_lossy(&output.stdout).lines() {
+                            let path = line.trim();
+                            if !path.is_empty() {
+                                urls.push(format!("file://{}", path));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         urls.dedup();
 
         if urls.is_empty() {
@@ -5243,6 +5284,14 @@ impl App {
 
         let mut paths: Vec<String> = Vec::new();
         for url in urls.iter().take(10) {
+            // Local file (from MIME extraction)
+            if let Some(local) = url.strip_prefix("file://") {
+                if std::path::Path::new(local).exists() {
+                    paths.push(local.to_string());
+                }
+                continue;
+            }
+
             let ext = url.rsplit('.').next()
                 .and_then(|e| {
                     let e = e.split('?').next().unwrap_or(e);
