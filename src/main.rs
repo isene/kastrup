@@ -427,7 +427,9 @@ fn create_panes(cols: u16, rows: u16, width: u16, border: u8, config: &Config) -
 
     // Border styles: 0=none, 1=right only, 2=both, 3=left only
     left.border = matches!(border, 2 | 3);
+    left.border_fg = Some(config.theme_colors.border_fg as u16);
     right.border = matches!(border, 1 | 2);
+    right.border_fg = Some(config.theme_colors.border_fg as u16);
     if left.border { left.border_refresh(); }
     if right.border { right.border_refresh(); }
 
@@ -3663,6 +3665,7 @@ impl App {
             ("Content bg", self.config.theme_colors.content_bg),
             ("List fg", self.config.theme_colors.list_fg),
             ("List bg", self.config.theme_colors.list_bg),
+            ("Border fg", self.config.theme_colors.border_fg),
         ];
 
         let mut sel = 0usize;
@@ -3732,11 +3735,14 @@ impl App {
         tc.src_instagram = colors[22].1; tc.src_weechat = colors[23].1;
         tc.content_fg = colors[24].1;  tc.content_bg = colors[25].1;
         tc.list_fg = colors[26].1;     tc.list_bg = colors[27].1;
+        tc.border_fg = colors[28].1;
         // Apply pane colors
         self.left.fg = tc.list_fg as u16;
         self.left.bg = tc.list_bg as u16;
+        self.left.border_fg = Some(tc.border_fg as u16);
         self.right.fg = tc.content_fg as u16;
         self.right.bg = tc.content_bg as u16;
+        self.right.border_fg = Some(tc.border_fg as u16);
         self.config.save();
         self.render_all();
     }

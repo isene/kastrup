@@ -60,6 +60,7 @@ pub struct ThemeColors {
     pub content_bg: u8,
     pub list_fg: u8,
     pub list_bg: u8,
+    pub border_fg: u8,
 }
 
 impl Default for ThemeColors {
@@ -82,7 +83,7 @@ impl Default for ThemeColors {
             src_email: 39, src_discord: 99, src_slack: 35, src_telegram: 51,
             src_whatsapp: 40, src_reddit: 202, src_rss: 226, src_web: 208,
             src_messenger: 33, src_instagram: 205, src_weechat: 75, src_default: 15,
-            content_fg: 252, content_bg: 0, list_fg: 252, list_bg: 0,
+            content_fg: 252, content_bg: 0, list_fg: 252, list_bg: 0, border_fg: 238,
         }
     }
 }
@@ -229,6 +230,7 @@ impl Config {
             "src_weechat": tc.src_weechat, "src_default": tc.src_default,
             "content_fg": tc.content_fg, "content_bg": tc.content_bg,
             "list_fg": tc.list_fg, "list_bg": tc.list_bg,
+            "border_fg": tc.border_fg,
         });
         data["default_email"] = serde_json::json!(self.default_email);
         data["smtp_command"] = serde_json::json!(self.smtp_command);
@@ -351,6 +353,7 @@ impl Config {
             if let Some(v) = colors.get("content_bg").and_then(|v| v.as_u64()) { tc.content_bg = v as u8; }
             if let Some(v) = colors.get("list_fg").and_then(|v| v.as_u64()) { tc.list_fg = v as u8; }
             if let Some(v) = colors.get("list_bg").and_then(|v| v.as_u64()) { tc.list_bg = v as u8; }
+            if let Some(v) = colors.get("border_fg").and_then(|v| v.as_u64()) { tc.border_fg = v as u8; }
         }
     }
 
@@ -530,6 +533,7 @@ impl Config {
                         "content_bg" => self.theme_colors.content_bg = cval as u8,
                         "list_fg" => self.theme_colors.list_fg = cval as u8,
                         "list_bg" => self.theme_colors.list_bg = cval as u8,
+                        "border_fg" => self.theme_colors.border_fg = cval as u8,
                         _ => {}
                     }
                 }
