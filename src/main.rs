@@ -963,6 +963,9 @@ impl App {
                     }
                 }
                 self.stats_cache = None; // Invalidate stats
+                // Update left pane and top bar to reflect read status
+                self.render_message_list();
+                self.render_top_bar();
             }
         }
 

@@ -249,9 +249,8 @@ impl Config {
     /// Load configuration from ~/.kastrup/config.yml and ~/.kastrup/kastruprc
     pub fn load() -> Self {
         let mut config = Config::default();
-        config.load_yaml();  // Loads theme name + saved color overrides
-        config.load_rc();
-        // theme_colors already set: load_yaml applies theme preset then saved colors on top
+        config.load_rc();    // Base settings from kastruprc
+        config.load_yaml();  // Saved overrides from config.yml win (colors, width, border, etc.)
         config
     }
 
