@@ -4641,6 +4641,21 @@ impl App {
                                 "ENTER" => {
                                     let final_content = std::fs::read_to_string(&tmpfile)
                                         .unwrap_or_else(|_| content.clone());
+                                    // Warn if subject is empty (like mutt)
+                                    let has_subject = final_content.lines()
+                                        .take_while(|l| !l.is_empty())
+                                        .any(|l| l.strip_prefix("Subject: ").is_some_and(|s| !s.trim().is_empty()));
+                                    if !has_subject {
+                                        self.set_feedback("No subject. Send anyway? (y/n)", tc.feedback_warn);
+                                        if let Some(k) = Input::getchr(Some(5)) {
+                                            if k != "y" && k != "Y" {
+                                                self.set_feedback("Aborted", tc.feedback_info);
+                                                continue;
+                                            }
+                                        } else {
+                                            continue;
+                                        }
+                                    }
                                     if attachments.is_empty() {
                                         self.handle_composed_message(&final_content);
                                     } else {
@@ -4663,8 +4678,30 @@ impl App {
                                     break;
                                 }
                                 "a" => {
-                                    let path = self.prompt("Attach file: ", "");
-                                    if !path.is_empty() {
+                                    let path = self.prompt("Attach file (Enter=browse): ", "");
+                                    if path.is_empty() {
+                                        // Launch pointer in --pick mode
+                                        let pick_file = format!("/tmp/kastrup_attach_{}.txt", std::process::id());
+                                        let _ = std::fs::remove_file(&pick_file);
+                                        Crust::cleanup();
+                                        print!("\x1b[2J\x1b[H");
+                                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                                        let _ = std::process::Command::new("pointer")
+                                            .arg(format!("--pick={}", pick_file))
+                                            .status();
+                                        Crust::init();
+                                        Crust::clear_screen();
+                                        self.handle_resize();
+                                        if let Ok(files) = std::fs::read_to_string(&pick_file) {
+                                            for f in files.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()) {
+                                                attachments.push(f);
+                                            }
+                                        }
+                                        let _ = std::fs::remove_file(&pick_file);
+                                        if !attachments.is_empty() {
+                                            self.set_feedback(&format!("{} attachment(s)", attachments.len()), tc.feedback_ok);
+                                        }
+                                    } else {
                                         let expanded = path.replace("~/",
                                             &format!("{}/", std::env::var("HOME").unwrap_or_default()));
                                         if std::path::Path::new(&expanded).exists() {
