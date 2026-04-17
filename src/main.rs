@@ -41,6 +41,32 @@ struct FolderEntry {
     collapsed: bool,
 }
 
+/// Wrap URLs in a line with OSC 8 hyperlink escapes so kitty keeps them
+/// clickable even when the visible text wraps across multiple pane lines.
+fn hyperlink_urls(line: &str) -> String {
+    use std::sync::OnceLock;
+    static URL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = URL_RE.get_or_init(|| {
+        regex::Regex::new(r#"https?://[^\s<>()\[\]{}\x00-\x1f\x7f]+[^\s<>()\[\]{}\x00-\x1f\x7f.,;:!?'"]"#)
+            .unwrap()
+    });
+    let mut out = String::with_capacity(line.len());
+    let mut last = 0;
+    for m in re.find_iter(line) {
+        out.push_str(&line[last..m.start()]);
+        let url = m.as_str();
+        // OSC 8: \e]8;;URL\e\\text\e]8;;\e\\
+        out.push_str("\x1b]8;;");
+        out.push_str(url);
+        out.push_str("\x1b\\");
+        out.push_str(url);
+        out.push_str("\x1b]8;;\x1b\\");
+        last = m.end();
+    }
+    out.push_str(&line[last..]);
+    out
+}
+
 fn discover_maildir_folders(maildir_path: &std::path::Path) -> Vec<String> {
     let mut folder_names = Vec::new();
     if let Ok(entries) = std::fs::read_dir(maildir_path) {
@@ -1244,18 +1270,19 @@ impl App {
             if line.starts_with("-- ") || line == "--" {
                 in_signature = true;
             }
+            let linked = hyperlink_urls(line);
             if in_signature {
-                lines.push(style::fg(line, self.config.theme_colors.sig));
+                lines.push(style::fg(&linked, self.config.theme_colors.sig));
             } else if line.starts_with(">>>>") {
-                lines.push(style::fg(line, self.config.theme_colors.quote4));
+                lines.push(style::fg(&linked, self.config.theme_colors.quote4));
             } else if line.starts_with(">>>") {
-                lines.push(style::fg(line, self.config.theme_colors.quote3));
+                lines.push(style::fg(&linked, self.config.theme_colors.quote3));
             } else if line.starts_with(">>") {
-                lines.push(style::fg(line, self.config.theme_colors.quote2));
+                lines.push(style::fg(&linked, self.config.theme_colors.quote2));
             } else if line.starts_with('>') {
-                lines.push(style::fg(line, self.config.theme_colors.quote1));
+                lines.push(style::fg(&linked, self.config.theme_colors.quote1));
             } else {
-                lines.push(line.to_string());
+                lines.push(linked);
             }
         }
 
@@ -1675,7 +1702,7 @@ impl App {
 
 impl App {
     fn show_folder_browser(&mut self) {
-        self.folder_count_cache.clear();
+        self.folder_count_cache = self.db.all_folder_counts();
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         let maildir_path = std::path::PathBuf::from(&home).join("Main/Maildir");
         let folder_names = discover_maildir_folders(&maildir_path);
@@ -1698,7 +1725,9 @@ impl App {
     }
 
     fn show_favorites_browser(&mut self) {
-        self.folder_count_cache.clear();
+        // Prefill counts cache in a single grouped DB query instead of
+        // one-per-folder as the user scrolls.
+        self.folder_count_cache = self.db.all_folder_counts();
         let favorites = self.db.get_favorite_folders();
         if favorites.is_empty() {
             self.set_feedback(

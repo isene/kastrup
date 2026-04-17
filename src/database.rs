@@ -178,6 +178,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender);
             CREATE INDEX IF NOT EXISTS idx_messages_read_timestamp ON messages(read, timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_folder ON messages(folder);
+            CREATE INDEX IF NOT EXISTS idx_messages_folder_timestamp ON messages(folder, timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_sources_enabled ON sources(enabled);
             CREATE INDEX IF NOT EXISTS idx_sources_plugin_type ON sources(plugin_type);
             CREATE INDEX IF NOT EXISTS idx_views_key_binding ON views(key_binding);
@@ -197,7 +198,96 @@ impl Database {
                 VALUES ('Starred', '*', '{{"rules":[{{"field":"starred","op":"=","value":true}}]}}', {now}, {now});
         "#));
 
+        // One-time cleanup: dedup maildir messages sharing the same file
+        // path (caused by pre-fix filing that didn't update external_id).
+        let migration_key = "maildir_dedup_v1";
+        let already_run: bool = conn
+            .query_row(
+                "SELECT 1 FROM settings WHERE key = ?",
+                params![migration_key],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !already_run {
+            Self::dedup_maildir(&conn);
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
+                params![migration_key, "done", now],
+            );
+        }
+
         Ok(())
+    }
+
+    /// Remove duplicate maildir rows and fix stale external_ids left behind
+    /// by the pre-fix filing bug. Keeps the row with the lowest id per file.
+    fn dedup_maildir(conn: &rusqlite::Connection) {
+        use std::collections::HashMap;
+        let mut stmt = match conn.prepare(
+            "SELECT id, external_id, folder, json_extract(metadata, '$.maildir_file') \
+             FROM messages WHERE external_id LIKE 'maildir_%'"
+        ) { Ok(s) => s, Err(_) => return };
+        let rows: Vec<(i64, String, Option<String>, Option<String>)> = stmt
+            .query_map([], |r| Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            )))
+            .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+            .unwrap_or_default();
+        drop(stmt);
+
+        // Group by maildir_file; within each group keep id=MIN, queue others for delete
+        let mut groups: HashMap<String, Vec<(i64, String, Option<String>)>> = HashMap::new();
+        for (id, ext, folder, file) in &rows {
+            if let Some(f) = file {
+                groups.entry(f.clone())
+                    .or_default()
+                    .push((*id, ext.clone(), folder.clone()));
+            }
+        }
+
+        let mut to_delete: Vec<i64> = Vec::new();
+        let mut to_fix: Vec<(i64, String)> = Vec::new();
+        for (path, mut entries) in groups {
+            entries.sort_by_key(|e| e.0);
+            let keeper = &entries[0];
+            for dup in &entries[1..] {
+                to_delete.push(dup.0);
+            }
+            // Fix keeper's external_id if it doesn't match current folder
+            if let Some(folder) = &keeper.2 {
+                let filename = std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("");
+                if !filename.is_empty() {
+                    let expected = format!("maildir_{}_{}", folder, filename);
+                    if keeper.1 != expected {
+                        to_fix.push((keeper.0, expected));
+                    }
+                }
+            }
+        }
+
+        let deleted = to_delete.len();
+        for id in &to_delete {
+            let _ = conn.execute("DELETE FROM messages WHERE id = ?", params![id]);
+        }
+        for (id, ext) in &to_fix {
+            // Ignore errors from UNIQUE conflicts (e.g. another row already has this id)
+            let _ = conn.execute(
+                "UPDATE messages SET external_id = ? WHERE id = ?",
+                params![ext, id],
+            );
+        }
+        if deleted > 0 {
+            eprintln!(
+                "Kastrup: removed {} duplicate maildir entries, fixed {} external_ids",
+                deleted, to_fix.len()
+            );
+        }
     }
 
     /// Get messages matching filters with limit and offset.
@@ -486,6 +576,26 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let meta_str = serde_json::to_string(metadata).unwrap_or_default();
         let labels = serde_json::json!([folder]).to_string();
+        // Also update external_id for maildir sources so the poller doesn't
+        // re-ingest the file at its new path as a new message.
+        // Format: maildir_{folder}_{filename} - strip using OLD folder, prepend NEW.
+        let current: Option<(String, Option<String>)> = conn.query_row(
+            "SELECT external_id, folder FROM messages WHERE id = ?",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).ok();
+        if let Some((ext_id, old_folder)) = current {
+            if let (Some(old), Some(rest)) = (old_folder.as_ref(), ext_id.strip_prefix("maildir_")) {
+                let prefix = format!("{}_", old);
+                if let Some(filename) = rest.strip_prefix(&prefix) {
+                    let new_ext_id = format!("maildir_{}_{}", folder, filename);
+                    let _ = conn.execute(
+                        "UPDATE messages SET external_id = ? WHERE id = ?",
+                        params![new_ext_id, id],
+                    );
+                }
+            }
+        }
         let _ = conn.execute(
             "UPDATE messages SET folder = ?, labels = ?, metadata = ? WHERE id = ?",
             params![folder, labels, meta_str, id],
@@ -552,6 +662,29 @@ impl Database {
                 row.get::<_, Option<i64>>(1).unwrap_or(Some(0)).unwrap_or(0),
             ))
         ).unwrap_or((0, 0))
+    }
+
+    /// Get total+unread counts for all folders in a single grouped query.
+    /// Much faster than calling folder_message_count per folder when browsing.
+    pub fn all_folder_counts(&self) -> HashMap<String, (i64, i64)> {
+        let conn = self.conn.lock().unwrap();
+        let mut out = HashMap::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT folder, COUNT(*), SUM(CASE WHEN read = 0 THEN 1 ELSE 0 END) \
+             FROM messages WHERE folder IS NOT NULL GROUP BY folder"
+        ) {
+            let iter = stmt.query_map([], |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1).unwrap_or(0),
+                r.get::<_, Option<i64>>(2).unwrap_or(Some(0)).unwrap_or(0),
+            )));
+            if let Ok(rows) = iter {
+                for row in rows.flatten() {
+                    out.insert(row.0, (row.1, row.2));
+                }
+            }
+        }
+        out
     }
 
     /// Get favorite folders from settings
