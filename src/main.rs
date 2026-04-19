@@ -469,7 +469,14 @@ fn create_panes(cols: u16, rows: u16, width: u16, border: u8, config: &Config) -
 
 impl App {
     fn handle_key(&mut self, key: &str) {
-        if key == "ESC" && self.showing_image {
+        // While an inline image is visible, only D acts (download). Any
+        // other key dismisses the image, like ESC would. Otherwise their
+        // redraw paints email text underneath the still-visible image.
+        if self.showing_image {
+            if key == "D" {
+                self.download_images();
+                return;
+            }
             self.clear_inline_image();
             self.render_message_content();
             return;
@@ -564,6 +571,7 @@ impl App {
             // Attachments / external
             "v" => { self.view_attachments(); }
             "V" => { self.toggle_inline_image(); }
+            "D" => { self.download_images(); }
             "x" => { self.open_external(); }
             "X" => { self.open_in_browser(); }
 
@@ -2813,6 +2821,7 @@ impl App {
 {}\n\
   v              View/save attachments\n\
   V              Inline image\n\
+  D              Download images to disk\n\
   x              Open in external app\n\
   X              Open HTML in browser\n\n\
 {}\n\
@@ -5509,7 +5518,7 @@ for part in msg.walk():
         }
 
         let label = if paths.len() == 1 { "1 image".to_string() } else { format!("{} images", paths.len()) };
-        self.right.set_text(&style::fg(&format!(" [{}]  Press ESC to return", label), self.config.theme_colors.hint_fg));
+        self.right.set_text(&style::fg(&format!(" [{}]  D: download  ESC: return", label), self.config.theme_colors.hint_fg));
         self.right.full_refresh();
         if self.right.border { self.right.border_refresh(); }
 
@@ -5569,6 +5578,306 @@ for part in msg.walk():
         self.image_display = None;
         self.showing_image = false;
     }
+
+    /// Collect every image URL referenced by the current message, from all
+    /// sources: Discord-style attachments, HTML <img>, MIME inline images
+    /// (the latter extracted to disk and returned as file:// URLs).
+    fn collect_image_urls(&mut self) -> Vec<String> {
+        if self.filtered_messages.is_empty() { return Vec::new(); }
+
+        if !self.filtered_messages[self.index].full_loaded {
+            let msg_id = self.filtered_messages[self.index].id;
+            if let Some((content, html)) = self.db.get_message_content(msg_id) {
+                self.filtered_messages[self.index].content = content;
+                self.filtered_messages[self.index].html_content = html;
+                self.filtered_messages[self.index].full_loaded = true;
+            }
+        }
+
+        let msg = &self.filtered_messages[self.index];
+        let mut urls: Vec<String> = Vec::new();
+
+        for att in &msg.attachments {
+            let url = att.get("url").or_else(|| att.get("proxy_url")).and_then(|v| v.as_str());
+            if let Some(url) = url {
+                if url.starts_with("http") && is_image_attachment(att) {
+                    urls.push(url.to_string());
+                }
+            }
+        }
+
+        let html = msg.html_content.as_deref()
+            .or_else(|| if msg.content.trim_start().starts_with('<') { Some(msg.content.as_str()) } else { None });
+        if let Some(html) = html {
+            for url in extract_image_urls(html) {
+                if url.starts_with("http") {
+                    urls.push(url);
+                }
+            }
+        }
+
+        if urls.is_empty() && msg.content.contains("image/") {
+            let maildir_file = msg.metadata.get("maildir_file").and_then(|v| v.as_str()).map(String::from);
+            if let Some(ref mf) = maildir_file {
+                if std::path::Path::new(mf).exists() {
+                    let cache_dir = home_dir().join(".kastrup/image_cache");
+                    let _ = std::fs::create_dir_all(&cache_dir);
+                    let py = r#"
+import email, sys, os
+with open(sys.argv[1], 'rb') as f:
+    msg = email.message_from_binary_file(f)
+dest = sys.argv[2]
+i = 0
+for part in msg.walk():
+    ct = part.get_content_type()
+    if ct.startswith('image/'):
+        data = part.get_payload(decode=True)
+        if data:
+            ext = ct.split('/')[-1].split(';')[0]
+            fname = part.get_filename() or f'mime_img_{i}.{ext}'
+            path = os.path.join(dest, fname)
+            with open(path, 'wb') as out:
+                out.write(data)
+            print(path)
+            i += 1
+"#;
+                    if let Ok(output) = std::process::Command::new("python3")
+                        .arg("-c").arg(py)
+                        .arg(mf).arg(cache_dir.to_string_lossy().as_ref())
+                        .output()
+                    {
+                        for line in String::from_utf8_lossy(&output.stdout).lines() {
+                            let path = line.trim();
+                            if !path.is_empty() {
+                                urls.push(format!("file://{}", path));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        urls.dedup();
+        urls
+    }
+
+    /// Prompt for destination directory, then save `urls` there.
+    /// Uses the on-disk image cache where possible; re-downloads otherwise.
+    fn save_image_urls(&mut self, urls: &[String]) {
+        if urls.is_empty() {
+            self.set_feedback("No images selected", self.config.theme_colors.feedback_warn);
+            return;
+        }
+
+        let default = format!("{}/Downloads", std::env::var("HOME").unwrap_or_default());
+        let dest_input = self.prompt("Save images to: ", &default);
+        if dest_input.is_empty() {
+            self.set_feedback("Cancelled", self.config.theme_colors.feedback_info);
+            return;
+        }
+        let dest_dir = dest_input.replace("~/",
+            &format!("{}/", std::env::var("HOME").unwrap_or_default()));
+        let dest_path = std::path::PathBuf::from(&dest_dir);
+        if let Err(e) = std::fs::create_dir_all(&dest_path) {
+            self.set_feedback(&format!("Can't create {}: {}", dest_dir, e), self.config.theme_colors.feedback_warn);
+            return;
+        }
+
+        self.set_feedback(&format!("Downloading {} image(s)...", urls.len()), self.config.theme_colors.unread);
+
+        let cache_dir = home_dir().join(".heathrow/image_cache");
+        let _ = std::fs::create_dir_all(&cache_dir);
+
+        let mut saved = 0usize;
+        let mut failed = 0usize;
+        for (i, url) in urls.iter().take(20).enumerate() {
+            if let Some(local) = url.strip_prefix("file://") {
+                let src = std::path::Path::new(local);
+                if src.exists() {
+                    let fname = src.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| format!("image_{}.bin", i + 1));
+                    let dest = unique_path(&dest_path.join(&fname));
+                    if std::fs::copy(src, &dest).is_ok() { saved += 1; } else { failed += 1; }
+                }
+                continue;
+            }
+
+            let ext = url.rsplit('.').next()
+                .and_then(|e| {
+                    let e = e.split('?').next().unwrap_or(e);
+                    if !e.is_empty() && e.len() <= 5 && e.chars().all(|c| c.is_alphanumeric()) {
+                        Some(e.to_string())
+                    } else { None }
+                })
+                .unwrap_or_else(|| "jpg".to_string());
+            let fname_from_url = url.rsplit('/').next()
+                .and_then(|s| s.split('?').next())
+                .filter(|s| !s.is_empty() && s.len() < 200)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("image_{}.{}", i + 1, ext));
+            let dest = unique_path(&dest_path.join(&fname_from_url));
+
+            let hash = simple_hash(url);
+            let cache_path = cache_dir.join(format!("{}.{}", hash, ext));
+            if cache_path.exists() && std::fs::metadata(&cache_path).map(|m| m.len() > 100).unwrap_or(false) {
+                if std::fs::copy(&cache_path, &dest).is_ok() { saved += 1; continue; }
+            }
+
+            let agent = ureq::AgentBuilder::new()
+                .timeout_connect(std::time::Duration::from_secs(5))
+                .timeout_read(std::time::Duration::from_secs(15))
+                .build();
+            if let Ok(resp) = agent.get(url).call() {
+                let mut bytes = Vec::new();
+                if std::io::Read::read_to_end(&mut resp.into_reader(), &mut bytes).is_ok() && bytes.len() > 100 {
+                    if std::fs::write(&dest, &bytes).is_ok() {
+                        saved += 1;
+                        let _ = std::fs::write(&cache_path, &bytes);
+                        continue;
+                    }
+                }
+            }
+            failed += 1;
+        }
+
+        let tc = self.config.theme_colors.clone();
+        if failed > 0 {
+            self.set_feedback(&format!("Saved {} to {} ({} failed)", saved, dest_dir, failed), tc.feedback_warn);
+        } else {
+            self.set_feedback(&format!("Saved {} image(s) to {}", saved, dest_dir), tc.feedback_ok);
+        }
+    }
+
+    /// D key: saves image(s). With one image, saves it directly. With several,
+    /// opens a picker where the user can tag specific images before saving.
+    fn download_images(&mut self) {
+        let urls = self.collect_image_urls();
+        if urls.is_empty() {
+            self.set_feedback("No images to download", self.config.theme_colors.feedback_warn);
+            return;
+        }
+        if urls.len() == 1 {
+            self.save_image_urls(&urls);
+            return;
+        }
+        let selected = self.pick_images_loop(&urls);
+        if !selected.is_empty() {
+            self.save_image_urls(&selected);
+        }
+    }
+
+    /// Tag-based picker for image URLs. Returns the selected URLs (tagged, or
+    /// the currently highlighted one if nothing is tagged). Empty Vec = cancel.
+    fn pick_images_loop(&mut self, urls: &[String]) -> Vec<String> {
+        let was_showing = self.showing_image;
+        if was_showing { self.clear_inline_image(); }
+
+        let mut idx = 0usize;
+        let mut tagged: HashSet<usize> = HashSet::new();
+        let tc = self.config.theme_colors.clone();
+
+        loop {
+            let mut lines = Vec::new();
+            lines.push(style::bold(&style::fg("Select images to download:", tc.attachment)));
+            lines.push(String::new());
+            for (i, url) in urls.iter().enumerate() {
+                let label = image_display_label(url, i);
+                let tag = if tagged.contains(&i) {
+                    style::fg("* ", tc.star)
+                } else { "  ".to_string() };
+                if i == idx {
+                    lines.push(format!("{}{}{}",
+                        style::fg("\u{2192} ", tc.unread),
+                        tag,
+                        style::bold(&style::fg(&label, 255))));
+                } else {
+                    lines.push(format!("  {}{}", tag, style::fg(&label, 250)));
+                }
+            }
+            lines.push(String::new());
+            let tagged_hint = if tagged.is_empty() {
+                String::new()
+            } else {
+                format!("  ({} tagged)", tagged.len())
+            };
+            lines.push(style::fg(
+                &format!("j/k:Move  t:Tag  T:All  Enter/s:Save{}  ESC:Cancel", tagged_hint),
+                tc.hint_fg));
+
+            self.right.set_text(&lines.join("\n"));
+            self.right.ix = 0;
+            self.right.full_refresh();
+            if self.right.border { self.right.border_refresh(); }
+
+            let Some(key) = Input::getchr(None) else { continue };
+            match key.as_str() {
+                "ESC" | "q" => return Vec::new(),
+                "j" | "DOWN" => { if idx + 1 < urls.len() { idx += 1; } }
+                "k" | "UP" => { if idx > 0 { idx -= 1; } }
+                "t" => {
+                    if tagged.contains(&idx) { tagged.remove(&idx); }
+                    else { tagged.insert(idx); }
+                }
+                "T" => {
+                    if tagged.len() == urls.len() { tagged.clear(); }
+                    else { tagged = (0..urls.len()).collect(); }
+                }
+                "ENTER" | "s" => {
+                    if tagged.is_empty() {
+                        return vec![urls[idx].clone()];
+                    }
+                    let mut sel: Vec<usize> = tagged.into_iter().collect();
+                    sel.sort();
+                    return sel.into_iter().map(|i| urls[i].clone()).collect();
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Short human label for an image URL (or file:// path) in the picker list.
+fn image_display_label(url: &str, i: usize) -> String {
+    if let Some(local) = url.strip_prefix("file://") {
+        return std::path::Path::new(local).file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("image_{}", i + 1));
+    }
+    let fname = url.rsplit('/').next()
+        .and_then(|s| s.split('?').next())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
+    if !fname.is_empty() && fname.len() < 60 {
+        format!("{}  {}", fname, shorten_mid(url, 70))
+    } else {
+        shorten_mid(url, 100)
+    }
+}
+
+fn shorten_mid(s: &str, max: usize) -> String {
+    if s.len() <= max { return s.to_string(); }
+    let half = (max - 3) / 2;
+    format!("{}...{}", &s[..half], &s[s.len() - half..])
+}
+
+/// Return `path` if it doesn't exist, otherwise append `_1`, `_2`, ... before
+/// the extension until an unused path is found.
+fn unique_path(path: &std::path::Path) -> std::path::PathBuf {
+    if !path.exists() { return path.to_path_buf(); }
+    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let ext = path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+    for i in 1..1000 {
+        let name = if ext.is_empty() {
+            format!("{}_{}", stem, i)
+        } else {
+            format!("{}_{}.{}", stem, i, ext)
+        };
+        let candidate = parent.join(name);
+        if !candidate.exists() { return candidate; }
+    }
+    path.to_path_buf()
 }
 
 // --- Batch I-N feature methods ---
