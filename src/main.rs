@@ -586,7 +586,8 @@ impl App {
             // Labels / save / misc
             "l" => { self.label_message(); }
             "s" => { self.file_message(); }
-            "+" => { self.set_feedback("Favorites not yet implemented", self.config.theme_colors.feedback_warn); }
+            "+" => { self.external_react(false); }
+            "-" => { self.external_react(true); }
             "I" => { self.ai_assistant(); }
             "Z" => { self.open_in_timely(); }
 
@@ -3858,7 +3859,201 @@ impl App {
         }
     }
 
+    /// Render a sender template: substitute @conv, @msg, @to, @emoji placeholders.
+    fn render_sender_template(template: &str, repl: &[(&str, &str)]) -> String {
+        let mut out = template.to_string();
+        for (k, v) in repl {
+            out = out.replace(&format!("@{}", k), v);
+        }
+        out
+    }
+
+    /// Run an external sender command (shell). Pipes `body` to stdin when non-empty.
+    /// Returns (success, combined_output).
+    fn run_sender_command(&mut self, cmd: &str, body: Option<&str>) -> (bool, String) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let body = body.unwrap_or("");
+        let mut child = match Command::new("sh").arg("-c").arg(cmd)
+            .stdin(if !body.is_empty() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return (false, format!("spawn failed: {}", e)),
+        };
+        if !body.is_empty() {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(body.as_bytes());
+            }
+        }
+        match child.wait_with_output() {
+            Ok(out) => {
+                let mut combined = String::from_utf8_lossy(&out.stdout).to_string();
+                if !out.stderr.is_empty() {
+                    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+                }
+                (out.status.success(), combined)
+            }
+            Err(e) => (false, format!("wait failed: {}", e)),
+        }
+    }
+
+    /// Look up a sender command for the given plugin_type + action, render with
+    /// placeholder substitutions, run it, pipe body. On success, if a `sync`
+    /// command is configured for the same plugin_type, invoke it too so kastrup
+    /// can see the new state on the next view refresh.
+    fn dispatch_external_action(
+        &mut self,
+        plugin_type: &str,
+        action: &str,
+        repl: &[(&str, &str)],
+        body: Option<&str>,
+    ) -> Result<(), String> {
+        let cmd_template = self.config.senders
+            .get(plugin_type)
+            .and_then(|m| m.get(action))
+            .cloned()
+            .ok_or_else(|| format!("no sender config for plugin_type='{}' action='{}'", plugin_type, action))?;
+        let cmd = Self::render_sender_template(&cmd_template, repl);
+        log::info(&format!("external sender: plugin={} action={} cmd={}", plugin_type, action, cmd));
+        let (ok, output) = self.run_sender_command(&cmd, body);
+        if !ok {
+            return Err(output.trim().to_string());
+        }
+        // Best-effort post-sync so the UI catches up; don't fail the caller if it errors.
+        let sync_template = self.config.senders.get(plugin_type)
+            .and_then(|m| m.get("sync"))
+            .cloned();
+        if let Some(sync_cmd) = sync_template {
+            let _ = self.run_sender_command(&sync_cmd, None);
+        }
+        Ok(())
+    }
+
+    /// Open `$EDITOR` on a blank tempfile; return the trimmed body.
+    fn edit_body_tempfile(&mut self) -> Option<String> {
+        let tmpfile = format!("/tmp/kastrup_body_{}.txt", std::process::id());
+        if std::fs::write(&tmpfile, "").is_err() { return None; }
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".into());
+        Crust::cleanup();
+        let _ = std::process::Command::new("sh").arg("-c")
+            .arg(format!("{} {}", editor, crust::shell_escape(&tmpfile)))
+            .status();
+        Crust::init();
+        Crust::clear_screen();
+        let body = std::fs::read_to_string(&tmpfile).ok()?.trim_end().to_string();
+        let _ = std::fs::remove_file(&tmpfile);
+        if body.is_empty() { None } else { Some(body) }
+    }
+
+    /// Reply to the selected message via an external sender (workspace, etc).
+    /// Returns true when handled — caller should skip the email reply flow.
+    fn maybe_external_reply(&mut self) -> bool {
+        if self.filtered_messages.is_empty() { return false; }
+        let msg = &self.filtered_messages[self.index];
+        let plugin_type = msg.source_type.clone();
+        if !self.config.senders.get(&plugin_type).map(|m| m.contains_key("reply")).unwrap_or(false) {
+            return false;
+        }
+        let conv = msg.metadata.get("conversation_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let msg_id = msg.external_id.clone();
+        if conv.is_empty() {
+            self.set_feedback("reply: no conversation_id in metadata",
+                self.config.theme_colors.feedback_warn);
+            return true;
+        }
+        self.set_feedback(&format!("Reply to {} — opening editor...",
+            msg.folder.clone().unwrap_or_default()),
+            self.config.theme_colors.accent);
+        let Some(body) = self.edit_body_tempfile() else {
+            self.set_feedback("reply cancelled", self.config.theme_colors.feedback_info);
+            return true;
+        };
+        match self.dispatch_external_action(&plugin_type, "reply",
+            &[("conv", &conv), ("msg", &msg_id), ("to", &msg_id)], Some(&body))
+        {
+            Ok(()) => self.set_feedback("Reply sent", self.config.theme_colors.feedback_ok),
+            Err(e) => self.set_feedback(&format!("Reply failed: {}", e),
+                self.config.theme_colors.feedback_warn),
+        }
+        true
+    }
+
+    /// Compose a new message to the conversation of the currently-selected message
+    /// via an external sender. Returns true when handled.
+    fn maybe_external_compose(&mut self) -> bool {
+        if self.filtered_messages.is_empty() { return false; }
+        let msg = &self.filtered_messages[self.index];
+        let plugin_type = msg.source_type.clone();
+        if !self.config.senders.get(&plugin_type).map(|m| m.contains_key("send")).unwrap_or(false) {
+            return false;
+        }
+        let conv = msg.metadata.get("conversation_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let folder = msg.folder.clone().unwrap_or_default();
+        if conv.is_empty() {
+            self.set_feedback("compose: no conversation_id in metadata",
+                self.config.theme_colors.feedback_warn);
+            return true;
+        }
+        self.set_feedback(&format!("Compose to {} — opening editor...", folder),
+            self.config.theme_colors.accent);
+        let Some(body) = self.edit_body_tempfile() else {
+            self.set_feedback("compose cancelled", self.config.theme_colors.feedback_info);
+            return true;
+        };
+        match self.dispatch_external_action(&plugin_type, "send",
+            &[("conv", &conv)], Some(&body))
+        {
+            Ok(()) => self.set_feedback(&format!("Sent to {}", folder),
+                self.config.theme_colors.feedback_ok),
+            Err(e) => self.set_feedback(&format!("Send failed: {}", e),
+                self.config.theme_colors.feedback_warn),
+        }
+        true
+    }
+
+    /// Prompt for an emoji and add/remove a reaction via external sender.
+    fn external_react(&mut self, remove: bool) {
+        if self.filtered_messages.is_empty() { return; }
+        let msg = &self.filtered_messages[self.index];
+        let plugin_type = msg.source_type.clone();
+        let action = if remove { "unreact" } else { "react" };
+        if !self.config.senders.get(&plugin_type).map(|m| m.contains_key(action)).unwrap_or(false) {
+            self.set_feedback(
+                &format!("{}: no sender for plugin_type='{}' action='{}'",
+                    if remove { "unreact" } else { "react" }, plugin_type, action),
+                self.config.theme_colors.feedback_warn);
+            return;
+        }
+        let conv = msg.metadata.get("conversation_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let msg_id = msg.external_id.clone();
+        if conv.is_empty() {
+            self.set_feedback("react: no conversation_id in metadata",
+                self.config.theme_colors.feedback_warn);
+            return;
+        }
+        let prompt = if remove { "Remove reaction: " } else { "React with emoji: " };
+        let emoji = self.prompt(prompt, "");
+        let emoji = emoji.trim().to_string();
+        if emoji.is_empty() {
+            self.set_feedback("cancelled", self.config.theme_colors.feedback_info);
+            return;
+        }
+        match self.dispatch_external_action(&plugin_type, action,
+            &[("conv", &conv), ("msg", &msg_id), ("emoji", &emoji)], None)
+        {
+            Ok(()) => self.set_feedback(
+                &format!("{} {}", if remove { "Removed" } else { "Reacted" }, emoji),
+                self.config.theme_colors.feedback_ok),
+            Err(e) => self.set_feedback(&format!("React failed: {}", e),
+                self.config.theme_colors.feedback_warn),
+        }
+    }
+
     fn reply(&mut self, _force_editor: bool) {
+        if self.maybe_external_reply() { return; }
         if self.filtered_messages.is_empty() { return; }
         self.ensure_full_content();
         let msg = &self.filtered_messages[self.index];
@@ -4210,6 +4405,7 @@ impl App {
     }
 
     fn compose_new(&mut self) {
+        if self.maybe_external_compose() { return; }
         self.pending_reply_id = None;
         // Check for postponed messages
         let conn = self.db.conn.lock().unwrap();

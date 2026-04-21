@@ -163,6 +163,20 @@ pub struct Config {
     pub custom_bindings: HashMap<String, String>,
     pub channel_names: HashMap<String, String>,
     pub save_folders: HashMap<String, String>,
+    /// Per-source-type external sender commands. Map from plugin_type
+    /// (e.g. "workspace", "discord") to a map of action → shell template.
+    /// Placeholders: `@conv`, `@msg`, `@to`, `@emoji`. If the template does
+    /// not include `@text`, kastrup pipes the composed body on stdin.
+    ///
+    /// Example in ~/.kastrup/config.yml:
+    ///   senders:
+    ///     workspace:
+    ///       send:    "ws-bridge send --conv @conv --stdin"
+    ///       reply:   "ws-bridge reply --conv @conv --to @msg --stdin"
+    ///       react:   "ws-bridge react --conv @conv --msg @msg --emoji @emoji"
+    ///       unreact: "ws-bridge unreact --conv @conv --msg @msg --emoji @emoji"
+    ///       sync:    "ws-bridge sync"
+    pub senders: HashMap<String, HashMap<String, String>>,
     pub theme_colors: ThemeColors,
 }
 
@@ -188,6 +202,7 @@ impl Default for Config {
             custom_bindings: HashMap::new(),
             channel_names: HashMap::new(),
             save_folders: HashMap::new(),
+            senders: HashMap::new(),
             theme_colors: ThemeColors::default(),
         }
     }
@@ -316,6 +331,25 @@ impl Config {
                 for (k, v) in map {
                     if let (Some(key), Some(val)) = (k.as_str(), v.as_str()) {
                         self.save_folders.insert(key.to_string(), val.to_string());
+                    }
+                }
+            }
+        }
+
+        // Load per-plugin-type external senders (see field docs for shape).
+        if let Some(s) = yaml.get("senders") {
+            if let Some(by_type) = s.as_mapping() {
+                for (type_key, actions) in by_type {
+                    let Some(plugin_type) = type_key.as_str() else { continue };
+                    let Some(action_map) = actions.as_mapping() else { continue };
+                    let mut entry: HashMap<String, String> = HashMap::new();
+                    for (ak, av) in action_map {
+                        if let (Some(k), Some(v)) = (ak.as_str(), av.as_str()) {
+                            entry.insert(k.to_string(), v.to_string());
+                        }
+                    }
+                    if !entry.is_empty() {
+                        self.senders.insert(plugin_type.to_string(), entry);
                     }
                 }
             }
