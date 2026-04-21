@@ -31,6 +31,19 @@ use config::{Config, Identity};
 use database::{Database, Filters};
 use message::Message;
 
+// --- Compose target picker ---
+
+/// One reachable destination for `m` (compose new). Harvested from the
+/// currently filtered messages; scoped to whichever sources have a `send`
+/// template configured in `config.senders`.
+struct ComposeTarget {
+    plugin_type: String,
+    conversation_id: String,
+    folder: String,
+    source_id: i64,
+    recent_ts: i64,
+}
+
 // --- Folder browser types ---
 
 struct FolderEntry {
@@ -3981,23 +3994,118 @@ impl App {
         true
     }
 
-    /// Compose a new message to the conversation of the currently-selected message
-    /// via an external sender. Returns true when handled.
+    /// A reachable compose target within the current view.
+    fn collect_compose_targets(&self) -> Vec<ComposeTarget> {
+        let mut seen: std::collections::HashSet<(i64, String, String)> = std::collections::HashSet::new();
+        let mut out: Vec<ComposeTarget> = Vec::new();
+        for m in &self.filtered_messages {
+            let plugin_type = m.source_type.clone();
+            if !self.config.senders.get(&plugin_type)
+                .map(|s| s.contains_key("send")).unwrap_or(false) { continue; }
+            let conv = m.metadata.get("conversation_id").and_then(|v| v.as_str())
+                .unwrap_or("").to_string();
+            let folder = m.folder.clone().unwrap_or_default();
+            if conv.is_empty() { continue; }
+            let key = (m.source_id, folder.clone(), conv.clone());
+            if !seen.insert(key) { continue; }
+            out.push(ComposeTarget {
+                plugin_type,
+                conversation_id: conv,
+                folder: if folder.is_empty() { "(unnamed)".into() } else { folder },
+                source_id: m.source_id,
+                recent_ts: m.timestamp,
+            });
+        }
+        out.sort_by(|a, b| a.plugin_type.cmp(&b.plugin_type)
+            .then(b.recent_ts.cmp(&a.recent_ts))
+            .then(a.folder.cmp(&b.folder)));
+        out
+    }
+
+    /// Render the cross-source picker in the right pane and prompt for a choice.
+    fn pick_compose_target(&mut self, targets: &[ComposeTarget], default_ix: usize) -> Option<usize> {
+        let tc = self.config.theme_colors.clone();
+        let mut lines = vec![
+            style::bold(&style::fg("Compose target:", tc.unread)),
+            String::new(),
+        ];
+        let mut cur_type = String::new();
+        for (i, t) in targets.iter().enumerate() {
+            if t.plugin_type != cur_type {
+                if !cur_type.is_empty() { lines.push(String::new()); }
+                lines.push(style::fg(&format!("{}:", t.plugin_type), tc.accent));
+                cur_type = t.plugin_type.clone();
+            }
+            let marker = if i == default_ix { "→" } else { " " };
+            lines.push(format!(" {} {:>3}. {}", marker, i + 1, t.folder));
+        }
+        lines.push(String::new());
+        lines.push(style::fg("Enter number, Enter=default, ESC=cancel", 245));
+        self.right.set_text(&lines.join("\n"));
+        self.right.full_refresh();
+
+        let input = self.prompt(&format!("Target # [{}]: ", default_ix + 1), "");
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            Some(default_ix)
+        } else if let Ok(n) = trimmed.parse::<usize>() {
+            if n >= 1 && n <= targets.len() { Some(n - 1) } else { None }
+        } else {
+            None
+        }
+    }
+
+    /// Compose a new message via an external sender. Inherits the current
+    /// message's channel as default target; user presses `c` to pick another
+    /// reachable channel from anywhere in the current view.
+    /// Returns true when handled — false = fall through to email compose.
     fn maybe_external_compose(&mut self) -> bool {
         if self.filtered_messages.is_empty() { return false; }
-        let msg = &self.filtered_messages[self.index];
-        let plugin_type = msg.source_type.clone();
-        if !self.config.senders.get(&plugin_type).map(|m| m.contains_key("send")).unwrap_or(false) {
-            return false;
-        }
-        let conv = msg.metadata.get("conversation_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let folder = msg.folder.clone().unwrap_or_default();
-        if conv.is_empty() {
-            self.set_feedback("compose: no conversation_id in metadata",
-                self.config.theme_colors.feedback_warn);
-            return true;
-        }
-        self.set_feedback(&format!("Compose to {} — opening editor...", folder),
+
+        let targets = self.collect_compose_targets();
+        if targets.is_empty() { return false; }
+
+        // Default: the currently-selected message's channel if it's reachable,
+        // otherwise the first listed (most recent in the dominant source).
+        let selected = &self.filtered_messages[self.index];
+        let default_ix = targets.iter().position(|t| {
+            t.source_id == selected.source_id
+                && selected.metadata.get("conversation_id").and_then(|v| v.as_str())
+                    .map_or(false, |c| c == t.conversation_id)
+        }).unwrap_or(0);
+
+        // Only the selected message's own source is reachable from this cursor?
+        // If so, only one target in the view → skip picker entirely.
+        let target = if targets.len() == 1 {
+            &targets[0]
+        } else {
+            let d = &targets[default_ix];
+            let tc = self.config.theme_colors.clone();
+            self.set_feedback(
+                &format!("Compose to {} ({})?  Enter=yes  c=change  ESC=cancel", d.folder, d.plugin_type),
+                tc.accent);
+            let Some(key) = Input::getchr(None) else { return true };
+            match key.as_str() {
+                "ENTER" => &targets[default_ix],
+                "c" | "C" => {
+                    let Some(ix) = self.pick_compose_target(&targets, default_ix) else {
+                        self.set_feedback("compose cancelled", self.config.theme_colors.feedback_info);
+                        return true;
+                    };
+                    &targets[ix]
+                }
+                _ => {
+                    self.set_feedback("compose cancelled", self.config.theme_colors.feedback_info);
+                    return true;
+                }
+            }
+        };
+
+        let plugin_type = target.plugin_type.clone();
+        let conv = target.conversation_id.clone();
+        let folder = target.folder.clone();
+
+        self.set_feedback(&format!("Compose to {} ({}) — opening editor...", folder, plugin_type),
             self.config.theme_colors.accent);
         let Some(body) = self.edit_body_tempfile() else {
             self.set_feedback("compose cancelled", self.config.theme_colors.feedback_info);
