@@ -7265,7 +7265,168 @@ fn decode_quoted_printable(s: &str) -> String {
 
 // --- HTML to text ---
 
+/// Find every `<table>…</table>` in `html` and replace it with an equivalent
+/// Markdown table. The downstream html_to_text strips what's left; the
+/// downstream format_markdown_tables then lays our Markdown out as a
+/// Unicode-box block.
+fn html_tables_to_markdown(html: &str) -> String {
+    let lower = html.to_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+    while let Some(rel_start) = lower[cursor..].find("<table") {
+        let start = cursor + rel_start;
+        // Find the matching </table> allowing nested tables (rare but possible).
+        let mut depth = 1usize;
+        let mut scan = start + 6;
+        let end = loop {
+            let next_open = lower[scan..].find("<table").map(|p| scan + p);
+            let next_close = lower[scan..].find("</table>").map(|p| scan + p);
+            match (next_open, next_close) {
+                (Some(o), Some(c)) if o < c => { depth += 1; scan = o + 6; }
+                (_, Some(c)) => {
+                    depth -= 1;
+                    if depth == 0 { break c + 8; } // include "</table>"
+                    scan = c + 8;
+                }
+                _ => return out + &html[cursor..],
+            }
+        };
+        out.push_str(&html[cursor..start]);
+        let block = &html[start..end];
+        out.push('\n');
+        out.push_str(&table_block_to_markdown(block));
+        out.push('\n');
+        cursor = end;
+    }
+    out.push_str(&html[cursor..]);
+    out
+}
+
+fn table_block_to_markdown(block: &str) -> String {
+    let rows = extract_tr_cells(block);
+    if rows.is_empty() { return String::new(); }
+    let n_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if n_cols == 0 { return String::new(); }
+    let mut out = String::new();
+    // Header row (first <tr>, even if it only has <td>s).
+    let header = &rows[0];
+    out.push('|');
+    for c in 0..n_cols {
+        out.push(' ');
+        out.push_str(header.get(c).map(|s| s.as_str()).unwrap_or(""));
+        out.push_str(" |");
+    }
+    out.push('\n');
+    out.push('|');
+    for _ in 0..n_cols { out.push_str(" --- |"); }
+    for row in &rows[1..] {
+        out.push('\n');
+        out.push('|');
+        for c in 0..n_cols {
+            out.push(' ');
+            out.push_str(row.get(c).map(|s| s.as_str()).unwrap_or(""));
+            out.push_str(" |");
+        }
+    }
+    out
+}
+
+/// Walk a `<table>…</table>` block, returning each `<tr>` as a Vec of cell
+/// text (both `<td>` and `<th>`). Inner HTML inside each cell is stripped
+/// to plain text; pipe characters are escaped so they don't break the
+/// Markdown we emit.
+fn extract_tr_cells(block: &str) -> Vec<Vec<String>> {
+    let lower = block.to_lowercase();
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = lower[cursor..].find("<tr") {
+        let tr_open = cursor + rel;
+        let tr_body = match lower[tr_open..].find('>') {
+            Some(p) => tr_open + p + 1,
+            None => break,
+        };
+        let tr_end_rel = lower[tr_body..].find("</tr>");
+        let tr_end = match tr_end_rel {
+            Some(p) => tr_body + p,
+            None => lower.len(),
+        };
+        let tr_slice = &block[tr_body..tr_end];
+        let cells = extract_cells_in_tr(tr_slice);
+        if !cells.is_empty() { rows.push(cells); }
+        cursor = tr_end + 5; // skip "</tr>"
+    }
+    rows
+}
+
+fn extract_cells_in_tr(tr: &str) -> Vec<String> {
+    let lower = tr.to_lowercase();
+    let mut cells: Vec<String> = Vec::new();
+    let mut cursor = 0usize;
+    loop {
+        let next_td = lower[cursor..].find("<td").map(|p| cursor + p);
+        let next_th = lower[cursor..].find("<th").map(|p| cursor + p);
+        let cell_open = match (next_td, next_th) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            _ => None,
+        };
+        let Some(open) = cell_open else { break; };
+        let Some(tag_end) = lower[open..].find('>').map(|p| open + p + 1) else { break; };
+        // Look for matching </td> / </th>.
+        let close_td = lower[tag_end..].find("</td>").map(|p| tag_end + p);
+        let close_th = lower[tag_end..].find("</th>").map(|p| tag_end + p);
+        let (close, close_len) = match (close_td, close_th) {
+            (Some(a), Some(b)) if a < b => (a, 5),
+            (_, Some(b)) => (b, 5),
+            (Some(a), _) => (a, 5),
+            _ => break,
+        };
+        let inner = &tr[tag_end..close];
+        cells.push(cell_html_to_text(inner));
+        cursor = close + close_len;
+    }
+    cells
+}
+
+/// Strip all tags from a cell's inner HTML, decode entities via the main
+/// html_to_text, collapse whitespace to a single space, and escape `|` and
+/// newlines so the resulting string plays nicely in a Markdown table.
+fn cell_html_to_text(inner: &str) -> String {
+    // Turn `<br>` into spaces so multi-line cells fit on one Markdown row.
+    let pre = inner
+        .replace("<br>", " ").replace("<BR>", " ")
+        .replace("<br/>", " ").replace("<br />", " ").replace("<BR/>", " ").replace("<BR />", " ");
+    let stripped = html_to_text(&pre);
+    // Collapse consecutive whitespace, trim.
+    let mut out = String::with_capacity(stripped.len());
+    let mut prev_ws = false;
+    for ch in stripped.chars() {
+        if ch == '\n' || ch == '\r' || ch == '\t' {
+            if !prev_ws { out.push(' '); prev_ws = true; }
+        } else if ch == ' ' {
+            if !prev_ws { out.push(' '); prev_ws = true; }
+        } else if ch == '|' {
+            out.push('\\'); out.push('|'); prev_ws = false;
+        } else {
+            out.push(ch); prev_ws = false;
+        }
+    }
+    out.trim().to_string()
+}
+
 fn html_to_text(html: &str) -> String {
+    // Convert `<table>` blocks to Markdown BEFORE the generic tag strip so
+    // structure survives. format_markdown_tables will lay them out.
+    // Guard against recursion — cell_html_to_text re-enters html_to_text on
+    // already-stripped cell HTML; skip the table pass when there's nothing
+    // to do.
+    let html_owned;
+    let html: &str = if html.contains("<table") || html.contains("<TABLE") {
+        html_owned = html_tables_to_markdown(html);
+        &html_owned
+    } else {
+        html
+    };
     let mut result = String::new();
     let mut in_tag = false;
     let mut in_script = false;
