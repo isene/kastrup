@@ -2411,18 +2411,37 @@ impl App {
             self.tagged.clear();
             self.set_feedback(&format!("{} messages marked for deletion", count), self.config.theme_colors.feedback_warn);
             self.render_all();
-        } else if let Some(msg) = self.filtered_messages.get(self.index) {
-            let id = msg.id;
-            if self.delete_marked.contains(&id) {
-                self.delete_marked.remove(&id);
-            } else {
-                self.delete_marked.insert(id);
-            }
-            if self.index < self.filtered_messages.len().saturating_sub(1) {
-                self.index += 1;
-            }
-            self.render_all();
+            return;
         }
+        // In threaded view, the cursor indexes display_messages (which
+        // includes synthetic section headers). Resolve the real message
+        // from the right list, and skip section headers — they aren't
+        // real rows and can't be deleted.
+        let (selected_id, is_header, at_end) = if self.show_threaded {
+            match self.display_messages.get(self.index) {
+                Some(m) if m.is_header => (None, true, false),
+                Some(m) => (Some(m.id), false, self.index + 1 >= self.display_messages.len()),
+                None => (None, false, false),
+            }
+        } else {
+            match self.filtered_messages.get(self.index) {
+                Some(m) => (Some(m.id), false, self.index + 1 >= self.filtered_messages.len()),
+                None => (None, false, false),
+            }
+        };
+        if is_header {
+            self.set_feedback("Cannot delete a section header",
+                self.config.theme_colors.feedback_warn);
+            return;
+        }
+        let Some(id) = selected_id else { return };
+        if self.delete_marked.contains(&id) {
+            self.delete_marked.remove(&id);
+        } else {
+            self.delete_marked.insert(id);
+        }
+        if !at_end { self.index += 1; }
+        self.render_all();
     }
 
     fn purge_deleted(&mut self) {
