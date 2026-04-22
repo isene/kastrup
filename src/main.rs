@@ -1284,6 +1284,12 @@ impl App {
         } else {
             extracted
         };
+        // Detect and render Markdown tables in-place with Unicode box
+        // borders. Non-table text passes through untouched, so the
+        // subsequent quote/signature coloring still works.
+        let pane_w = (self.right.w as usize).saturating_sub(4).max(20);
+        let content = crust::text::format_markdown_tables(&content, pane_w);
+
         let mut in_signature = false;
         let mut prev_blank = false;
         for line in content.lines() {
