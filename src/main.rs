@@ -7273,6 +7273,109 @@ fn decode_quoted_printable(s: &str) -> String {
 
 // --- HTML to text ---
 
+/// Decode a named HTML entity like "&micro;" into its character. Returns
+/// `Some('\u{200C}')` for zero-width entities so the caller can skip them
+/// without treating them as "unknown". Returns `None` for unrecognised
+/// entities — caller can leave them verbatim or try numeric fallback.
+fn decode_html_named_entity(entity: &str) -> Option<char> {
+    match entity {
+        // Structural / basic
+        "&amp;" => Some('&'), "&lt;" => Some('<'), "&gt;" => Some('>'),
+        "&quot;" => Some('"'), "&apos;" => Some('\''), "&nbsp;" => Some(' '),
+        "&zwnj;" | "&zwj;" => Some('\u{200C}'),
+
+        // Punctuation / dashes / quotes
+        "&ndash;" => Some('\u{2013}'), "&mdash;" => Some('\u{2014}'),
+        "&lsquo;" => Some('\u{2018}'), "&rsquo;" => Some('\u{2019}'),
+        "&sbquo;" => Some('\u{201A}'), "&bdquo;" => Some('\u{201E}'),
+        "&ldquo;" => Some('\u{201C}'), "&rdquo;" => Some('\u{201D}'),
+        "&lsaquo;" => Some('\u{2039}'), "&rsaquo;" => Some('\u{203A}'),
+        "&laquo;" => Some('\u{00AB}'), "&raquo;" => Some('\u{00BB}'),
+        "&bull;" => Some('\u{2022}'), "&hellip;" => Some('\u{2026}'),
+        "&prime;" => Some('\u{2032}'), "&Prime;" => Some('\u{2033}'),
+        "&oline;" => Some('\u{203E}'), "&middot;" => Some('\u{00B7}'),
+        "&para;" => Some('\u{00B6}'), "&sect;" => Some('\u{00A7}'),
+        "&iexcl;" => Some('\u{00A1}'), "&iquest;" => Some('\u{00BF}'),
+
+        // Currency / symbols
+        "&cent;" => Some('\u{00A2}'), "&pound;" => Some('\u{00A3}'),
+        "&curren;" => Some('\u{00A4}'), "&yen;" => Some('\u{00A5}'),
+        "&euro;" => Some('\u{20AC}'),
+
+        // Trademarks / copyright / misc
+        "&trade;" => Some('\u{2122}'), "&copy;" => Some('\u{00A9}'),
+        "&reg;" => Some('\u{00AE}'),
+        "&deg;" => Some('\u{00B0}'), "&micro;" => Some('\u{00B5}'),
+        "&not;" => Some('\u{00AC}'), "&shy;" => Some('\u{00AD}'),
+        "&macr;" => Some('\u{00AF}'), "&acute;" => Some('\u{00B4}'),
+        "&cedil;" => Some('\u{00B8}'), "&brvbar;" => Some('\u{00A6}'),
+        "&uml;" => Some('\u{00A8}'), "&ordf;" => Some('\u{00AA}'),
+        "&ordm;" => Some('\u{00BA}'),
+
+        // Superscripts / fractions
+        "&sup1;" => Some('\u{00B9}'), "&sup2;" => Some('\u{00B2}'),
+        "&sup3;" => Some('\u{00B3}'),
+        "&frac14;" => Some('\u{00BC}'), "&frac12;" => Some('\u{00BD}'),
+        "&frac34;" => Some('\u{00BE}'),
+
+        // Math operators
+        "&times;" => Some('\u{00D7}'), "&divide;" => Some('\u{00F7}'),
+        "&plusmn;" => Some('\u{00B1}'), "&minus;" => Some('\u{2212}'),
+        "&ne;" => Some('\u{2260}'), "&le;" => Some('\u{2264}'), "&ge;" => Some('\u{2265}'),
+        "&infin;" => Some('\u{221E}'), "&sum;" => Some('\u{2211}'), "&prod;" => Some('\u{220F}'),
+        "&radic;" => Some('\u{221A}'), "&part;" => Some('\u{2202}'),
+        "&int;" => Some('\u{222B}'), "&asymp;" => Some('\u{2248}'),
+        "&equiv;" => Some('\u{2261}'), "&empty;" => Some('\u{2205}'),
+        "&isin;" => Some('\u{2208}'), "&notin;" => Some('\u{2209}'),
+        "&sub;" => Some('\u{2282}'), "&sup;" => Some('\u{2283}'),
+        "&cap;" => Some('\u{2229}'), "&cup;" => Some('\u{222A}'),
+        "&and;" => Some('\u{2227}'), "&or;" => Some('\u{2228}'),
+        "&forall;" => Some('\u{2200}'), "&exist;" => Some('\u{2203}'),
+        "&nabla;" => Some('\u{2207}'), "&prop;" => Some('\u{221D}'),
+        "&lang;" => Some('\u{2329}'), "&rang;" => Some('\u{232A}'),
+
+        // Arrows
+        "&larr;" => Some('\u{2190}'), "&uarr;" => Some('\u{2191}'),
+        "&rarr;" => Some('\u{2192}'), "&darr;" => Some('\u{2193}'),
+        "&harr;" => Some('\u{2194}'),
+        "&lArr;" => Some('\u{21D0}'), "&uArr;" => Some('\u{21D1}'),
+        "&rArr;" => Some('\u{21D2}'), "&dArr;" => Some('\u{21D3}'),
+        "&hArr;" => Some('\u{21D4}'),
+
+        // Latin-1 supplement accented letters (upper)
+        "&Agrave;" => Some('À'), "&Aacute;" => Some('Á'), "&Acirc;" => Some('Â'),
+        "&Atilde;" => Some('Ã'), "&Auml;" => Some('Ä'),   "&Aring;" => Some('Å'),
+        "&AElig;" => Some('Æ'),  "&Ccedil;" => Some('Ç'),
+        "&Egrave;" => Some('È'), "&Eacute;" => Some('É'), "&Ecirc;" => Some('Ê'),
+        "&Euml;" => Some('Ë'),
+        "&Igrave;" => Some('Ì'), "&Iacute;" => Some('Í'), "&Icirc;" => Some('Î'),
+        "&Iuml;" => Some('Ï'),
+        "&ETH;" => Some('Ð'),    "&Ntilde;" => Some('Ñ'),
+        "&Ograve;" => Some('Ò'), "&Oacute;" => Some('Ó'), "&Ocirc;" => Some('Ô'),
+        "&Otilde;" => Some('Õ'), "&Ouml;" => Some('Ö'),   "&Oslash;" => Some('Ø'),
+        "&Ugrave;" => Some('Ù'), "&Uacute;" => Some('Ú'), "&Ucirc;" => Some('Û'),
+        "&Uuml;" => Some('Ü'),
+        "&Yacute;" => Some('Ý'), "&THORN;" => Some('Þ'), "&szlig;" => Some('ß'),
+
+        // Latin-1 supplement (lower)
+        "&agrave;" => Some('à'), "&aacute;" => Some('á'), "&acirc;" => Some('â'),
+        "&atilde;" => Some('ã'), "&auml;" => Some('ä'),   "&aring;" => Some('å'),
+        "&aelig;" => Some('æ'),  "&ccedil;" => Some('ç'),
+        "&egrave;" => Some('è'), "&eacute;" => Some('é'), "&ecirc;" => Some('ê'),
+        "&euml;" => Some('ë'),
+        "&igrave;" => Some('ì'), "&iacute;" => Some('í'), "&icirc;" => Some('î'),
+        "&iuml;" => Some('ï'),
+        "&eth;" => Some('ð'),    "&ntilde;" => Some('ñ'),
+        "&ograve;" => Some('ò'), "&oacute;" => Some('ó'), "&ocirc;" => Some('ô'),
+        "&otilde;" => Some('õ'), "&ouml;" => Some('ö'),   "&oslash;" => Some('ø'),
+        "&ugrave;" => Some('ù'), "&uacute;" => Some('ú'), "&ucirc;" => Some('û'),
+        "&uuml;" => Some('ü'),
+        "&yacute;" => Some('ý'), "&thorn;" => Some('þ'),  "&yuml;" => Some('ÿ'),
+
+        _ => None,
+    }
+}
+
 /// Find every `<table>…</table>` in `html` and replace it with an equivalent
 /// Markdown table. The downstream html_to_text strips what's left; the
 /// downstream format_markdown_tables then lays our Markdown out as a
@@ -7493,20 +7596,7 @@ fn html_to_text(html: &str) -> String {
             let entity_end = chars[i..].iter().take(12).position(|&c| c == ';');
             if let Some(end) = entity_end {
                 let entity: String = chars[i..i + end + 1].iter().collect();
-                let decoded = match entity.as_str() {
-                    "&amp;" => Some('&'), "&lt;" => Some('<'), "&gt;" => Some('>'),
-                    "&quot;" => Some('"'), "&apos;" => Some('\''), "&nbsp;" => Some(' '),
-                    "&ndash;" => Some('\u{2013}'), "&mdash;" => Some('\u{2014}'),
-                    "&lsquo;" => Some('\u{2018}'), "&rsquo;" => Some('\u{2019}'),
-                    "&ldquo;" => Some('\u{201C}'), "&rdquo;" => Some('\u{201D}'),
-                    "&bull;" => Some('\u{2022}'), "&hellip;" => Some('\u{2026}'),
-                    "&trade;" => Some('\u{2122}'), "&copy;" => Some('\u{00A9}'),
-                    "&reg;" => Some('\u{00AE}'), "&deg;" => Some('\u{00B0}'),
-                    "&sup1;" => Some('\u{00B9}'), "&sup2;" => Some('\u{00B2}'),
-                    "&sup3;" => Some('\u{00B3}'), "&frac12;" => Some('\u{00BD}'),
-                    "&zwnj;" | "&zwj;" => Some('\u{200C}'),
-                    _ => None,
-                };
+                let decoded = decode_html_named_entity(entity.as_str());
                 if let Some(c) = decoded {
                     if c != '\u{200C}' { result.push(c); } // skip zero-width chars
                     i += end + 1;
