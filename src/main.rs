@@ -5793,6 +5793,39 @@ impl App {
             }
         }
 
+        // From external-sender attachments (no URL, addressable by file_id):
+        // dispatch the source's open_attachment template to download into a
+        // cache file, then add a file:// URL. Covers workspace etc.
+        let plugin_type = msg.source_type.clone();
+        let has_open = self.config.senders.get(&plugin_type)
+            .map(|m| m.contains_key("open_attachment")).unwrap_or(false);
+        if has_open {
+            let cache_dir = home_dir().join(".kastrup/image_cache");
+            let _ = std::fs::create_dir_all(&cache_dir);
+            let mut jobs: Vec<(String, String, String)> = Vec::new(); // (file_id, name, dest)
+            for att in &msg.attachments {
+                if !is_image_attachment(att) { continue; }
+                let file_id = att.get("file_id").and_then(|v| v.as_str());
+                let name = att.get("name").or_else(|| att.get("filename"))
+                    .and_then(|v| v.as_str()).unwrap_or("image");
+                if let Some(fid) = file_id {
+                    let dest = cache_dir.join(format!("{}_{}", fid, name))
+                        .to_string_lossy().to_string();
+                    jobs.push((fid.to_string(), name.to_string(), dest));
+                }
+            }
+            for (fid, name, dest) in jobs {
+                if !std::path::Path::new(&dest).exists() {
+                    let _ = self.dispatch_external_action(&plugin_type, "open_attachment",
+                        &[("file_id", &fid), ("name", &name), ("dest", &dest)], None);
+                }
+                if std::path::Path::new(&dest).exists() {
+                    urls.push(format!("file://{}", dest));
+                }
+            }
+        }
+        let msg = &self.filtered_messages[self.index];
+
         // From HTML content
         let html = msg.html_content.as_deref()
             .or_else(|| if msg.content.trim_start().starts_with('<') { Some(msg.content.as_str()) } else { None });
