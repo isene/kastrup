@@ -1098,6 +1098,23 @@ impl App {
             }
         }
 
+        // Clamp self.index in case a view refresh shrank the list while the
+        // cursor was parked past the new end. Previously panicked at the
+        // messages[self.index] below with "len is N but index is M".
+        let list_len = if self.show_threaded {
+            self.display_messages.len()
+        } else {
+            self.filtered_messages.len()
+        };
+        if list_len == 0 {
+            self.right.set_text("");
+            self.right.ix = 0;
+            self.right.full_refresh();
+            return;
+        }
+        if self.index >= list_len {
+            self.index = list_len - 1;
+        }
         let messages = if self.show_threaded {
             &self.display_messages
         } else {
