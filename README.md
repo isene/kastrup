@@ -8,6 +8,12 @@
 
 Unified terminal messaging client. All your email, chat, and feeds in one TUI. Built on [Crust](https://github.com/isene/crust). Feature clone of [Heathrow](https://github.com/isene/Heathrow) rewritten in Rust for speed and single-binary distribution.
 
+## Screenshot
+
+![Screenshot](img/screenshot.png)
+
+*Unified messaging: threaded RSS feeds (shown), mail, chat, and Workspace in one inbox.*
+
 ## Features
 
 - **Multi-source messaging**: Maildir email, RSS/Atom feeds, WeeChat/IRC, Messenger, Instagram
