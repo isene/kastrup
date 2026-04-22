@@ -6788,7 +6788,7 @@ fn extract_mime_text_depth(raw: &str, depth: usize) -> Option<String> {
     let effective_text = if text_is_fallback { None } else { text_part };
 
     // If text_part contains HTML entities, decode them
-    let result = effective_text
+    let body = effective_text
         .map(|t| {
             let has_entities = regex::Regex::new(r"&[a-zA-Z]+;|&#\d+;|&#x[0-9a-fA-F]+;")
                 .map(|re| re.is_match(&t)).unwrap_or(false);
@@ -6796,9 +6796,18 @@ fn extract_mime_text_depth(raw: &str, depth: usize) -> Option<String> {
                 html_to_text(&t)
             } else { t }
         })
-        .or_else(|| html_part.map(|h| html_to_text(&h)).filter(|t| !t.trim().is_empty()))
-        .or(cal_part);
-    result
+        .or_else(|| html_part.map(|h| html_to_text(&h)).filter(|t| !t.trim().is_empty()));
+
+    // When this is a calendar invite (text/calendar part present), put the
+    // structured summary on top followed by the plain-text body. That way
+    // the user sees "Title / When / Where / Organizer" first and the
+    // Teams/Zoom join block below.
+    match (cal_part, body) {
+        (Some(cal), Some(text)) => Some(format!("{}\n\n---\n\n{}", cal, text)),
+        (Some(cal), None)       => Some(cal),
+        (None,      Some(text)) => Some(text),
+        (None,      None)       => None,
+    }
 }
 
 /// Extract raw HTML from MIME multipart content (for browser display).
