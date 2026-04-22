@@ -2484,18 +2484,50 @@ impl App {
         let count = ids.len();
         self.delete_marked.clear();
 
-        // Find lowest position of a deleted message (before removing)
-        let min_deleted_pos = ids.iter().filter_map(|id| {
-            self.filtered_messages.iter().position(|m| m.id == *id)
-        }).min().unwrap_or(0);
+        // Lowest position of a deleted message in the ACTIVE list. In
+        // threaded view the cursor indexes display_messages (headers +
+        // expanded section), not filtered_messages — clamping against the
+        // wrong list left the cursor past-the-end, visible as "no left-pane
+        // selection + blank right pane" after purge.
+        let min_deleted_pos = if self.show_threaded {
+            ids.iter().filter_map(|id| {
+                self.display_messages.iter().position(|m| m.id == *id)
+            }).min().unwrap_or(0)
+        } else {
+            ids.iter().filter_map(|id| {
+                self.filtered_messages.iter().position(|m| m.id == *id)
+            }).min().unwrap_or(0)
+        };
 
         self.filtered_messages.retain(|m| !ids.contains(&m.id));
         if self.show_threaded {
             self.display_messages.retain(|m| !ids.contains(&m.id));
         }
 
-        // Land on the item now at the first deleted position
-        self.index = min_deleted_pos.min(self.filtered_messages.len().saturating_sub(1));
+        // Land on the item now at the first deleted position in the
+        // active list. Skip synthetic section headers — they aren't
+        // selectable targets.
+        let active_len = if self.show_threaded {
+            self.display_messages.len()
+        } else {
+            self.filtered_messages.len()
+        };
+        let mut new_index = min_deleted_pos.min(active_len.saturating_sub(1));
+        if self.show_threaded {
+            while new_index < self.display_messages.len()
+                && self.display_messages[new_index].is_header
+            {
+                new_index += 1;
+            }
+            if new_index >= self.display_messages.len() {
+                // Walk back past any trailing headers.
+                new_index = self.display_messages.len().saturating_sub(1);
+                while new_index > 0 && self.display_messages[new_index].is_header {
+                    new_index -= 1;
+                }
+            }
+        }
+        self.index = new_index;
 
         self.set_feedback(&format!("Purged {} messages", count), self.config.theme_colors.feedback_ok);
         self.render_all();
