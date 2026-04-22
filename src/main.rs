@@ -627,7 +627,11 @@ impl App {
                 }
             }
             "y" => { self.copy_message_id(); }
-            "Y" => { self.copy_right_pane(); }
+            "Y" | "C-Y" => {
+                self.copy_right_pane();
+                self.set_feedback("Right pane copied to clipboard",
+                    self.config.theme_colors.feedback_ok);
+            }
             "B" => { self.show_folder_browser(); }
 
             "C-B" => { self.cycle_border(); }
@@ -709,7 +713,7 @@ impl App {
             "D" => { self.cycle_date_format(); }
             "C-L" => { self.force_redraw(); }
             "RESIZE" => { self.handle_resize(); }
-            "Y" => { self.copy_right_pane(); }
+            "Y" | "C-Y" => { self.copy_right_pane(); }
             _ => {}
         }
     }
@@ -1270,7 +1274,11 @@ impl App {
                 || extracted.trim().len() < 20
         };
         let content = if let Some(ref html) = msg.html_content {
-            if is_html_fallback {
+            // Prefer the HTML body when the plain-text part looks like a
+            // stripped stub (common on RSS) or the HTML has structural
+            // content the text part can't represent — notably tables.
+            let html_has_table = html.contains("<table") || html.contains("<TABLE");
+            if is_html_fallback || html_has_table {
                 html_to_text(html)
             } else if extracted.contains("<br") || extracted.contains("<p>") || extracted.contains("<p ") ||
                 (extracted.trim_start().starts_with('<') && (extracted.contains("<html") || extracted.contains("<body") || extracted.contains("<div") || extracted.contains("<table"))) {
