@@ -879,18 +879,25 @@ impl App {
         } else {
             String::new()
         };
-        let (icon, scolor) = source_info(&msg.source_type, tc);
-        let content = format!("{} {} {} [{}]{}",
-            arrow, icon, subject, msg.content, unread_mark);
+        let (icon, _scolor) = source_info(&msg.source_type, tc);
+
+        // Selection affects only the subject text: underline it when selected.
+        // Everything else keeps the same thread color so collapsed/selected
+        // rows visually match their neighbours.
+        let subject_styled = if selected {
+            style::underline(&style::bold(&style::fg(subject, tc.thread)))
+        } else {
+            style::bold(&style::fg(subject, tc.thread))
+        };
+        let prefix = style::bold(&style::fg(&format!("{} {} ", arrow, icon), tc.thread));
+        let suffix = style::bold(&style::fg(&format!(" [{}]", msg.content), tc.thread));
+        let content = format!("{}{}{}{}", prefix, subject_styled, suffix, unread_mark);
+
+        // Trailing pad so the row bg fills the pane width; padding is not
+        // underlined so the underline hugs just the subject.
         let content_w = crust::display_width(&content);
         let padding = if pane_w > content_w { " ".repeat(pane_w - content_w) } else { String::new() };
-        let full = format!("{}{}", content, padding);
-
-        if selected {
-            style::underline(&style::bold(&style::fg(&full, scolor)))
-        } else {
-            style::bold(&style::fg(&full, tc.thread))
-        }
+        format!("{}{}", content, padding)
     }
 
     fn format_message_line(&self, msg: &Message, selected: bool, pane_w: usize) -> String {
