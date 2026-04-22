@@ -5604,6 +5604,41 @@ impl App {
             .unwrap_or("unnamed");
         let dest = format!("/tmp/kastrup_att_{}", name);
 
+        // External-sender path: if the attachment carries a file_id AND the
+        // source has an open_attachment template configured, dispatch to it.
+        // Covers non-maildir sources like Dualog Workspace that resolve
+        // attachments by server-side id.
+        let file_id = att.get("file_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let plugin_type = self.filtered_messages.get(self.index)
+            .map(|m| m.source_type.clone()).unwrap_or_default();
+        let has_open_attachment = self.config.senders.get(&plugin_type)
+            .map(|m| m.contains_key("open_attachment")).unwrap_or(false);
+        if let (Some(fid), true) = (file_id, has_open_attachment) {
+            self.set_feedback(&format!("Downloading {}...", name),
+                self.config.theme_colors.accent);
+            let res = self.dispatch_external_action(&plugin_type, "open_attachment",
+                &[("file_id", &fid), ("name", name), ("dest", &dest)], None);
+            match res {
+                Ok(()) => {
+                    if open {
+                        let _ = std::process::Command::new("xdg-open").arg(&dest)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn();
+                        self.set_feedback(&format!("Opened {}", name),
+                            self.config.theme_colors.feedback_ok);
+                    } else {
+                        self.set_feedback(&format!("Saved to {}", dest),
+                            self.config.theme_colors.feedback_ok);
+                    }
+                }
+                Err(e) => self.set_feedback(&format!("Attachment download failed: {}", e),
+                    self.config.theme_colors.feedback_warn),
+            }
+            return;
+        }
+
         let Some(mf) = maildir_file else {
             self.set_feedback("No source file available", self.config.theme_colors.feedback_warn);
             return;
