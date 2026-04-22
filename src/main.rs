@@ -3999,29 +3999,42 @@ impl App {
     /// Returns true when handled — caller should skip the email reply flow.
     fn maybe_external_reply(&mut self) -> bool {
         if self.filtered_messages.is_empty() { return false; }
-        let msg = &self.filtered_messages[self.index];
-        let plugin_type = msg.source_type.clone();
+        // Snapshot selected-message fields up front — holding &self across
+        // mutable calls (set_feedback / edit_body_tempfile / dispatch) would
+        // trip the borrow checker.
+        let (plugin_type, conv, msg_id, folder) = {
+            let msg = &self.filtered_messages[self.index];
+            (
+                msg.source_type.clone(),
+                msg.metadata.get("conversation_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                msg.external_id.clone(),
+                msg.folder.clone().unwrap_or_default(),
+            )
+        };
         if !self.config.senders.get(&plugin_type).map(|m| m.contains_key("reply")).unwrap_or(false) {
             return false;
         }
-        let conv = msg.metadata.get("conversation_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let msg_id = msg.external_id.clone();
         if conv.is_empty() {
             self.set_feedback("reply: no conversation_id in metadata",
                 self.config.theme_colors.feedback_warn);
             return true;
         }
-        self.set_feedback(&format!("Reply to {} — opening editor...",
-            msg.folder.clone().unwrap_or_default()),
+        self.set_feedback(&format!("Reply to {} — opening editor...", folder),
             self.config.theme_colors.accent);
         let Some(body) = self.edit_body_tempfile() else {
             self.set_feedback("reply cancelled", self.config.theme_colors.feedback_info);
             return true;
         };
-        match self.dispatch_external_action(&plugin_type, "reply",
-            &[("conv", &conv), ("msg", &msg_id), ("to", &msg_id)], Some(&body))
-        {
-            Ok(()) => self.set_feedback("Reply sent", self.config.theme_colors.feedback_ok),
+        self.set_feedback(&format!("Sending reply to {}...", folder),
+            self.config.theme_colors.accent);
+        let result = self.dispatch_external_action(&plugin_type, "reply",
+            &[("conv", &conv), ("msg", &msg_id), ("to", &msg_id)], Some(&body));
+        match result {
+            Ok(()) => {
+                self.set_feedback(&format!("Reply sent to {}", folder),
+                    self.config.theme_colors.feedback_ok);
+                self.refresh_current_view();
+            }
             Err(e) => self.set_feedback(&format!("Reply failed: {}", e),
                 self.config.theme_colors.feedback_warn),
         }
@@ -4145,11 +4158,16 @@ impl App {
             self.set_feedback("compose cancelled", self.config.theme_colors.feedback_info);
             return true;
         };
-        match self.dispatch_external_action(&plugin_type, "send",
-            &[("conv", &conv)], Some(&body))
-        {
-            Ok(()) => self.set_feedback(&format!("Sent to {}", folder),
-                self.config.theme_colors.feedback_ok),
+        self.set_feedback(&format!("Sending to {}...", folder),
+            self.config.theme_colors.accent);
+        let result = self.dispatch_external_action(&plugin_type, "send",
+            &[("conv", &conv)], Some(&body));
+        match result {
+            Ok(()) => {
+                self.set_feedback(&format!("Sent to {}", folder),
+                    self.config.theme_colors.feedback_ok);
+                self.refresh_current_view();
+            }
             Err(e) => self.set_feedback(&format!("Send failed: {}", e),
                 self.config.theme_colors.feedback_warn),
         }
