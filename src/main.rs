@@ -3945,7 +3945,9 @@ impl App {
         Ok(())
     }
 
-    /// Open `$EDITOR` on a blank tempfile; return the trimmed body.
+    /// Open `$EDITOR` on a blank tempfile; return the trimmed body. The editor
+    /// runs with the TUI torn down; on return we restore terminal state AND
+    /// redraw every pane so the caller's set_feedback lands on a visible UI.
     fn edit_body_tempfile(&mut self) -> Option<String> {
         let tmpfile = format!("/tmp/kastrup_body_{}.txt", std::process::id());
         if std::fs::write(&tmpfile, "").is_err() { return None; }
@@ -3956,6 +3958,8 @@ impl App {
             .status();
         Crust::init();
         Crust::clear_screen();
+        self.handle_resize();
+        self.render_all();
         let body = std::fs::read_to_string(&tmpfile).ok()?.trim_end().to_string();
         let _ = std::fs::remove_file(&tmpfile);
         if body.is_empty() { None } else { Some(body) }
