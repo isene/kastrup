@@ -2279,6 +2279,36 @@ impl App {
     }
 
     fn toggle_read(&mut self) {
+        // If any messages are tagged, operate on the tagged set (same idiom
+        // kastrup already uses for forward/delete). This gives "T then R" as
+        // bulk "mark-all-in-view-as-read": tag-all with T, then R decides
+        // the new state from whether ALL tagged are already read.
+        if !self.tagged.is_empty() {
+            let tagged_ids: Vec<i64> = self.tagged.iter().copied().collect();
+            let tagged_set: std::collections::HashSet<i64> = self.tagged.iter().copied().collect();
+            // Flip direction: if all tagged are already read, mark unread;
+            // otherwise mark read.
+            let all_read = self.filtered_messages.iter()
+                .filter(|m| tagged_set.contains(&m.id))
+                .all(|m| m.read);
+            let new_state = !all_read;
+            for id in &tagged_ids {
+                if new_state {
+                    self.db.mark_as_read(*id);
+                } else {
+                    self.db.mark_as_unread(*id);
+                }
+            }
+            for m in &mut self.filtered_messages {
+                if tagged_set.contains(&m.id) { m.read = new_state; }
+            }
+            let label = if new_state { "read" } else { "unread" };
+            self.set_feedback(
+                &format!("Marked {} tagged as {}", tagged_ids.len(), label),
+                self.config.theme_colors.feedback_ok);
+            self.render_all();
+            return;
+        }
         if let Some(msg) = self.filtered_messages.get_mut(self.index) {
             let new_state = self.db.toggle_read(msg.id);
             msg.read = new_state;
