@@ -1343,7 +1343,12 @@ impl App {
         let looks_mime = raw.contains("boundary=")
             || (raw.contains("Content-Type:") && raw.lines().any(|l| l.starts_with("--") && l.len() > 5));
         let extracted = if looks_mime {
-            extract_mime_text(raw).unwrap_or_else(|| raw.clone())
+            // If MIME parsing finds no readable body (e.g. attachment-only
+            // message where text/html is empty), fall back to an empty
+            // string rather than dumping the raw multipart envelope into
+            // the pane — the attachment list + image hint already rendered
+            // above tell the user what's there.
+            extract_mime_text(raw).unwrap_or_default()
         } else if raw.contains("Content-Transfer-Encoding: quoted-printable") {
             // Single-part QP encoded
             let body_start = raw.find("\n\n").map(|p| p + 2)
@@ -4874,7 +4879,9 @@ impl App {
         let looks_mime = raw.contains("Content-Type:")
             || raw.lines().any(|l| l.starts_with("--") && l.len() > 5);
         let extracted = if looks_mime {
-            extract_mime_text(raw).unwrap_or_else(|| raw.clone())
+            // Same attachment-only fallback as render_message_content —
+            // prefer an empty body over dumping raw MIME into yank/search.
+            extract_mime_text(raw).unwrap_or_default()
         } else if raw.contains("Content-Transfer-Encoding: quoted-printable") {
             let body_start = raw.find("\n\n").map(|p| p + 2)
                 .or_else(|| raw.find("\r\n\r\n").map(|p| p + 4))
