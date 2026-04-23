@@ -798,10 +798,24 @@ impl App {
         let mode = if self.group_by_folder { "Folders" } else if self.show_threaded { "Threaded" } else { "Flat" };
         let mode_label = style::fg(&format!(" [{}]", mode), tc.hint_fg);
 
-        // Position indicator (use display_messages count in threaded mode)
-        let display_total = if self.show_threaded { self.display_messages.len() as i64 } else { total };
-        let pos_label = if display_total > 0 {
-            style::fg(&format!(" [{}/{}]", self.index + 1, display_total), tc.info_fg)
+        // Position indicator: always expressed as "message N of total", not
+        // the display-row index. In threaded view, display_messages has
+        // section headers interleaved with messages; counting those as
+        // "positions" gave a number that drifted from the per-folder
+        // "[N messages]" tallies the user sees. Map the cursor back to a
+        // real message position, skipping headers.
+        let (shown_pos, shown_total) = if self.show_threaded {
+            let headers_up_to_and_incl = self.display_messages.iter()
+                .take(self.index + 1)
+                .filter(|m| m.is_header)
+                .count() as i64;
+            let pos = ((self.index as i64) + 1 - headers_up_to_and_incl).max(0);
+            (pos, total)
+        } else {
+            ((self.index as i64) + 1, total)
+        };
+        let pos_label = if shown_total > 0 {
+            style::fg(&format!(" [{}/{}]", shown_pos, shown_total), tc.info_fg)
         } else {
             style::fg(" [0/0]", tc.info_fg)
         };
@@ -2247,17 +2261,43 @@ impl App {
 
     fn toggle_collapse(&mut self) {
         if !self.show_threaded { return; }
-        if let Some(msg) = self.display_messages.get(self.index) {
-            if msg.is_header {
-                if let Some(ref name) = msg.thread_id {
-                    let name = name.clone();
-                    let collapsed = self.section_collapsed.entry(name).or_insert(false);
-                    *collapsed = !*collapsed;
-                    self.rebuild_display();
-                    self.render_all();
+        // If cursor is on a child message, walk back to find its section
+        // header and collapse THAT — the user's intent when Space-folding
+        // from inside an expanded section. Also move the cursor to the
+        // header so it's visible after the collapse.
+        let (header_ix, section_name) = {
+            let Some(current) = self.display_messages.get(self.index) else { return };
+            if current.is_header {
+                (self.index, current.thread_id.clone())
+            } else {
+                let mut ix = self.index;
+                while ix > 0 && !self.display_messages[ix].is_header {
+                    ix -= 1;
                 }
+                let name = self.display_messages.get(ix)
+                    .filter(|m| m.is_header)
+                    .and_then(|m| m.thread_id.clone());
+                (ix, name)
             }
+        };
+        let Some(name) = section_name else { return };
+        let was_on_child = self.index != header_ix;
+        // When invoked from a child, we want to collapse (not toggle) so a
+        // subsequent Space doesn't re-expand the section we just collapsed.
+        // When on the header itself, toggle (expand if collapsed).
+        if was_on_child {
+            self.section_collapsed.insert(name, true);
+        } else {
+            let collapsed = self.section_collapsed.entry(name).or_insert(false);
+            *collapsed = !*collapsed;
         }
+        self.index = header_ix;
+        self.rebuild_display();
+        // Re-find the header post-rebuild in case indices shifted.
+        if self.index >= self.display_messages.len() {
+            self.index = self.display_messages.len().saturating_sub(1);
+        }
+        self.render_all();
     }
 
     fn collapse_current(&mut self) {
