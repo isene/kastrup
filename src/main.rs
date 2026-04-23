@@ -7768,9 +7768,13 @@ fn html_to_text(html: &str) -> String {
     use std::sync::OnceLock;
     static HIDDEN_RE: OnceLock<regex::Regex> = OnceLock::new();
     let hidden_re = HIDDEN_RE.get_or_init(|| {
+        // Rust's regex crate doesn't support backreferences, so we match
+        // any open/close pair from the same set of element names instead
+        // of pinning the close tag to the open tag. The body is
+        // constrained to `[^<]*` so nested HTML can't sneak in.
         regex::Regex::new(
-            r#"(?is)<(div|span|p|td|tr|table|section)\b[^>]*\bstyle\s*=\s*"[^"]*\b(display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0(?:\.0+)?|max-height\s*:\s*0(?:px)?|max-width\s*:\s*0(?:px)?)[^"]*"[^>]*>[^<]*</\s*\1\s*>"#
-        ).unwrap()
+            r#"(?is)<(?:div|span|p|td|tr|table|section)\b[^>]*\bstyle\s*=\s*"[^"]*\b(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0(?:\.0+)?|max-height\s*:\s*0(?:px)?|max-width\s*:\s*0(?:px)?)[^"]*"[^>]*>[^<]*</\s*(?:div|span|p|td|tr|table|section)\s*>"#
+        ).expect("hidden-element regex should compile")
     });
     let stripped = hidden_re.replace_all(html, "").into_owned();
 
