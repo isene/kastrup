@@ -927,7 +927,11 @@ impl App {
 
         self.left.set_text(&lines.join("\n"));
         self.left.ix = 0;
-        self.left.refresh();
+        // full_refresh (not diff refresh): the selected row's underline can
+        // persist across cursor moves when a slow render_message_content
+        // (e.g. a fat OBOS HTML body) sits between two left-pane repaints.
+        // Writing every row from scratch is cheap and avoids stale state.
+        self.left.full_refresh();
         if self.left.border { self.left.border_refresh(); }
     }
 
@@ -1566,6 +1570,8 @@ impl App {
         } else {
             self.render_message_list();
             self.render_message_content();
+            // Keep the top bar's [pos/total] in sync with the cursor.
+            self.render_top_bar();
         }
     }
 
@@ -1590,6 +1596,8 @@ impl App {
         } else {
             self.render_message_list();
             self.render_message_content();
+            // Keep the top bar's [pos/total] in sync with the cursor.
+            self.render_top_bar();
         }
     }
 
