@@ -7758,17 +7758,34 @@ fn cell_html_to_text(inner: &str) -> String {
 }
 
 fn html_to_text(html: &str) -> String {
+    // Strip elements that a browser would render as invisible (CSS
+    // display:none, opacity:0, max-height:0, visibility:hidden). Substack
+    // and other newsletters stuff these with preview-padding chars
+    // (soft-hyphen, combining grapheme joiner, NBSP) which otherwise leak
+    // into the pane as "-?" grids. Regex is deliberately narrow — matches
+    // a single <div|span|…> with the offending style and no nested
+    // element of the same type inside it (`[^<]` forbids `<` in the body).
+    use std::sync::OnceLock;
+    static HIDDEN_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let hidden_re = HIDDEN_RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?is)<(div|span|p|td|tr|table|section)\b[^>]*\bstyle\s*=\s*"[^"]*\b(display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0(?:\.0+)?|max-height\s*:\s*0(?:px)?|max-width\s*:\s*0(?:px)?)[^"]*"[^>]*>[^<]*</\s*\1\s*>"#
+        ).unwrap()
+    });
+    let stripped = hidden_re.replace_all(html, "").into_owned();
+
     // Convert `<table>` blocks to Markdown BEFORE the generic tag strip so
     // structure survives. format_markdown_tables will lay them out.
     // Guard against recursion — cell_html_to_text re-enters html_to_text on
     // already-stripped cell HTML; skip the table pass when there's nothing
     // to do.
     let html_owned;
-    let html: &str = if html.contains("<table") || html.contains("<TABLE") {
-        html_owned = html_tables_to_markdown(html);
+    let html: &str = if stripped.contains("<table") || stripped.contains("<TABLE") {
+        html_owned = html_tables_to_markdown(&stripped);
         &html_owned
     } else {
-        html
+        html_owned = stripped;
+        &html_owned
     };
     let mut result = String::new();
     let mut in_tag = false;
@@ -7830,7 +7847,7 @@ fn html_to_text(html: &str) -> String {
                 let entity: String = chars[i..i + end + 1].iter().collect();
                 let decoded = decode_html_named_entity(entity.as_str());
                 if let Some(c) = decoded {
-                    if c != '\u{200C}' { result.push(c); } // skip zero-width chars
+                    if !is_invisible_format_char(c) { result.push(c); }
                     i += end + 1;
                     continue;
                 }
@@ -7846,7 +7863,7 @@ fn html_to_text(html: &str) -> String {
                         num_str.parse::<u32>().ok()
                     };
                     if let Some(c) = code.and_then(char::from_u32) {
-                        result.push(c);
+                        if !is_invisible_format_char(c) { result.push(c); }
                         i += end + 1;
                         continue;
                     }
@@ -7855,7 +7872,9 @@ fn html_to_text(html: &str) -> String {
         }
 
         last_was_block = false;
-        result.push(chars[i]);
+        if !is_invisible_format_char(chars[i]) {
+            result.push(chars[i]);
+        }
         i += 1;
     }
 
@@ -7874,6 +7893,22 @@ fn html_to_text(html: &str) -> String {
         }
     }
     cleaned
+}
+
+/// Characters that browsers render as zero-width or purely-formatting.
+/// Newsletters abuse these to pad email preview text; in a plain-text
+/// pane they leak as "?" / "-" replacement glyphs and junk up the view.
+fn is_invisible_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}'          // SOFT HYPHEN
+        | '\u{034F}'        // COMBINING GRAPHEME JOINER
+        | '\u{180E}'        // MONGOLIAN VOWEL SEPARATOR
+        | '\u{200B}'        // ZERO WIDTH SPACE
+        | '\u{200C}'        // ZERO WIDTH NON-JOINER
+        | '\u{200D}'        // ZERO WIDTH JOINER
+        | '\u{2060}'        // WORD JOINER
+        | '\u{FEFF}'        // ZERO WIDTH NO-BREAK SPACE / BOM
+    )
 }
 
 // --- Utilities ---
