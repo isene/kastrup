@@ -1790,7 +1790,22 @@ impl App {
                 msg.source_type = st.clone();
             }
         }
-        self.sort_messages();
+        // Only re-sort when the id set actually changed (new messages
+        // arrived or some were purged). If only read-state flipped, keep
+        // the previous in-memory order — otherwise the "unread" sort
+        // mode shuffles the just-read message down and the cursor ends
+        // up on a different row than the user last navigated to.
+        let old_id_set: std::collections::HashSet<i64> = old_ids.iter().copied().collect();
+        let new_id_set: std::collections::HashSet<i64> =
+            self.filtered_messages.iter().map(|m| m.id).collect();
+        if old_id_set == new_id_set && !old_ids.is_empty() {
+            let pos: std::collections::HashMap<i64, usize> =
+                old_ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+            self.filtered_messages.sort_by_key(|m|
+                pos.get(&m.id).copied().unwrap_or(usize::MAX));
+        } else {
+            self.sort_messages();
+        }
         self.rebuild_display();
 
         // Restore position by message ID, fall back to saved index
