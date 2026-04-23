@@ -79,24 +79,21 @@ fn collapse_bracketed_links(body: &str) -> String {
         let anchor = m.get(1).map(|a| a.as_str().trim()).unwrap_or("");
         let url = m.get(2).unwrap().as_str();
         out.push_str(&body[last..whole.start()]);
-        if anchor.is_empty() || anchor == url {
-            // Degenerate: just emit the URL as a clickable link.
-            out.push_str("\x1b]8;;");
-            out.push_str(url);
-            out.push_str("\x1b\\");
-            out.push_str(url);
-            out.push_str("\x1b]8;;\x1b\\");
+        // SGR underline inside the OSC 8 sequence so the visible anchor
+        // stands out as a link; terminals strip SGR on copy so the text
+        // the user yanks stays clean.
+        let visible = if anchor.is_empty() || anchor == url {
+            url.to_string()
         } else {
             // Collapse whitespace inside the anchor — the raw text often
-            // wraps across lines — and OSC-8-wrap it.
-            let collapsed: String = anchor.split_whitespace()
-                .collect::<Vec<_>>().join(" ");
-            out.push_str("\x1b]8;;");
-            out.push_str(url);
-            out.push_str("\x1b\\");
-            out.push_str(&collapsed);
-            out.push_str("\x1b]8;;\x1b\\");
-        }
+            // wraps across lines.
+            anchor.split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        out.push_str("\x1b]8;;");
+        out.push_str(url);
+        out.push_str("\x1b\\\x1b[4m");
+        out.push_str(&visible);
+        out.push_str("\x1b[24m\x1b]8;;\x1b\\");
         last = whole.end();
     }
     out.push_str(&body[last..]);
@@ -117,12 +114,13 @@ fn hyperlink_urls(line: &str) -> String {
     for m in re.find_iter(line) {
         out.push_str(&line[last..m.start()]);
         let url = m.as_str();
-        // OSC 8: \e]8;;URL\e\\text\e]8;;\e\\
+        // OSC 8 link with SGR underline around the visible text so users
+        // can see where links are; SGR 24 turns underline off after.
         out.push_str("\x1b]8;;");
         out.push_str(url);
-        out.push_str("\x1b\\");
+        out.push_str("\x1b\\\x1b[4m");
         out.push_str(url);
-        out.push_str("\x1b]8;;\x1b\\");
+        out.push_str("\x1b[24m\x1b]8;;\x1b\\");
         last = m.end();
     }
     out.push_str(&line[last..]);
