@@ -54,6 +54,55 @@ struct FolderEntry {
     collapsed: bool,
 }
 
+/// Collapse the bracketed-anchor-with-inline-URL pattern that plain-text
+/// mail parts emit for every `<a href>` — `[anchor text <https://…>]`,
+/// often with the anchor and URL split across a line break — into an OSC 8
+/// hyperlink whose visible text is just the anchor. Runs on the whole body
+/// (multi-line) and is applied before per-line URL linkification so we
+/// don't double-wrap. Pattern is deliberately narrow: requires the URL to
+/// be inside `< >` and the whole thing inside `[ ]`, to avoid chewing up
+/// prose that happens to contain bracketed phrases.
+fn collapse_bracketed_links(body: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // (?s) dot-matches-newline; anchor is any non-bracket chars (lazy),
+        // URL is http(s)://... without < > or whitespace.
+        regex::Regex::new(
+            r"(?s)\[\s*([^\[\]]{1,200}?)\s*<(https?://[^<>\s]+)>\s*\]"
+        ).unwrap()
+    });
+    let mut out = String::with_capacity(body.len());
+    let mut last = 0;
+    for m in re.captures_iter(body) {
+        let whole = m.get(0).unwrap();
+        let anchor = m.get(1).map(|a| a.as_str().trim()).unwrap_or("");
+        let url = m.get(2).unwrap().as_str();
+        out.push_str(&body[last..whole.start()]);
+        if anchor.is_empty() || anchor == url {
+            // Degenerate: just emit the URL as a clickable link.
+            out.push_str("\x1b]8;;");
+            out.push_str(url);
+            out.push_str("\x1b\\");
+            out.push_str(url);
+            out.push_str("\x1b]8;;\x1b\\");
+        } else {
+            // Collapse whitespace inside the anchor — the raw text often
+            // wraps across lines — and OSC-8-wrap it.
+            let collapsed: String = anchor.split_whitespace()
+                .collect::<Vec<_>>().join(" ");
+            out.push_str("\x1b]8;;");
+            out.push_str(url);
+            out.push_str("\x1b\\");
+            out.push_str(&collapsed);
+            out.push_str("\x1b]8;;\x1b\\");
+        }
+        last = whole.end();
+    }
+    out.push_str(&body[last..]);
+    out
+}
+
 /// Wrap URLs in a line with OSC 8 hyperlink escapes so kitty keeps them
 /// clickable even when the visible text wraps across multiple pane lines.
 fn hyperlink_urls(line: &str) -> String {
@@ -1328,6 +1377,11 @@ impl App {
         // subsequent quote/signature coloring still works.
         let pane_w = (self.right.w as usize).saturating_sub(4).max(20);
         let content = crust::text::format_markdown_tables(&content, pane_w);
+        // Collapse plain-text bracketed-link syntax `[anchor <URL>]` (with
+        // the URL possibly wrapped to the next line) into OSC 8 links
+        // showing only the anchor, so the pane isn't dominated by long
+        // tracking URLs that mail clients inline-expand.
+        let content = collapse_bracketed_links(&content);
 
         let mut in_signature = false;
         let mut prev_blank = false;
