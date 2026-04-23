@@ -1,8 +1,9 @@
 use super::MessageData;
 use std::path::{Path, PathBuf};
 use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 
-pub fn sync_maildir(maildir_path: &str, known_ids: &HashSet<String>) -> Vec<MessageData> {
+pub fn sync_maildir(maildir_path: &str, known_ids: &HashSet<String>, last_sync: i64) -> Vec<MessageData> {
     let root = Path::new(maildir_path);
     if !root.is_dir() { return Vec::new(); }
 
@@ -21,10 +22,28 @@ pub fn sync_maildir(maildir_path: &str, known_ids: &HashSet<String>) -> Vec<Mess
         }
     }
 
+    // Build a SystemTime threshold from last_sync (with 2s slack for FS mtime granularity).
+    // last_sync == 0 means "never synced" — fall through and scan everything.
+    let threshold: Option<SystemTime> = if last_sync > 0 {
+        UNIX_EPOCH.checked_add(Duration::from_secs(last_sync.saturating_sub(2) as u64))
+    } else {
+        None
+    };
+
     for (folder_name, folder_path) in &folders {
         for subdir in &["cur", "new"] {
             let dir = folder_path.join(subdir);
             if !dir.is_dir() { continue; }
+            // mtime gate: skip subdirs that haven't changed since last_sync.
+            // Maildir delivery writes to new/ and moves to cur/, both of which bump
+            // the directory mtime, so we catch all new/modified messages this way.
+            if let Some(thr) = threshold {
+                if let Ok(meta) = std::fs::metadata(&dir) {
+                    if let Ok(mt) = meta.modified() {
+                        if mt <= thr { continue; }
+                    }
+                }
+            }
             let Ok(entries) = std::fs::read_dir(&dir) else { continue };
             for entry in entries.flatten() {
                 let path = entry.path();

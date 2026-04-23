@@ -19,10 +19,20 @@ impl Poller {
         let running_clone = running.clone();
 
         let thread = std::thread::spawn(move || {
-            // Cache known_ids per source (loaded once, updated incrementally)
+            // Cache known_ids per source (loaded once, updated incrementally).
+            // This HashSet grows for the process lifetime but eviction is only
+            // worth building if VmRSS actually creeps up — the periodic log
+            // below lets us confirm whether that ever matters in practice.
             let mut known_cache: HashMap<i64, HashSet<String>> = HashMap::new();
+            log_process_memory("poller startup", &known_cache);
+            let mut next_mem_log = std::time::Instant::now()
+                + std::time::Duration::from_secs(3600);
 
             while running_clone.load(Ordering::Relaxed) {
+                if std::time::Instant::now() >= next_mem_log {
+                    log_process_memory("poller hourly", &known_cache);
+                    next_mem_log += std::time::Duration::from_secs(3600);
+                }
                 let sources_list = db.get_sources(true);
                 let now = crate::database::now_secs();
 
@@ -45,7 +55,7 @@ impl Poller {
                                 .unwrap_or("~/Maildir");
                             let expanded = path.replace("~/",
                                 &format!("{}/", std::env::var("HOME").unwrap_or_default()));
-                            sources::maildir::sync_maildir(&expanded, known)
+                            sources::maildir::sync_maildir(&expanded, known, last_sync)
                         }
                         "rss" => {
                             let feeds = source.config.get("feeds")
@@ -104,4 +114,26 @@ impl Drop for Poller {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
     }
+}
+
+/// Log process VmRSS and the total number of entries in the poller's
+/// known_ids cache so we can judge whether the cache ever becomes large
+/// enough to justify an eviction policy.
+fn log_process_memory(tag: &str, known_cache: &HashMap<i64, HashSet<String>>) {
+    let vm_rss_kb = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+        });
+    let total_known: usize = known_cache.values().map(|s| s.len()).sum();
+    let rss_str = match vm_rss_kb {
+        Some(kb) => format!("{} KB", kb),
+        None => "unknown".to_string(),
+    };
+    crate::log::info(&format!(
+        "{}: VmRSS={}, known_cache={} entries across {} sources",
+        tag, rss_str, total_known, known_cache.len()
+    ));
 }

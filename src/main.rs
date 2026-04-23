@@ -11,6 +11,7 @@ use crust::{Crust, Pane, Input};
 use crust::style;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 
 /// Background DB write operations (fire-and-forget from main thread)
@@ -289,6 +290,9 @@ struct App {
     poller: Option<poller::Poller>,
     poller_rx: Option<std::sync::mpsc::Receiver<poller::PollerEvent>>,
     write_tx: std_mpsc::Sender<DbWriteOp>,
+    // Flipped to true whenever the DB writer thread mutates a message row.
+    // The 5s periodic refresh skips its get_messages() query when this is false.
+    messages_dirty: Arc<AtomicBool>,
 
     // Help state
     showing_help: bool,
@@ -342,6 +346,8 @@ fn main() {
     // Spawn background DB writer thread
     let (write_tx, write_rx) = std_mpsc::channel::<DbWriteOp>();
     let writer_db = db.clone();
+    let messages_dirty = Arc::new(AtomicBool::new(false));
+    let writer_dirty = messages_dirty.clone();
     std::thread::spawn(move || {
         while let Ok(op) = write_rx.recv() {
             match op {
@@ -368,6 +374,10 @@ fn main() {
                     let _ = conn.execute(&sql, param_refs.as_slice());
                 }
             }
+            // Any op that reached here touched the DB; flag the view as dirty
+            // so the periodic refresh actually fetches. SetSetting is a
+            // false positive but cheap — one extra refresh vs 720/hour saved.
+            writer_dirty.store(true, Ordering::Relaxed);
         }
     });
 
@@ -414,6 +424,7 @@ fn main() {
         poller: None,
         poller_rx: None,
         write_tx,
+        messages_dirty,
         showing_help: false,
         help_extended: false,
         right_pane_locked: false,
@@ -478,10 +489,14 @@ fn main() {
                     );
                     app.refresh_current_view();
                 }
-                // Periodic DB refresh (skip when showing inline images)
+                // Periodic DB refresh (skip when showing inline images).
+                // Gated on messages_dirty so an idle kastrup doesn't rerun
+                // get_messages() every 5s for no reason.
                 if !app.showing_image && app.delete_marked.is_empty() && app.last_db_refresh.elapsed().as_secs() >= 5 {
                     app.last_db_refresh = std::time::Instant::now();
-                    app.refresh_current_view();
+                    if app.messages_dirty.swap(false, Ordering::Relaxed) {
+                        app.refresh_current_view();
+                    }
                 }
             }
         }
@@ -2322,13 +2337,40 @@ impl App {
 
             if !is_collapsed {
                 for &idx in &section.messages {
-                    let mut msg = self.filtered_messages[idx].clone();
-                    // Don't clone heavy fields for display list (loaded on demand)
-                    msg.content = String::new();
-                    msg.html_content = None;
-                    msg.metadata = serde_json::Value::Null;
-                    msg.full_loaded = false;
-                    self.display_messages.push(msg);
+                    // Build the display entry directly instead of cloning the
+                    // full Message and then blanking the heavy fields — that
+                    // churns alloc/dealloc for content/html_content/metadata
+                    // on every rebuild. We still clone the light String fields
+                    // so downstream mutation of display_messages (mark read,
+                    // etc.) doesn't have to reach back into filtered_messages.
+                    let src = &self.filtered_messages[idx];
+                    self.display_messages.push(Message {
+                        id: src.id,
+                        source_id: src.source_id,
+                        external_id: src.external_id.clone(),
+                        thread_id: src.thread_id.clone(),
+                        parent_id: src.parent_id,
+                        sender: src.sender.clone(),
+                        sender_name: src.sender_name.clone(),
+                        recipients: src.recipients.clone(),
+                        cc: src.cc.clone(),
+                        subject: src.subject.clone(),
+                        content: String::new(),
+                        html_content: None,
+                        timestamp: src.timestamp,
+                        received_at: src.received_at,
+                        read: src.read,
+                        starred: src.starred,
+                        archived: src.archived,
+                        labels: src.labels.clone(),
+                        attachments: src.attachments.clone(),
+                        metadata: serde_json::Value::Null,
+                        folder: src.folder.clone(),
+                        replied: src.replied,
+                        source_type: src.source_type.clone(),
+                        is_header: false,
+                        full_loaded: false,
+                    });
                 }
             }
         }
