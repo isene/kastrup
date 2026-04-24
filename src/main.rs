@@ -7447,11 +7447,22 @@ fn decode_qp_bytes_body(s: &str) -> Vec<u8> {
                 if i < input.len() && input[i] == b'\r' { i += 1; }
                 if i < input.len() && input[i] == b'\n' { i += 1; }
             } else if i + 2 < input.len() {
-                let hex = &s[i + 1..i + 3];
-                if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                    bytes.push(byte);
-                    i += 3;
+                let b1 = input[i + 1];
+                let b2 = input[i + 2];
+                if b1.is_ascii_hexdigit() && b2.is_ascii_hexdigit() {
+                    let hex = [b1, b2];
+                    // SAFETY: both bytes are ASCII hex digits -> valid UTF-8
+                    let hex_str = std::str::from_utf8(&hex).unwrap();
+                    if let Ok(byte) = u8::from_str_radix(hex_str, 16) {
+                        bytes.push(byte);
+                        i += 3;
+                    } else {
+                        bytes.push(b'=');
+                        i += 1;
+                    }
                 } else {
+                    // Bare `=` not followed by ASCII hex (e.g. preceding a
+                    // UTF-8 multi-byte char) — emit literally.
                     bytes.push(b'=');
                     i += 1;
                 }
@@ -7480,11 +7491,22 @@ fn decode_quoted_printable(s: &str) -> String {
                 if i < input.len() && input[i] == b'\r' { i += 1; }
                 if i < input.len() && input[i] == b'\n' { i += 1; }
             } else if i + 2 < input.len() {
-                let hex = &s[i + 1..i + 3];
-                if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                    bytes.push(byte);
-                    i += 3;
+                let b1 = input[i + 1];
+                let b2 = input[i + 2];
+                if b1.is_ascii_hexdigit() && b2.is_ascii_hexdigit() {
+                    let hex = [b1, b2];
+                    // SAFETY: both bytes are ASCII hex digits -> valid UTF-8
+                    let hex_str = std::str::from_utf8(&hex).unwrap();
+                    if let Ok(byte) = u8::from_str_radix(hex_str, 16) {
+                        bytes.push(byte);
+                        i += 3;
+                    } else {
+                        bytes.push(b'=');
+                        i += 1;
+                    }
                 } else {
+                    // Bare `=` not followed by ASCII hex (e.g. preceding a
+                    // UTF-8 multi-byte char) — emit literally.
                     bytes.push(b'=');
                     i += 1;
                 }
