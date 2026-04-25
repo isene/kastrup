@@ -6875,22 +6875,12 @@ impl App {
 
         // Scan the rendered message body for a future date mention.
         // Just resolves the destination date; never creates an event.
+        let mut time_str: Option<String> = None;
         if date_str.is_none() {
-            let body_text = if !msg.content.trim().is_empty() {
-                msg.content.clone()
-            } else if let Some(html) = msg.html_content.as_ref() {
-                html_to_text(html)
-            } else if let Some(file) = msg.metadata.get("maildir_file").and_then(|v| v.as_str()) {
-                std::fs::read_to_string(file)
-                    .ok()
-                    .and_then(|raw| extract_mime_text(&raw))
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-
-            if let Some((y, m, d, _time)) = scan_for_future_event(&body_text) {
+            let body_text = self.get_display_content(&msg);
+            if let Some((y, m, d, time)) = scan_for_future_event(&body_text) {
                 date_str = Some(format!("{:04}-{:02}-{:02}", y, m, d));
+                time_str = time.map(|(h, mi)| format!("{:02}:{:02}", h, mi));
             }
         }
 
@@ -6907,7 +6897,11 @@ impl App {
         // Write goto file for Tock to navigate to the date.
         let goto_path = tock_home.join("goto");
         let _ = std::fs::write(&goto_path, &date);
-        self.set_feedback(&format!("Sent to Tock: {}", date), self.config.theme_colors.feedback_ok);
+        let label = match &time_str {
+            Some(t) => format!("Sent to Tock: {} {}", date, t),
+            None => format!("Sent to Tock: {}", date),
+        };
+        self.set_feedback(&label, self.config.theme_colors.feedback_ok);
     }
 
     // Batch M: Extended Help
