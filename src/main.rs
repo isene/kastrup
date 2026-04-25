@@ -6887,6 +6887,47 @@ impl App {
             }
         }
 
+        // No ICS event detected: scan the rendered message body for a
+        // future date mention and, if found, generate a Tock event for it.
+        let mut created_event = false;
+        if date_str.is_none() {
+            let body_text = if !msg.content.trim().is_empty() {
+                msg.content.clone()
+            } else if let Some(html) = msg.html_content.as_ref() {
+                html_to_text(html)
+            } else if let Some(file) = msg.metadata.get("maildir_file").and_then(|v| v.as_str()) {
+                std::fs::read_to_string(file)
+                    .ok()
+                    .and_then(|raw| extract_mime_text(&raw))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            if let Some((y, m, d, time)) = scan_for_future_event(&body_text) {
+                let incoming = tock_home.join("incoming");
+                let _ = std::fs::create_dir_all(&incoming);
+                let uid = format!("kastrup-{}-{}", msg.id, y * 10000 + m as i32 * 100 + d as i32);
+                let subject = msg.subject.clone().unwrap_or_else(|| "(no subject)".into());
+                // Snippet: first non-empty rendered line or up to 200 chars.
+                let snippet: String = body_text.lines()
+                    .find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(200).collect();
+                let ics = build_ics_event(&uid, &subject, &snippet, y, m, d, time);
+                let path = incoming.join(format!("kastrup_msg_{}.ics", msg.id));
+                if std::fs::write(&path, ics).is_ok() {
+                    created_event = true;
+                    let time_str = time
+                        .map(|(h, mi)| format!(" {:02}:{:02}", h, mi))
+                        .unwrap_or_default();
+                    date_str = Some(format!("{:04}-{:02}-{:02}", y, m, d));
+                    self.set_feedback(
+                        &format!("Tock event: {} {:04}-{:02}-{:02}{}", subject, y, m, d, time_str),
+                        self.config.theme_colors.feedback_ok,
+                    );
+                }
+            }
+        }
+
         // Fallback: use message timestamp
         if date_str.is_none() && msg.timestamp > 0 {
             date_str = Some(format_timestamp(msg.timestamp, "%Y-%m-%d"));
@@ -6900,7 +6941,9 @@ impl App {
         // Write goto file for Tock/Timely
         let goto_path = tock_home.join("goto");
         let _ = std::fs::write(&goto_path, &date);
-        self.set_feedback(&format!("Sent to Tock: {}", date), self.config.theme_colors.feedback_ok);
+        if !created_event {
+            self.set_feedback(&format!("Sent to Tock: {}", date), self.config.theme_colors.feedback_ok);
+        }
     }
 
     // Batch M: Extended Help
@@ -8006,6 +8049,138 @@ fn days_to_ymd(days: i64) -> (i64, i64, i64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+/// Inverse of days_to_ymd: convert (year, month, day) to days since epoch.
+fn ymd_to_days(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Scan plain text for the earliest future date (with optional time).
+/// Returns (Y, M, D, Option<(H, Min)>) when found.
+/// Recognises DD.MM.YYYY (Nordic), YYYY-MM-DD (ISO), DD/MM/YYYY (EU).
+/// Time formats: "kl. HH:MM", "kl. HH.MM", "HH:MM" appearing on the same
+/// rendered line or within ~80 bytes after the date match.
+fn scan_for_future_event(text: &str) -> Option<(i32, u32, u32, Option<(u32, u32)>)> {
+    use regex::Regex;
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    let today_days = now_secs / 86400;
+
+    // (regex, year_idx, month_idx, day_idx)
+    let date_patterns: [(Regex, usize, usize, usize); 3] = [
+        (Regex::new(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b").unwrap(), 3, 2, 1),
+        (Regex::new(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b").unwrap(), 1, 2, 3),
+        (Regex::new(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b").unwrap(), 3, 2, 1),
+    ];
+
+    // (?i) case-insensitive, optional period after kl
+    let time_re = Regex::new(r"(?i)(?:kl\.?\s*)?(\d{1,2})[:.](\d{2})\b").ok()?;
+
+    let mut best: Option<(i64, usize, i32, u32, u32)> = None;
+    for (re, yi, mi, di) in date_patterns.iter() {
+        for cap in re.captures_iter(text) {
+            let m_full = match cap.get(0) { Some(m) => m, None => continue };
+            let y: i32 = match cap.get(*yi).and_then(|m| m.as_str().parse().ok()) { Some(v) => v, None => continue };
+            let mo: u32 = match cap.get(*mi).and_then(|m| m.as_str().parse().ok()) { Some(v) => v, None => continue };
+            let d: u32 = match cap.get(*di).and_then(|m| m.as_str().parse().ok()) { Some(v) => v, None => continue };
+            if !(1..=12).contains(&mo) || !(1..=31).contains(&d) { continue; }
+            if !(2000..=2200).contains(&y) { continue; }
+            let days = ymd_to_days(y as i64, mo as i64, d as i64);
+            if days < today_days { continue; }
+            // Prefer earliest; on tie, prefer earliest position.
+            let take = match best {
+                Some((bd, _, _, _, _)) if bd <= days => false,
+                _ => true,
+            };
+            if take {
+                best = Some((days, m_full.end(), y, mo, d));
+            }
+        }
+    }
+
+    let (_, after_pos, y, mo, d) = best?;
+
+    // Look for a time within the same rendered line OR in the next 80 bytes,
+    // whichever comes first.
+    let after = &text[after_pos..];
+    let line_end = after.find('\n').unwrap_or(after.len());
+    let window_end = std::cmp::min(line_end.max(80), after.len());
+    let window = &after[..window_end];
+    let time = time_re.captures(window).and_then(|c| {
+        let h: u32 = c.get(1)?.as_str().parse().ok()?;
+        let min: u32 = c.get(2)?.as_str().parse().ok()?;
+        if h < 24 && min < 60 { Some((h, min)) } else { None }
+    });
+
+    Some((y, mo, d, time))
+}
+
+/// Generate a minimal ICS file body for a one-off event with optional time.
+/// Time given => 30-minute appointment; no time => all-day.
+fn build_ics_event(uid: &str, summary: &str, description: &str,
+                   y: i32, m: u32, d: u32, time: Option<(u32, u32)>) -> String {
+    let now_stamp = {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+        let days = secs / 86400;
+        let (yy, mm, dd) = days_to_ymd(days);
+        let tod = secs.rem_euclid(86400);
+        let h = tod / 3600;
+        let mi = (tod % 3600) / 60;
+        let s = tod % 60;
+        format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", yy, mm, dd, h, mi, s)
+    };
+    // Escape per RFC 5545: replace newlines, semicolons, commas, backslashes.
+    let escape = |s: &str| s.replace('\\', r"\\").replace(';', r"\;")
+        .replace(',', r"\,").replace('\n', r"\n");
+    let summary = escape(summary);
+    let description = escape(description);
+
+    match time {
+        Some((h, mi)) => {
+            // 30-minute event in floating local time.
+            let end_min = mi + 30;
+            let (eh, em) = if end_min >= 60 { (h + 1, end_min - 60) } else { (h, end_min) };
+            format!(
+                "BEGIN:VCALENDAR\r\n\
+                 VERSION:2.0\r\n\
+                 PRODID:-//Kastrup//Z-action//EN\r\n\
+                 CALSCALE:GREGORIAN\r\n\
+                 BEGIN:VEVENT\r\n\
+                 UID:{uid}\r\n\
+                 DTSTAMP:{now_stamp}\r\n\
+                 DTSTART:{y:04}{m:02}{d:02}T{h:02}{mi:02}00\r\n\
+                 DTEND:{y:04}{m:02}{d:02}T{eh:02}{em:02}00\r\n\
+                 SUMMARY:{summary}\r\n\
+                 DESCRIPTION:{description}\r\n\
+                 END:VEVENT\r\n\
+                 END:VCALENDAR\r\n"
+            )
+        }
+        None => format!(
+            "BEGIN:VCALENDAR\r\n\
+             VERSION:2.0\r\n\
+             PRODID:-//Kastrup//Z-action//EN\r\n\
+             CALSCALE:GREGORIAN\r\n\
+             BEGIN:VEVENT\r\n\
+             UID:{uid}\r\n\
+             DTSTAMP:{now_stamp}\r\n\
+             DTSTART;VALUE=DATE:{y:04}{m:02}{d:02}\r\n\
+             DTEND;VALUE=DATE:{y:04}{m:02}{d:02}\r\n\
+             SUMMARY:{summary}\r\n\
+             DESCRIPTION:{description}\r\n\
+             END:VEVENT\r\n\
+             END:VCALENDAR\r\n"
+        ),
+    }
 }
 
 /// Get local UTC offset in seconds using libc
