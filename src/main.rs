@@ -3125,7 +3125,7 @@ impl App {
   s              File/save message\n\
   +              Add to favorites\n\
   I              AI assistant / plugins\n\
-  Z              Timely actions\n\n\
+  Z              Tock action\n\n\
 {}\n\
   o              Cycle sort order\n\
   i              Invert sort\n\
