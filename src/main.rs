@@ -6848,18 +6848,17 @@ impl App {
             return;
         }
 
-        // Try to extract date from ICS attachment in the maildir file
+        // Try to extract date from ICS attachment in the maildir file.
+        // Z navigates Tock to the relevant date — never auto-imports.
         let mut date_str = None;
         if let Some(file) = msg.metadata.get("maildir_file").and_then(|v| v.as_str()) {
             if std::path::Path::new(file).exists() {
                 if let Ok(content) = std::fs::read_to_string(file) {
-                    // Look for DTSTART in any VEVENT block
                     if let Some(vevent_start) = content.find("BEGIN:VEVENT") {
                         let vevent = &content[vevent_start..];
                         for line in vevent.lines() {
                             let l = line.trim();
                             if l.starts_with("DTSTART") {
-                                // Extract YYYYMMDD from various formats
                                 if let Some(colon) = l.find(':') {
                                     let val = &l[colon + 1..];
                                     if val.len() >= 8 {
@@ -6870,26 +6869,12 @@ impl App {
                             }
                         }
                     }
-
-                    // Copy ICS parts to incoming dir
-                    if content.contains("BEGIN:VCALENDAR") || content.contains("text/calendar") {
-                        let incoming = tock_home.join("incoming");
-                        let _ = std::fs::create_dir_all(&incoming);
-                        // Extract ICS from MIME or use whole file if it's an ICS
-                        if content.starts_with("BEGIN:VCALENDAR") {
-                            let ics_path = incoming.join(format!("kastrup_{}.ics", msg.id));
-                            if !ics_path.exists() {
-                                let _ = std::fs::write(&ics_path, &content);
-                            }
-                        }
-                    }
                 }
             }
         }
 
-        // No ICS event detected: scan the rendered message body for a
-        // future date mention and, if found, generate a Tock event for it.
-        let mut created_event = false;
+        // Scan the rendered message body for a future date mention.
+        // Just resolves the destination date; never creates an event.
         if date_str.is_none() {
             let body_text = if !msg.content.trim().is_empty() {
                 msg.content.clone()
@@ -6904,27 +6889,8 @@ impl App {
                 String::new()
             };
 
-            if let Some((y, m, d, time)) = scan_for_future_event(&body_text) {
-                let incoming = tock_home.join("incoming");
-                let _ = std::fs::create_dir_all(&incoming);
-                let uid = format!("kastrup-{}-{}", msg.id, y * 10000 + m as i32 * 100 + d as i32);
-                let subject = msg.subject.clone().unwrap_or_else(|| "(no subject)".into());
-                // Snippet: first non-empty rendered line or up to 200 chars.
-                let snippet: String = body_text.lines()
-                    .find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(200).collect();
-                let ics = build_ics_event(&uid, &subject, &snippet, y, m, d, time);
-                let path = incoming.join(format!("kastrup_msg_{}.ics", msg.id));
-                if std::fs::write(&path, ics).is_ok() {
-                    created_event = true;
-                    let time_str = time
-                        .map(|(h, mi)| format!(" {:02}:{:02}", h, mi))
-                        .unwrap_or_default();
-                    date_str = Some(format!("{:04}-{:02}-{:02}", y, m, d));
-                    self.set_feedback(
-                        &format!("Tock event: {} {:04}-{:02}-{:02}{}", subject, y, m, d, time_str),
-                        self.config.theme_colors.feedback_ok,
-                    );
-                }
+            if let Some((y, m, d, _time)) = scan_for_future_event(&body_text) {
+                date_str = Some(format!("{:04}-{:02}-{:02}", y, m, d));
             }
         }
 
@@ -6938,12 +6904,10 @@ impl App {
             return;
         };
 
-        // Write goto file for Tock/Timely
+        // Write goto file for Tock to navigate to the date.
         let goto_path = tock_home.join("goto");
         let _ = std::fs::write(&goto_path, &date);
-        if !created_event {
-            self.set_feedback(&format!("Sent to Tock: {}", date), self.config.theme_colors.feedback_ok);
-        }
+        self.set_feedback(&format!("Sent to Tock: {}", date), self.config.theme_colors.feedback_ok);
     }
 
     // Batch M: Extended Help
@@ -8123,65 +8087,6 @@ fn scan_for_future_event(text: &str) -> Option<(i32, u32, u32, Option<(u32, u32)
     Some((y, mo, d, time))
 }
 
-/// Generate a minimal ICS file body for a one-off event with optional time.
-/// Time given => 30-minute appointment; no time => all-day.
-fn build_ics_event(uid: &str, summary: &str, description: &str,
-                   y: i32, m: u32, d: u32, time: Option<(u32, u32)>) -> String {
-    let now_stamp = {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
-        let days = secs / 86400;
-        let (yy, mm, dd) = days_to_ymd(days);
-        let tod = secs.rem_euclid(86400);
-        let h = tod / 3600;
-        let mi = (tod % 3600) / 60;
-        let s = tod % 60;
-        format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", yy, mm, dd, h, mi, s)
-    };
-    // Escape per RFC 5545: replace newlines, semicolons, commas, backslashes.
-    let escape = |s: &str| s.replace('\\', r"\\").replace(';', r"\;")
-        .replace(',', r"\,").replace('\n', r"\n");
-    let summary = escape(summary);
-    let description = escape(description);
-
-    match time {
-        Some((h, mi)) => {
-            // 30-minute event in floating local time.
-            let end_min = mi + 30;
-            let (eh, em) = if end_min >= 60 { (h + 1, end_min - 60) } else { (h, end_min) };
-            format!(
-                "BEGIN:VCALENDAR\r\n\
-                 VERSION:2.0\r\n\
-                 PRODID:-//Kastrup//Z-action//EN\r\n\
-                 CALSCALE:GREGORIAN\r\n\
-                 BEGIN:VEVENT\r\n\
-                 UID:{uid}\r\n\
-                 DTSTAMP:{now_stamp}\r\n\
-                 DTSTART:{y:04}{m:02}{d:02}T{h:02}{mi:02}00\r\n\
-                 DTEND:{y:04}{m:02}{d:02}T{eh:02}{em:02}00\r\n\
-                 SUMMARY:{summary}\r\n\
-                 DESCRIPTION:{description}\r\n\
-                 END:VEVENT\r\n\
-                 END:VCALENDAR\r\n"
-            )
-        }
-        None => format!(
-            "BEGIN:VCALENDAR\r\n\
-             VERSION:2.0\r\n\
-             PRODID:-//Kastrup//Z-action//EN\r\n\
-             CALSCALE:GREGORIAN\r\n\
-             BEGIN:VEVENT\r\n\
-             UID:{uid}\r\n\
-             DTSTAMP:{now_stamp}\r\n\
-             DTSTART;VALUE=DATE:{y:04}{m:02}{d:02}\r\n\
-             DTEND;VALUE=DATE:{y:04}{m:02}{d:02}\r\n\
-             SUMMARY:{summary}\r\n\
-             DESCRIPTION:{description}\r\n\
-             END:VEVENT\r\n\
-             END:VCALENDAR\r\n"
-        ),
-    }
-}
 
 /// Get local UTC offset in seconds using libc
 fn local_utc_offset() -> i64 {
