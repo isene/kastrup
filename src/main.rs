@@ -664,7 +664,7 @@ impl App {
             "+" => { self.external_react(false); }
             "-" => { self.external_react(true); }
             "I" => { self.ai_assistant(); }
-            "Z" => { self.open_in_timely(); }
+            "Z" => { self.open_in_tock(); }
 
             // UI
             "w" => { self.cycle_width(); }
@@ -6834,8 +6834,8 @@ impl App {
         }
     }
 
-    // Batch L: Calendar/Timely
-    fn open_in_timely(&mut self) {
+    // Batch L: Calendar/Tock
+    fn open_in_tock(&mut self) {
         let msg = match self.filtered_messages.get(self.index) {
             Some(m) => m.clone(),
             None => return,
