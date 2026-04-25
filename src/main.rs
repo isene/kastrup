@@ -6848,9 +6848,10 @@ impl App {
             return;
         }
 
-        // Try to extract date from ICS attachment in the maildir file.
-        // Z navigates Tock to the relevant date — never auto-imports.
-        let mut date_str = None;
+        // Source 1: ICS attachment in the maildir file.
+        let mut date_ymd: Option<(i32, u32, u32)> = None;
+        let mut time_hm: Option<(u32, u32)> = None;
+        let mut ics_passthrough: Option<String> = None;
         if let Some(file) = msg.metadata.get("maildir_file").and_then(|v| v.as_str()) {
             if std::path::Path::new(file).exists() {
                 if let Ok(content) = std::fs::read_to_string(file) {
@@ -6862,46 +6863,82 @@ impl App {
                                 if let Some(colon) = l.find(':') {
                                     let val = &l[colon + 1..];
                                     if val.len() >= 8 {
-                                        date_str = Some(format!("{}-{}-{}", &val[0..4], &val[4..6], &val[6..8]));
+                                        let y: i32 = val[0..4].parse().unwrap_or(0);
+                                        let m: u32 = val[4..6].parse().unwrap_or(0);
+                                        let d: u32 = val[6..8].parse().unwrap_or(0);
+                                        if y > 0 && m > 0 && d > 0 {
+                                            date_ymd = Some((y, m, d));
+                                        }
+                                        if val.len() >= 13 {
+                                            let h: u32 = val[9..11].parse().unwrap_or(0);
+                                            let mi: u32 = val[11..13].parse().unwrap_or(0);
+                                            if h < 24 && mi < 60 { time_hm = Some((h, mi)); }
+                                        }
                                     }
                                 }
                                 break;
                             }
                         }
                     }
+                    // If the message itself is a full ICS file, pass it
+                    // through verbatim instead of synthesising one.
+                    if content.starts_with("BEGIN:VCALENDAR") {
+                        ics_passthrough = Some(content);
+                    }
                 }
             }
         }
 
-        // Scan the rendered message body for a future date mention.
-        // Just resolves the destination date; never creates an event.
-        let mut time_str: Option<String> = None;
-        if date_str.is_none() {
+        // Source 2: scan the rendered message body for a future date.
+        if date_ymd.is_none() {
             let body_text = self.get_display_content(&msg);
             if let Some((y, m, d, time)) = scan_for_future_event(&body_text) {
-                date_str = Some(format!("{:04}-{:02}-{:02}", y, m, d));
-                time_str = time.map(|(h, mi)| format!("{:02}:{:02}", h, mi));
+                date_ymd = Some((y, m, d));
+                time_hm = time;
             }
         }
 
-        // Fallback: use message timestamp
-        if date_str.is_none() && msg.timestamp > 0 {
-            date_str = Some(format_timestamp(msg.timestamp, "%Y-%m-%d"));
+        // Source 3: fall back to the message arrival timestamp (date only).
+        if date_ymd.is_none() && msg.timestamp > 0 {
+            let local_ts = msg.timestamp + local_utc_offset();
+            let days = local_ts.div_euclid(86400);
+            let (y, m, d) = days_to_ymd(days);
+            date_ymd = Some((y as i32, m as u32, d as u32));
         }
 
-        let Some(date) = date_str else {
+        let Some((y, m, d)) = date_ymd else {
             self.set_feedback("Could not determine date", self.config.theme_colors.feedback_warn);
             return;
         };
 
-        // Write goto file for Tock to navigate to the date.
+        // Drop an ICS file in ~/.tock/incoming/ so Tock picks it up as an
+        // event on the resolved date. This is a Z-triggered, explicit
+        // user action — kastrup never creates events on its own.
+        let incoming = tock_home.join("incoming");
+        let _ = std::fs::create_dir_all(&incoming);
+        let subject = msg.subject.clone().unwrap_or_else(|| "(no subject)".into());
+        let path = incoming.join(format!("kastrup_msg_{}.ics", msg.id));
+        let snippet: String = self.get_display_content(&msg).lines()
+            .find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(200).collect();
+        let ics_body = if let Some(passthrough) = ics_passthrough {
+            passthrough
+        } else {
+            let uid = format!("kastrup-{}-{}", msg.id, y * 10000 + m as i32 * 100 + d as i32);
+            build_ics_event(&uid, &subject, &snippet, y, m, d, time_hm)
+        };
+        let event_written = std::fs::write(&path, ics_body).is_ok();
+
+        // Also write goto so a running Tock navigates to the day.
+        let date = format!("{:04}-{:02}-{:02}", y, m, d);
         let goto_path = tock_home.join("goto");
         let _ = std::fs::write(&goto_path, &date);
-        let label = match &time_str {
-            Some(t) => format!("Sent to Tock: {} {}", date, t),
-            None => format!("Sent to Tock: {}", date),
-        };
-        self.set_feedback(&label, self.config.theme_colors.feedback_ok);
+
+        let time_lbl = time_hm.map(|(h, mi)| format!(" {:02}:{:02}", h, mi)).unwrap_or_default();
+        let verb = if event_written { "Event sent to Tock" } else { "Sent to Tock" };
+        self.set_feedback(
+            &format!("{}: {}{}", verb, date, time_lbl),
+            self.config.theme_colors.feedback_ok,
+        );
     }
 
     // Batch M: Extended Help
@@ -8081,6 +8118,63 @@ fn scan_for_future_event(text: &str) -> Option<(i32, u32, u32, Option<(u32, u32)
     Some((y, mo, d, time))
 }
 
+/// Generate a minimal ICS file body for a one-off event with optional time.
+/// Time given => 30-minute appointment; no time => all-day.
+fn build_ics_event(uid: &str, summary: &str, description: &str,
+                   y: i32, m: u32, d: u32, time: Option<(u32, u32)>) -> String {
+    let now_stamp = {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+        let days = secs / 86400;
+        let (yy, mm, dd) = days_to_ymd(days);
+        let tod = secs.rem_euclid(86400);
+        let h = tod / 3600;
+        let mi = (tod % 3600) / 60;
+        let s = tod % 60;
+        format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", yy, mm, dd, h, mi, s)
+    };
+    let escape = |s: &str| s.replace('\\', r"\\").replace(';', r"\;")
+        .replace(',', r"\,").replace('\n', r"\n");
+    let summary = escape(summary);
+    let description = escape(description);
+
+    match time {
+        Some((h, mi)) => {
+            let end_min = mi + 30;
+            let (eh, em) = if end_min >= 60 { (h + 1, end_min - 60) } else { (h, end_min) };
+            format!(
+                "BEGIN:VCALENDAR\r\n\
+                 VERSION:2.0\r\n\
+                 PRODID:-//Kastrup//Z-action//EN\r\n\
+                 CALSCALE:GREGORIAN\r\n\
+                 BEGIN:VEVENT\r\n\
+                 UID:{uid}\r\n\
+                 DTSTAMP:{now_stamp}\r\n\
+                 DTSTART:{y:04}{m:02}{d:02}T{h:02}{mi:02}00\r\n\
+                 DTEND:{y:04}{m:02}{d:02}T{eh:02}{em:02}00\r\n\
+                 SUMMARY:{summary}\r\n\
+                 DESCRIPTION:{description}\r\n\
+                 END:VEVENT\r\n\
+                 END:VCALENDAR\r\n"
+            )
+        }
+        None => format!(
+            "BEGIN:VCALENDAR\r\n\
+             VERSION:2.0\r\n\
+             PRODID:-//Kastrup//Z-action//EN\r\n\
+             CALSCALE:GREGORIAN\r\n\
+             BEGIN:VEVENT\r\n\
+             UID:{uid}\r\n\
+             DTSTAMP:{now_stamp}\r\n\
+             DTSTART;VALUE=DATE:{y:04}{m:02}{d:02}\r\n\
+             DTEND;VALUE=DATE:{y:04}{m:02}{d:02}\r\n\
+             SUMMARY:{summary}\r\n\
+             DESCRIPTION:{description}\r\n\
+             END:VEVENT\r\n\
+             END:VCALENDAR\r\n"
+        ),
+    }
+}
 
 /// Get local UTC offset in seconds using libc
 fn local_utc_offset() -> i64 {
