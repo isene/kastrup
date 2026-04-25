@@ -3164,6 +3164,10 @@ impl App {
         // Restore per-view top bar bg color
         self.restore_view_top_bg();
         Crust::clear_screen();
+        // clear_screen wipes the pane borders too; redraw them before content
+        // so the right pane border isn't missing after compose / external editor.
+        if self.left.border { self.left.border_refresh(); }
+        if self.right.border { self.right.border_refresh(); }
         self.render_all();
     }
 
