@@ -6834,6 +6834,67 @@ impl App {
         }
     }
 
+    /// Read Tock's calendar list and let the user pick one. Returns the
+    /// chosen calendar id (Enter on empty input = the configured
+    /// default), or None if the user cancels with ESC. Returns Some(1)
+    /// silently when Tock's DB or config can't be read so Z still
+    /// works in fresh installs.
+    fn pick_tock_calendar(&mut self, tock_home: &std::path::Path) -> Option<i64> {
+        // Calendars from tock.db
+        let db_path = tock_home.join("tock.db");
+        let calendars: Vec<(i64, String)> = rusqlite::Connection::open(&db_path)
+            .ok()
+            .and_then(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT id, name FROM calendars WHERE enabled = 1 ORDER BY id"
+                ).ok()?;
+                let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                    .ok()?
+                    .filter_map(|r| r.ok())
+                    .collect::<Vec<_>>();
+                Some(rows)
+            })
+            .unwrap_or_default();
+        if calendars.is_empty() { return Some(1); }
+
+        // Default from ~/.tock/config.yml: line "default_calendar: <n>"
+        let default_id = std::fs::read_to_string(tock_home.join("config.yml"))
+            .ok()
+            .and_then(|s| {
+                s.lines().find_map(|l| {
+                    l.trim().strip_prefix("default_calendar:")
+                        .and_then(|v| v.trim().parse::<i64>().ok())
+                })
+            })
+            .unwrap_or(calendars[0].0);
+        let default_ix = calendars.iter().position(|(id, _)| *id == default_id)
+            .unwrap_or(0);
+
+        let tc = self.config.theme_colors.clone();
+        let mut lines = vec![
+            style::bold(&style::fg("Pick Tock calendar:", tc.unread)),
+            String::new(),
+        ];
+        for (i, (_, name)) in calendars.iter().enumerate() {
+            let marker = if i == default_ix { "→" } else { " " };
+            lines.push(format!(" {} {:>3}. {}", marker, i + 1, name));
+        }
+        lines.push(String::new());
+        lines.push(style::fg("Enter number, Enter=default, ESC=cancel", 245));
+        self.right.set_text(&lines.join("\n"));
+        self.right.full_refresh();
+
+        let input = self.prompt(&format!("Calendar # [{}]: ", default_ix + 1), "");
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            Some(calendars[default_ix].0)
+        } else if let Ok(n) = trimmed.parse::<usize>() {
+            if n >= 1 && n <= calendars.len() { Some(calendars[n - 1].0) } else { None }
+        } else {
+            None
+        }
+    }
+
     // Batch L: Calendar/Tock
     fn open_in_tock(&mut self) {
         let msg = match self.filtered_messages.get(self.index) {
@@ -6911,6 +6972,16 @@ impl App {
             return;
         };
 
+        // Ask which calendar to add the event to. ESC cancels the whole
+        // action so we don't insert into the wrong calendar.
+        let cal_id = match self.pick_tock_calendar(&tock_home) {
+            Some(id) => id,
+            None => {
+                self.set_feedback("Z cancelled", self.config.theme_colors.feedback_info);
+                return;
+            }
+        };
+
         // Drop an ICS file in ~/.tock/incoming/ so Tock picks it up as an
         // event on the resolved date. This is a Z-triggered, explicit
         // user action — kastrup never creates events on its own.
@@ -6921,10 +6992,13 @@ impl App {
         let snippet: String = self.get_display_content(&msg).lines()
             .find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(200).collect();
         let ics_body = if let Some(passthrough) = ics_passthrough {
-            passthrough
+            inject_tock_calendar_id(&passthrough, cal_id)
         } else {
             let uid = format!("kastrup-{}-{}", msg.id, y * 10000 + m as i32 * 100 + d as i32);
-            build_ics_event(&uid, &subject, &snippet, y, m, d, time_hm)
+            inject_tock_calendar_id(
+                &build_ics_event(&uid, &subject, &snippet, y, m, d, time_hm),
+                cal_id,
+            )
         };
         let event_written = std::fs::write(&path, ics_body).is_ok();
 
@@ -8116,6 +8190,35 @@ fn scan_for_future_event(text: &str) -> Option<(i32, u32, u32, Option<(u32, u32)
     });
 
     Some((y, mo, d, time))
+}
+
+/// Insert `X-TOCK-CALENDAR-ID:<n>` into each VEVENT in an ICS body so
+/// Tock's importer can route the event to a specific calendar.
+fn inject_tock_calendar_id(ics: &str, cal_id: i64) -> String {
+    let needle = "BEGIN:VEVENT";
+    let line = format!("X-TOCK-CALENDAR-ID:{}", cal_id);
+    let mut out = String::with_capacity(ics.len() + 64);
+    let mut rest = ics;
+    while let Some(idx) = rest.find(needle) {
+        let end = idx + needle.len();
+        out.push_str(&rest[..end]);
+        // After BEGIN:VEVENT, find the line terminator (\r\n or \n) and
+        // insert our line immediately after.
+        let after = &rest[end..];
+        let (term, term_len) = if after.starts_with("\r\n") {
+            ("\r\n", 2)
+        } else if after.starts_with('\n') {
+            ("\n", 1)
+        } else {
+            ("\r\n", 0)
+        };
+        out.push_str(term);
+        out.push_str(&line);
+        out.push_str(term);
+        rest = &after[term_len..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Generate a minimal ICS file body for a one-off event with optional time.
