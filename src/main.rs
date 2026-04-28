@@ -70,114 +70,49 @@ struct FolderEntry {
 fn collapse_bracketed_links(body: &str) -> String {
     use std::sync::OnceLock;
     static EMBEDDED: OnceLock<regex::Regex> = OnceLock::new();
-    static MD_ANGLE: OnceLock<regex::Regex> = OnceLock::new();
-    static MD_BARE: OnceLock<regex::Regex> = OnceLock::new();
+    static MARKDOWN: OnceLock<regex::Regex> = OnceLock::new();
     let embedded = EMBEDDED.get_or_init(|| {
         regex::Regex::new(
             r"(?s)\[\s*([^\[\]]{1,200}?)\s*<(https?://[^<>\s]+)>\s*\]"
         ).unwrap()
     });
-    // [label](<url>) — angle-bracketed URL form; allow whitespace inside since
-    // the `>)` terminator is unambiguous (real-world malformed mail-merge URLs
-    // sometimes embed personalisation text mid-URL).
-    let md_angle = MD_ANGLE.get_or_init(|| {
+    let markdown = MARKDOWN.get_or_init(|| {
+        // [anchor](<url>) or [anchor](url). URL may not contain < > ( )
+        // or whitespace. Anchor is lazy and may contain anything except
+        // brackets so it can wrap across newlines.
         regex::Regex::new(
-            r"(?s)\[\s*([^\[\]]{0,4000}?)\s*\]\(\s*<(https?://[^<>]{1,3000}?)>\s*\)"
-        ).unwrap()
-    });
-    // [label](url) — bare URL. No whitespace, no brackets, no parens.
-    let md_bare = MD_BARE.get_or_init(|| {
-        regex::Regex::new(
-            r"(?s)\[\s*([^\[\]]{0,4000}?)\s*\]\(\s*(https?://[^<>()\s]+)\s*\)"
+            r"(?s)\[\s*([^\[\]]{0,200}?)\s*\]\(\s*<?(https?://[^<>()\s]+)>?\s*\)"
         ).unwrap()
     });
 
-    // We use private-use Unicode sentinels to mark already-collapsed links so
-    // subsequent regex passes don't see brackets inside the OSC-8 escape and
-    // can match outer wrappers around already-collapsed inner ones.
-    //   \u{E000}URL\u{E001}LABEL\u{E002}
-    // After all collapse passes, sentinels are replaced with the real OSC-8
-    // sequence `\x1b]8;;URL\x1b\\\x1b[4mLABEL\x1b[24m\x1b]8;;\x1b\\`.
-    fn anchor_visible(anchor: &str) -> String {
-        // Strip inner sentinel blocks down to just their LABEL so a wrapping
-        // [outer](url) takes the inner button's text as its visible label.
-        let mut out = String::with_capacity(anchor.len());
-        let mut chars = anchor.chars();
-        while let Some(c) = chars.next() {
-            if c == '\u{E000}' {
-                for c in chars.by_ref() { if c == '\u{E001}' { break; } }
-                for c in chars.by_ref() {
-                    if c == '\u{E002}' { break; }
-                    out.push(c);
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    }
     let collapse = |src: &str, re: &regex::Regex| -> String {
         let mut out = String::with_capacity(src.len());
         let mut last = 0;
         for m in re.captures_iter(src) {
             let whole = m.get(0).unwrap();
-            let anchor_raw = m.get(1).map(|a| a.as_str()).unwrap_or("");
-            let url_raw = m.get(2).unwrap().as_str();
-            // Strip whitespace embedded mid-URL (mailmerge text injection).
-            let url: String = url_raw.split_whitespace().collect();
+            let anchor = m.get(1).map(|a| a.as_str().trim()).unwrap_or("");
+            let url = m.get(2).unwrap().as_str();
             out.push_str(&src[last..whole.start()]);
-            let anchor_vis = anchor_visible(anchor_raw);
-            let anchor_clean = anchor_vis.trim();
-            let visible = if anchor_clean.is_empty() || anchor_clean == url {
-                url.clone()
+            let visible = if anchor.is_empty() || anchor == url {
+                url.to_string()
             } else {
-                anchor_clean.split_whitespace().collect::<Vec<_>>().join(" ")
+                anchor.split_whitespace().collect::<Vec<_>>().join(" ")
             };
-            out.push('\u{E000}');
-            out.push_str(&url);
-            out.push('\u{E001}');
+            out.push_str("\x1b]8;;");
+            out.push_str(url);
+            out.push_str("\x1b\\\x1b[4m");
             out.push_str(&visible);
-            out.push('\u{E002}');
+            out.push_str("\x1b[24m\x1b]8;;\x1b\\");
             last = whole.end();
         }
         out.push_str(&src[last..]);
         out
     };
 
-    let mut cur = collapse(body, embedded);
-    // Iterate angle-form pass: outer wrappers around inner collapsed sentinels.
-    for _ in 0..4 {
-        let next = collapse(&cur, md_angle);
-        if next == cur { break; }
-        cur = next;
-    }
-    cur = collapse(&cur, md_bare);
-
-    // Restore sentinels into real OSC-8 escapes.
-    let mut out = String::with_capacity(cur.len());
-    let mut chars = cur.chars();
-    while let Some(c) = chars.next() {
-        if c == '\u{E000}' {
-            let mut url = String::new();
-            for c in chars.by_ref() {
-                if c == '\u{E001}' { break; }
-                url.push(c);
-            }
-            let mut visible = String::new();
-            for c in chars.by_ref() {
-                if c == '\u{E002}' { break; }
-                visible.push(c);
-            }
-            out.push_str("\x1b]8;;");
-            out.push_str(&url);
-            out.push_str("\x1b\\\x1b[4m");
-            out.push_str(&visible);
-            out.push_str("\x1b[24m\x1b]8;;\x1b\\");
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    // Apply embedded pattern first, then markdown. Both pass the same
+    // already-collapsed text to per-line URL linkification downstream.
+    let pass1 = collapse(body, embedded);
+    collapse(&pass1, markdown)
 }
 
 /// Wrap URLs in a line with OSC 8 hyperlink escapes so kitty keeps them
