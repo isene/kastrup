@@ -5335,7 +5335,7 @@ impl App {
                                         let pick_file = format!("/tmp/kastrup_attach_{}.txt", std::process::id());
                                         let _ = std::fs::remove_file(&pick_file);
                                         Crust::cleanup();
-                                        print!("\x1b[2J\x1b[H");
+                                        Crust::clear_screen();
                                         let _ = std::io::Write::flush(&mut std::io::stdout());
                                         let _ = std::process::Command::new("pointer")
                                             .arg(format!("--pick={}", pick_file))
@@ -5375,7 +5375,7 @@ impl App {
                                         let _ = std::fs::remove_file(&pick_file);
                                         let cmd = command.replace("%{pick_file}", &crust::shell_escape(&pick_file));
                                         Crust::cleanup();
-                                        print!("\x1b[2J\x1b[H");
+                                        Crust::clear_screen();
                                         let _ = std::process::Command::new("sh").arg("-c").arg(&cmd).status();
                                         Crust::init();
                                         Crust::clear_screen();
@@ -6681,7 +6681,7 @@ impl App {
         let _ = std::fs::remove_file(&pick_file);
         let cmd = command.replace("%{pick_file}", &pick_file);
         Crust::cleanup();
-        print!("\x1b[2J\x1b[H");
+        Crust::clear_screen();
         let _ = std::io::Write::flush(&mut std::io::stdout());
         let err_file = format!("/tmp/kastrup_plugin_err_{}.txt", std::process::id());
         let wrapped = format!("{} 2>'{}'", cmd, err_file);
