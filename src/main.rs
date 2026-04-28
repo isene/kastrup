@@ -55,50 +55,64 @@ struct FolderEntry {
     collapsed: bool,
 }
 
-/// Collapse the bracketed-anchor-with-inline-URL pattern that plain-text
-/// mail parts emit for every `<a href>` — `[anchor text <https://…>]`,
-/// often with the anchor and URL split across a line break — into an OSC 8
-/// hyperlink whose visible text is just the anchor. Runs on the whole body
-/// (multi-line) and is applied before per-line URL linkification so we
-/// don't double-wrap. Pattern is deliberately narrow: requires the URL to
-/// be inside `< >` and the whole thing inside `[ ]`, to avoid chewing up
-/// prose that happens to contain bracketed phrases.
+/// Collapse bracketed-anchor patterns that plain-text mail parts emit
+/// for `<a href>` into OSC 8 hyperlinks whose visible text is just the
+/// anchor. Two forms are recognised:
+///
+///   `[anchor text <https://…>]`   — URL embedded inside the brackets
+///   `[anchor text](<https://…>)`  — markdown-style; URL in following
+///                                   parens, optionally wrapped in `< >`
+///
+/// Both forms allow the anchor and URL to be split across line breaks
+/// (newsletter HTML→text emitters often do that). Patterns are
+/// deliberately narrow — anchor cannot contain brackets — so they
+/// don't chew up prose that happens to contain bracketed phrases.
 fn collapse_bracketed_links(body: &str) -> String {
     use std::sync::OnceLock;
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        // (?s) dot-matches-newline; anchor is any non-bracket chars (lazy),
-        // URL is http(s)://... without < > or whitespace.
+    static EMBEDDED: OnceLock<regex::Regex> = OnceLock::new();
+    static MARKDOWN: OnceLock<regex::Regex> = OnceLock::new();
+    let embedded = EMBEDDED.get_or_init(|| {
         regex::Regex::new(
             r"(?s)\[\s*([^\[\]]{1,200}?)\s*<(https?://[^<>\s]+)>\s*\]"
         ).unwrap()
     });
-    let mut out = String::with_capacity(body.len());
-    let mut last = 0;
-    for m in re.captures_iter(body) {
-        let whole = m.get(0).unwrap();
-        let anchor = m.get(1).map(|a| a.as_str().trim()).unwrap_or("");
-        let url = m.get(2).unwrap().as_str();
-        out.push_str(&body[last..whole.start()]);
-        // SGR underline inside the OSC 8 sequence so the visible anchor
-        // stands out as a link; terminals strip SGR on copy so the text
-        // the user yanks stays clean.
-        let visible = if anchor.is_empty() || anchor == url {
-            url.to_string()
-        } else {
-            // Collapse whitespace inside the anchor — the raw text often
-            // wraps across lines.
-            anchor.split_whitespace().collect::<Vec<_>>().join(" ")
-        };
-        out.push_str("\x1b]8;;");
-        out.push_str(url);
-        out.push_str("\x1b\\\x1b[4m");
-        out.push_str(&visible);
-        out.push_str("\x1b[24m\x1b]8;;\x1b\\");
-        last = whole.end();
-    }
-    out.push_str(&body[last..]);
-    out
+    let markdown = MARKDOWN.get_or_init(|| {
+        // [anchor](<url>) or [anchor](url). URL may not contain < > ( )
+        // or whitespace. Anchor is lazy and may contain anything except
+        // brackets so it can wrap across newlines.
+        regex::Regex::new(
+            r"(?s)\[\s*([^\[\]]{0,200}?)\s*\]\(\s*<?(https?://[^<>()\s]+)>?\s*\)"
+        ).unwrap()
+    });
+
+    let collapse = |src: &str, re: &regex::Regex| -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut last = 0;
+        for m in re.captures_iter(src) {
+            let whole = m.get(0).unwrap();
+            let anchor = m.get(1).map(|a| a.as_str().trim()).unwrap_or("");
+            let url = m.get(2).unwrap().as_str();
+            out.push_str(&src[last..whole.start()]);
+            let visible = if anchor.is_empty() || anchor == url {
+                url.to_string()
+            } else {
+                anchor.split_whitespace().collect::<Vec<_>>().join(" ")
+            };
+            out.push_str("\x1b]8;;");
+            out.push_str(url);
+            out.push_str("\x1b\\\x1b[4m");
+            out.push_str(&visible);
+            out.push_str("\x1b[24m\x1b]8;;\x1b\\");
+            last = whole.end();
+        }
+        out.push_str(&src[last..]);
+        out
+    };
+
+    // Apply embedded pattern first, then markdown. Both pass the same
+    // already-collapsed text to per-line URL linkification downstream.
+    let pass1 = collapse(body, embedded);
+    collapse(&pass1, markdown)
 }
 
 /// Wrap URLs in a line with OSC 8 hyperlink escapes so kitty keeps them
