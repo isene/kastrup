@@ -6283,22 +6283,22 @@ for part in msg.walk():
             return;
         }
 
-        self.set_feedback(&format!("Loading {} image(s)...", urls.len()), self.config.theme_colors.unread);
-
-        // Download to cache
+        // Download to cache. Local files (file://) and already-cached URLs
+        // are served instantly. Remote URLs go to a small thread pool so
+        // 10 images aren't a 10×timeout serial wait on the main loop.
         let cache_dir = home_dir().join(".heathrow/image_cache");
         let _ = std::fs::create_dir_all(&cache_dir);
 
+        // Pass 1: classify URLs (local / cached / needs-download).
         let mut paths: Vec<String> = Vec::new();
+        let mut to_fetch: Vec<(String, std::path::PathBuf)> = Vec::new();
         for url in urls.iter().take(10) {
-            // Local file (from MIME extraction)
             if let Some(local) = url.strip_prefix("file://") {
                 if std::path::Path::new(local).exists() {
                     paths.push(local.to_string());
                 }
                 continue;
             }
-
             let ext = url.rsplit('.').next()
                 .and_then(|e| {
                     let e = e.split('?').next().unwrap_or(e);
@@ -6307,24 +6307,53 @@ for part in msg.walk():
                 .unwrap_or("jpg");
             let hash = simple_hash(url);
             let cache_path = cache_dir.join(format!("{}.{}", hash, ext));
-
             if cache_path.exists() && std::fs::metadata(&cache_path).map(|m| m.len() > 100).unwrap_or(false) {
                 paths.push(cache_path.to_string_lossy().to_string());
                 continue;
             }
+            to_fetch.push((url.clone(), cache_path));
+        }
 
-            // Download
-            let agent = ureq::AgentBuilder::new()
-                .timeout_connect(std::time::Duration::from_secs(5))
-                .timeout_read(std::time::Duration::from_secs(10))
-                .build();
-            if let Ok(resp) = agent.get(url).call() {
-                let mut bytes = Vec::new();
-                if std::io::Read::read_to_end(&mut resp.into_reader(), &mut bytes).is_ok() && bytes.len() > 100 {
-                    let _ = std::fs::write(&cache_path, &bytes);
-                    paths.push(cache_path.to_string_lossy().to_string());
-                }
+        // Pass 2: parallel download. Cap parallelism at 4 (matches typical
+        // browser per-host connection limit and keeps memory + load sane).
+        if !to_fetch.is_empty() {
+            self.set_feedback(
+                &format!("Loading {} image(s)...", paths.len() + to_fetch.len()),
+                self.config.theme_colors.unread,
+            );
+            let workers = to_fetch.len().min(4);
+            let queue = std::sync::Arc::new(std::sync::Mutex::new(to_fetch));
+            let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                let q = queue.clone();
+                let r = results.clone();
+                handles.push(std::thread::spawn(move || {
+                    loop {
+                        let job = { q.lock().unwrap().pop() };
+                        let Some((url, cache_path)) = job else { break; };
+                        let agent = ureq::AgentBuilder::new()
+                            .timeout_connect(std::time::Duration::from_secs(5))
+                            .timeout_read(std::time::Duration::from_secs(10))
+                            .build();
+                        if let Ok(resp) = agent.get(&url).call() {
+                            let mut bytes = Vec::new();
+                            if std::io::Read::read_to_end(&mut resp.into_reader(), &mut bytes).is_ok()
+                                && bytes.len() > 100
+                            {
+                                let _ = std::fs::write(&cache_path, &bytes);
+                                r.lock().unwrap().push(cache_path.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                }));
             }
+            for h in handles { let _ = h.join(); }
+            let downloaded = std::mem::take(&mut *results.lock().unwrap());
+            paths.extend(downloaded);
+        } else if !paths.is_empty() {
+            self.set_feedback(&format!("Loading {} image(s)...", paths.len()),
+                              self.config.theme_colors.unread);
         }
 
         if paths.is_empty() {
@@ -6510,8 +6539,17 @@ for part in msg.walk():
         let cache_dir = home_dir().join(".heathrow/image_cache");
         let _ = std::fs::create_dir_all(&cache_dir);
 
+        // Pass 1: classify (local copy / cached copy / needs-download).
+        // Cached and local copies happen synchronously since they're just
+        // a copy() call.
         let mut saved = 0usize;
         let mut failed = 0usize;
+        struct Job {
+            url: String,
+            cache_path: std::path::PathBuf,
+            dest: std::path::PathBuf,
+        }
+        let mut jobs: Vec<Job> = Vec::new();
         for (i, url) in urls.iter().take(20).enumerate() {
             if let Some(local) = url.strip_prefix("file://") {
                 let src = std::path::Path::new(local);
@@ -6524,7 +6562,6 @@ for part in msg.walk():
                 }
                 continue;
             }
-
             let ext = url.rsplit('.').next()
                 .and_then(|e| {
                     let e = e.split('?').next().unwrap_or(e);
@@ -6539,28 +6576,52 @@ for part in msg.walk():
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("image_{}.{}", i + 1, ext));
             let dest = unique_path(&dest_path.join(&fname_from_url));
-
             let hash = simple_hash(url);
             let cache_path = cache_dir.join(format!("{}.{}", hash, ext));
             if cache_path.exists() && std::fs::metadata(&cache_path).map(|m| m.len() > 100).unwrap_or(false) {
                 if std::fs::copy(&cache_path, &dest).is_ok() { saved += 1; continue; }
             }
+            jobs.push(Job { url: url.clone(), cache_path, dest });
+        }
 
-            let agent = ureq::AgentBuilder::new()
-                .timeout_connect(std::time::Duration::from_secs(5))
-                .timeout_read(std::time::Duration::from_secs(15))
-                .build();
-            if let Ok(resp) = agent.get(url).call() {
-                let mut bytes = Vec::new();
-                if std::io::Read::read_to_end(&mut resp.into_reader(), &mut bytes).is_ok() && bytes.len() > 100 {
-                    if std::fs::write(&dest, &bytes).is_ok() {
-                        saved += 1;
-                        let _ = std::fs::write(&cache_path, &bytes);
-                        continue;
+        // Pass 2: parallel download (cap 4 concurrent).
+        if !jobs.is_empty() {
+            let workers = jobs.len().min(4);
+            let queue = std::sync::Arc::new(std::sync::Mutex::new(jobs));
+            let counts = std::sync::Arc::new(std::sync::Mutex::new((0usize, 0usize))); // (saved, failed)
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                let q = queue.clone();
+                let c = counts.clone();
+                handles.push(std::thread::spawn(move || {
+                    loop {
+                        let job = { q.lock().unwrap().pop() };
+                        let Some(Job { url, cache_path, dest }) = job else { break; };
+                        let agent = ureq::AgentBuilder::new()
+                            .timeout_connect(std::time::Duration::from_secs(5))
+                            .timeout_read(std::time::Duration::from_secs(15))
+                            .build();
+                        let mut ok = false;
+                        if let Ok(resp) = agent.get(&url).call() {
+                            let mut bytes = Vec::new();
+                            if std::io::Read::read_to_end(&mut resp.into_reader(), &mut bytes).is_ok()
+                                && bytes.len() > 100
+                            {
+                                if std::fs::write(&dest, &bytes).is_ok() {
+                                    let _ = std::fs::write(&cache_path, &bytes);
+                                    ok = true;
+                                }
+                            }
+                        }
+                        let mut g = c.lock().unwrap();
+                        if ok { g.0 += 1; } else { g.1 += 1; }
                     }
-                }
+                }));
             }
-            failed += 1;
+            for h in handles { let _ = h.join(); }
+            let g = counts.lock().unwrap();
+            saved += g.0;
+            failed += g.1;
         }
 
         let tc = self.config.theme_colors.clone();
