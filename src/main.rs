@@ -70,53 +70,133 @@ struct FolderEntry {
 fn collapse_bracketed_links(body: &str) -> String {
     use std::sync::OnceLock;
     static EMBEDDED: OnceLock<regex::Regex> = OnceLock::new();
-    static MARKDOWN: OnceLock<regex::Regex> = OnceLock::new();
+    static MD_ANGLE: OnceLock<regex::Regex> = OnceLock::new();
+    static MD_BARE: OnceLock<regex::Regex> = OnceLock::new();
     let embedded = EMBEDDED.get_or_init(|| {
         regex::Regex::new(
             r"(?s)\[\s*([^\[\]]{1,200}?)\s*<(https?://[^<>\s]+)>\s*\]"
         ).unwrap()
     });
-    let markdown = MARKDOWN.get_or_init(|| {
-        // [anchor](<url>) or [anchor](url). URL may not contain < > ( )
-        // or whitespace. Anchor is lazy and may contain anything except
-        // brackets so it can wrap across newlines.
+    // [label](<url>) — angle-bracketed URL form; allow whitespace inside since
+    // the `>)` terminator is unambiguous (real-world malformed mail-merge URLs
+    // sometimes embed personalisation text mid-URL).
+    let md_angle = MD_ANGLE.get_or_init(|| {
         regex::Regex::new(
-            r"(?s)\[\s*([^\[\]]{0,200}?)\s*\]\(\s*<?(https?://[^<>()\s]+)>?\s*\)"
+            r"(?s)\[\s*([^\[\]]{0,4000}?)\s*\]\(\s*<(https?://[^<>]{1,3000}?)>\s*\)"
+        ).unwrap()
+    });
+    // [label](url) — bare URL. No whitespace, no brackets, no parens.
+    let md_bare = MD_BARE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?s)\[\s*([^\[\]]{0,4000}?)\s*\]\(\s*(https?://[^<>()\s]+)\s*\)"
         ).unwrap()
     });
 
+    // Use private-use Unicode sentinels so subsequent regex passes don't see
+    // brackets inside the OSC-8 escape and can match outer wrappers around
+    // already-collapsed inner ones:
+    //   \u{E000}URL\u{E001}LABEL\u{E002}
+    // Sentinels are replaced with real OSC-8 escapes after all passes.
+    fn anchor_visible(anchor: &str) -> String {
+        // Strip inner sentinel blocks down to just their LABEL so a wrapping
+        // [outer](url) takes the inner button's text as its visible label.
+        let mut out = String::with_capacity(anchor.len());
+        let mut chars = anchor.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{E000}' {
+                for c in chars.by_ref() { if c == '\u{E001}' { break; } }
+                for c in chars.by_ref() {
+                    if c == '\u{E002}' { break; }
+                    out.push(c);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
     let collapse = |src: &str, re: &regex::Regex| -> String {
         let mut out = String::with_capacity(src.len());
         let mut last = 0;
         for m in re.captures_iter(src) {
             let whole = m.get(0).unwrap();
-            let anchor = m.get(1).map(|a| a.as_str().trim()).unwrap_or("");
-            let url = m.get(2).unwrap().as_str();
+            let anchor_raw = m.get(1).map(|a| a.as_str()).unwrap_or("");
+            let url_raw = m.get(2).unwrap().as_str();
+            // Strip whitespace embedded mid-URL (mailmerge text injection).
+            let url: String = url_raw.split_whitespace().collect();
             out.push_str(&src[last..whole.start()]);
-            let visible = if anchor.is_empty() || anchor == url {
-                url.to_string()
+            let anchor_vis = anchor_visible(anchor_raw);
+            let anchor_clean = anchor_vis.trim();
+            let visible = if anchor_clean.is_empty() || anchor_clean == url {
+                if url.len() > 60 { shorten_url_label(&url) } else { url.clone() }
             } else {
-                anchor.split_whitespace().collect::<Vec<_>>().join(" ")
+                anchor_clean.split_whitespace().collect::<Vec<_>>().join(" ")
             };
-            out.push_str("\x1b]8;;");
-            out.push_str(url);
-            out.push_str("\x1b\\\x1b[4m");
+            out.push('\u{E000}');
+            out.push_str(&url);
+            out.push('\u{E001}');
             out.push_str(&visible);
-            out.push_str("\x1b[24m\x1b]8;;\x1b\\");
+            out.push('\u{E002}');
             last = whole.end();
         }
         out.push_str(&src[last..]);
         out
     };
 
-    // Apply embedded pattern first, then markdown. Both pass the same
-    // already-collapsed text to per-line URL linkification downstream.
-    let pass1 = collapse(body, embedded);
-    collapse(&pass1, markdown)
+    let mut cur = collapse(body, embedded);
+    // Iterate angle-form pass: outer wrappers around inner collapsed sentinels.
+    for _ in 0..4 {
+        let next = collapse(&cur, md_angle);
+        if next == cur { break; }
+        cur = next;
+    }
+    cur = collapse(&cur, md_bare);
+
+    // Restore sentinels into real OSC-8 escapes.
+    let mut out = String::with_capacity(cur.len());
+    let mut chars = cur.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{E000}' {
+            let mut url = String::new();
+            for c in chars.by_ref() {
+                if c == '\u{E001}' { break; }
+                url.push(c);
+            }
+            let mut visible = String::new();
+            for c in chars.by_ref() {
+                if c == '\u{E002}' { break; }
+                visible.push(c);
+            }
+            out.push_str("\x1b]8;;");
+            out.push_str(&url);
+            out.push_str("\x1b\\\x1b[4m");
+            out.push_str(&visible);
+            out.push_str("\x1b[24m\x1b]8;;\x1b\\");
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Shorten a URL for display: `host` or `host/…` so the visible label
+/// stays on a single pane line. Glass scans OSC 8 link spans cell-by-cell
+/// and only the cells on the URL's first wrapped row register as clickable;
+/// keeping the visible text short keeps the entire link on one row.
+fn shorten_url_label(url: &str) -> String {
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let (host, rest) = match after_scheme.split_once('/') {
+        Some((h, r)) => (h, r),
+        None => (after_scheme, ""),
+    };
+    if rest.is_empty() { host.to_string() } else { format!("{}/…", host) }
 }
 
 /// Wrap URLs in a line with OSC 8 hyperlink escapes so kitty keeps them
 /// clickable even when the visible text wraps across multiple pane lines.
+/// Skips regions already inside an OSC-8 escape (from collapse_bracketed_links)
+/// to avoid nesting OSC-8 inside OSC-8 — kitty consumes nested escapes
+/// greedily and eats following visible text.
 fn hyperlink_urls(line: &str) -> String {
     use std::sync::OnceLock;
     static URL_RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -124,21 +204,67 @@ fn hyperlink_urls(line: &str) -> String {
         regex::Regex::new(r#"https?://[^\s<>()\[\]{}\x00-\x1f\x7f]+[^\s<>()\[\]{}\x00-\x1f\x7f.,;:!?'"]"#)
             .unwrap()
     });
+    let bytes = line.as_bytes();
     let mut out = String::with_capacity(line.len());
-    let mut last = 0;
-    for m in re.find_iter(line) {
-        out.push_str(&line[last..m.start()]);
-        let url = m.as_str();
-        // OSC 8 link with SGR underline around the visible text so users
-        // can see where links are; SGR 24 turns underline off after.
-        out.push_str("\x1b]8;;");
-        out.push_str(url);
-        out.push_str("\x1b\\\x1b[4m");
-        out.push_str(url);
-        out.push_str("\x1b[24m\x1b]8;;\x1b\\");
-        last = m.end();
+    let mut i = 0;
+    let is_osc8_open = |b: &[u8], pos: usize| -> bool {
+        pos + 4 < b.len() && b[pos] == 0x1b && b[pos+1] == b']'
+            && b[pos+2] == b'8' && b[pos+3] == b';' && b[pos+4] == b';'
+    };
+    let find_st = |b: &[u8], from: usize| -> Option<usize> {
+        let mut p = from;
+        while p + 1 < b.len() {
+            if b[p] == 0x1b && b[p+1] == b'\\' { return Some(p); }
+            p += 1;
+        }
+        None
+    };
+    while i < bytes.len() {
+        if is_osc8_open(bytes, i) {
+            // Skip OPEN: \x1b]8;;URL\x1b\\
+            let open_st = match find_st(bytes, i + 5) { Some(p) => p, None => break };
+            let after_open = open_st + 2;
+            // Find CLOSE: \x1b]8;; immediately followed by \x1b\\
+            let mut p = after_open;
+            let mut close_at = None;
+            while p < bytes.len() {
+                if is_osc8_open(bytes, p) && p + 6 < bytes.len()
+                    && bytes[p+5] == 0x1b && bytes[p+6] == b'\\' {
+                    close_at = Some(p);
+                    break;
+                }
+                p += 1;
+            }
+            let close_end = match close_at { Some(p) => p + 7, None => bytes.len() };
+            out.push_str(std::str::from_utf8(&bytes[i..close_end]).unwrap_or(""));
+            i = close_end;
+            continue;
+        }
+        // Not in OSC-8: scan ahead until next OSC-8 open or end of line.
+        let mut chunk_end = i;
+        while chunk_end < bytes.len() && !is_osc8_open(bytes, chunk_end) {
+            chunk_end += 1;
+        }
+        let chunk = std::str::from_utf8(&bytes[i..chunk_end]).unwrap_or("");
+        let mut last = 0;
+        for m in re.find_iter(chunk) {
+            out.push_str(&chunk[last..m.start()]);
+            let url = m.as_str();
+            // Shorten visible label for long URLs so the link stays on one
+            // wrapped pane row (glass clickability requires single-row span).
+            let label = if url.len() > 60 { shorten_url_label(url) } else { url.to_string() };
+            // OSC 8 link with SGR underline around the visible text so users
+            // can see where links are; SGR 24 turns underline off after.
+            out.push_str("\x1b]8;;");
+            out.push_str(url);
+            out.push_str("\x1b\\\x1b[4m");
+            out.push_str(&label);
+            out.push_str("\x1b[24m\x1b]8;;\x1b\\");
+            last = m.end();
+        }
+        out.push_str(&chunk[last..]);
+        i = chunk_end;
     }
-    out.push_str(&line[last..]);
     out
 }
 
@@ -346,6 +472,7 @@ fn main() {
     }
 
     Crust::init();
+    Crust::set_app_identity("Kastrup");
     let (cols, rows) = Crust::terminal_size();
 
     let config = Config::load();
