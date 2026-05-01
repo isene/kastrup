@@ -5445,7 +5445,13 @@ impl App {
 
         // Build full command string and pass through sh -c to handle quoted args properly
         let escaped_file = crust::shell_escape(&tmpfile);
-        let cmd_str = if editor.contains("vim") || editor.contains("vi") {
+        // vim, vi, and scribe (Fe2O3 modal editor) all accept `+N` as the
+        // open-at-line argument. Other editors get the bare invocation.
+        let editor_short = std::path::Path::new(&editor).file_name()
+            .and_then(|s| s.to_str()).unwrap_or(&editor);
+        let supports_plus = editor_short == "vim" || editor_short == "vi"
+            || editor_short == "nvim" || editor_short == "scribe";
+        let cmd_str = if supports_plus {
             format!("{} +{} {} {}", editor, cursor_line, editor_args, escaped_file)
         } else {
             format!("{} {} {}", editor, editor_args, escaped_file)
