@@ -192,6 +192,47 @@ fn shorten_url_label(url: &str) -> String {
     if rest.is_empty() { host.to_string() } else { format!("{}/…", host) }
 }
 
+/// Pre-color email addresses with `\x1b[38;5;177m...{restore}` so they show
+/// in light purple regardless of the surrounding block color (sig / quote
+/// level / header). Mirrors scribe's email-mode tokenizer for 1-for-1
+/// visual parity between scribe-compose and kastrup right-pane.
+///
+/// `outer_fg = Some(c)` restores fg to color c after the email span (used
+/// when the line will be wrapped in an outer color); `None` restores to
+/// the terminal's default fg via SGR 39 (used for plain body lines).
+///
+/// Run on the raw line BEFORE `hyperlink_urls`. The URL regex stops at
+/// `\x1b` (control char) so the inserted color escapes don't perturb the
+/// subsequent URL pass.
+fn color_emails(line: &str, outer_fg: Option<u8>) -> String {
+    use std::sync::OnceLock;
+    static EMAIL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = EMAIL_RE.get_or_init(|| regex::Regex::new(
+        r#"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"#
+    ).unwrap());
+    let restore: String = match outer_fg {
+        Some(c) => format!("\x1b[38;5;{}m", c),
+        None    => "\x1b[39m".to_string(),
+    };
+    re.replace_all(line, |caps: &regex::Captures| {
+        format!("\x1b[38;5;177m{}{}", &caps[0], restore)
+    }).into_owned()
+}
+
+/// Build a header row with KEY bold and VALUE non-bold (mirrors scribe's
+/// `HeaderBold` style). Both share the same fg color. Inline email
+/// addresses inside the value are colored 177 with the outer color
+/// restored after.
+fn header_row(key: &str, value: &str, color: u8) -> String {
+    let val_styled = color_emails(value, Some(color));
+    format!(
+        "{} \x1b[38;5;{}m{}\x1b[39m",
+        style::bold(&style::fg(key, color)),
+        color,
+        val_styled
+    )
+}
+
 /// Wrap URLs in a line with OSC 8 hyperlink escapes so kitty keeps them
 /// clickable even when the visible text wraps across multiple pane lines.
 /// Skips regions already inside an OSC-8 escape (from collapse_bracketed_links)
@@ -594,7 +635,17 @@ fn main() {
     app.poller = Some(poller);
     app.poller_rx = Some(poller_rx);
 
-    // Load initial view
+    // Render-first, scrape-later: paint chrome (panes, borders, top/bottom
+    // bars) into the alt-screen with whatever's in memory so the user sees a
+    // populated UI instantly. Then run the heavier switch_to_view (DB query
+    // for filtered_messages) and re-render. On a cold start with thousands
+    // of messages this turns a noticeable startup pause into two paints
+    // separated by a few ms — the first one looks like instant boot.
+    if app.left.border { app.left.border_refresh(); }
+    if app.right.border { app.right.border_refresh(); }
+    app.render_all();
+
+    // Load initial view (heavy DB query) — then repaint with real data.
     let default_view = app.config.default_view.clone();
     app.switch_to_view(&default_view);
     app.render_all();
@@ -1173,37 +1224,29 @@ impl App {
         let stype = &msg.source_type;
         let (icon, scolor) = source_info(stype, &self.config.theme_colors);
 
-        // Sender (15 chars max)
+        // Sender column: 12 chars, plus a 1-char per-sender avatar in front
+        // (own deterministic color). 12 + 1 (gap) + 1 (avatar) + 1 (gap) =
+        // same 15-cell budget as the previous bare-sender layout.
         let sender_display = msg.sender_name.as_deref().unwrap_or(&msg.sender);
-        let sender_truncated = truncate_str(sender_display, 14);
-        let sender_padded = format!("{:<14} ", sender_truncated); // 14 chars + always 1 space gap
+        let sender_truncated = truncate_str(sender_display, 12);
+        let sender_padded = format!("{:<12} ", sender_truncated);
 
         // Subject fills remaining width (decode RFC 2047 encoded-words)
         let raw_subject = msg.subject.as_deref().unwrap_or("");
         let subject = sources::maildir::decode_rfc2047(raw_subject);
         // Calculate available width for subject
-        // "N r I DDDDDD i sender          subject"
-        // 1+1+1+1+6+1+1+1+15+1 = 29 fixed chars
+        // "N r I DDDDDD i a sender        subject"
+        // 1+1+1+1+6+1+1+1+1+1+12+1 = 29 fixed chars (same as before; avatar
+        // takes 1 + gap from sender column).
         let fixed = 29;
         let subj_w = pane_w.saturating_sub(fixed);
         let subject_truncated = truncate_str(&subject, subj_w);
 
         let flags = format!("{}{}{}", nflag, rflag, ind);
 
-        // Build content as PLAIN text (no ANSI), color applied in styling step below
-        let content = format!("{} {} {}{}", date_padded, icon, sender_padded, subject_truncated);
-
-        // Pad to full width
-        let flags_w = crust::display_width(&flags);
-        let content_w = crust::display_width(&content);
-        let padding = if pane_w > flags_w + content_w + 1 {
-            " ".repeat(pane_w - flags_w - content_w - 1)
-        } else {
-            String::new()
-        };
-        let full_content = format!("{}{}", content, padding);
-
-        // Apply styling: single color on the full content (no nested ANSI)
+        // Compute outer color first so we can splice the avatar's own color
+        // inline and then re-open the outer color afterward (an inner SGR
+        // close would otherwise reset to default fg for the rest of the line).
         let color = if self.delete_marked.contains(&msg.id) {
             self.config.theme_colors.delete_mark
         } else if self.tagged.contains(&msg.id) {
@@ -1213,6 +1256,27 @@ impl App {
         } else {
             scolor
         };
+
+        // Per-sender avatar: 1 colored char between source icon and sender.
+        let (avatar_ch, avatar_color) = sender_avatar(&msg.sender, msg.sender_name.as_deref());
+        let avatar_inline = format!(
+            "\x1b[38;5;{}m{}\x1b[38;5;{}m",
+            avatar_color, avatar_ch, color
+        );
+
+        // Build content. avatar_inline carries its own ANSI; everything
+        // else is plain text and gets colored by the outer style::fg below.
+        let content = format!("{} {} {} {}{}", date_padded, icon, avatar_inline, sender_padded, subject_truncated);
+
+        // Pad to full width — display_width strips ANSI before measuring.
+        let flags_w = crust::display_width(&flags);
+        let content_w = crust::display_width(&content);
+        let padding = if pane_w > flags_w + content_w + 1 {
+            " ".repeat(pane_w - flags_w - content_w - 1)
+        } else {
+            String::new()
+        };
+        let full_content = format!("{}{}", content, padding);
 
         if selected {
             format!("{}{}{}", flags, style::underline(&style::bold(&style::fg(&content, color))), style::bold(&style::fg(&padding, color)))
@@ -1377,47 +1441,48 @@ impl App {
 
         let mut lines = Vec::new();
 
-        // From
+        // Headers — use header_row helper: KEY bold, VALUE non-bold, both
+        // in the same color, with inline email addresses colored 177. This
+        // matches scribe's email-mode rendering exactly so reading mail in
+        // kastrup and composing in scribe produces visually identical text.
         let from_display = match &msg.sender_name {
             Some(name) => format!("{} <{}>", name, msg.sender),
             None => msg.sender.clone(),
         };
-        lines.push(format!("{} {}", style::fg("From:", tc.header_from), style::fg(&from_display, tc.header_from)));
+        lines.push(header_row("From:", &from_display, tc.header_from));
 
-        // To (parse JSON recipients)
         let to_display = parse_json_recipients(&msg.recipients);
         if !to_display.is_empty() {
-            lines.push(format!("{} {}", style::fg("To:", tc.header_from), style::fg(&to_display, tc.header_from)));
+            lines.push(header_row("To:", &to_display, tc.header_from));
         }
 
-        // Cc (parse JSON, skip if empty)
         if let Some(ref cc) = msg.cc {
             let cc_display = parse_json_recipients(cc);
             if !cc_display.is_empty() {
-                lines.push(format!("{} {}", style::fg("Cc:", tc.header_from), style::fg(&cc_display, tc.header_from)));
+                lines.push(header_row("Cc:", &cc_display, tc.header_from));
             }
         }
 
-        // Subject
         if let Some(ref subj) = msg.subject {
             let decoded_subj = sources::maildir::decode_rfc2047(subj);
-            lines.push(format!("{} {}", style::bold(&style::fg("Subject:", tc.header_subj)), style::bold(&style::fg(&decoded_subj, tc.header_subj))));
+            lines.push(header_row("Subject:", &decoded_subj, tc.header_subj));
         }
 
-        // Date
         let full_date = format_timestamp(msg.timestamp, "%Y-%m-%d %H:%M");
-        lines.push(format!("{} {}", style::fg("Date:", tc.header_date), style::fg(&full_date, tc.header_date)));
+        lines.push(header_row("Date:", &full_date, tc.header_date));
 
-        // Type
-        lines.push(format!("{} {}", style::fg("Type:", tc.header_date), style::fg(&msg.source_type, scolor)));
+        // Type — value uses source-specific color; build manually since the
+        // VALUE differs from the KEY color (header_row assumes one color).
+        lines.push(format!("{} {}",
+            style::bold(&style::fg("Type:", tc.header_date)),
+            style::fg(&msg.source_type, scolor)));
 
-        // Labels
         if !msg.labels.is_empty() {
             let label_str = msg.labels.iter()
                 .map(|l| format!("[{}]", l))
                 .collect::<Vec<_>>()
                 .join(" ");
-            lines.push(format!("{} {}", style::fg("Labels:", tc.header_label), style::fg(&label_str, tc.header_label)));
+            lines.push(header_row("Labels:", &label_str, tc.header_label));
         }
 
         // Separator
@@ -1591,19 +1656,29 @@ impl App {
             if line.starts_with("-- ") || line == "--" {
                 in_signature = true;
             }
-            let linked = hyperlink_urls(line);
-            if in_signature {
-                lines.push(style::fg(&linked, self.config.theme_colors.sig));
+            // Determine the outer block color first so color_emails can
+            // restore it after each email-address span.
+            let outer = if in_signature {
+                Some(self.config.theme_colors.sig)
             } else if line.starts_with(">>>>") {
-                lines.push(style::fg(&linked, self.config.theme_colors.quote4));
+                Some(self.config.theme_colors.quote4)
             } else if line.starts_with(">>>") {
-                lines.push(style::fg(&linked, self.config.theme_colors.quote3));
+                Some(self.config.theme_colors.quote3)
             } else if line.starts_with(">>") {
-                lines.push(style::fg(&linked, self.config.theme_colors.quote2));
+                Some(self.config.theme_colors.quote2)
             } else if line.starts_with('>') {
-                lines.push(style::fg(&linked, self.config.theme_colors.quote1));
+                Some(self.config.theme_colors.quote1)
             } else {
-                lines.push(linked);
+                None
+            };
+            // Apply email coloring (177 with restore-to-outer) before
+            // hyperlink_urls so the URL pass — which also stops at \x1b
+            // bytes — doesn't span across the email's color escapes.
+            let with_emails = color_emails(line, outer);
+            let linked = hyperlink_urls(&with_emails);
+            match outer {
+                Some(c) => lines.push(style::fg(&linked, c)),
+                None    => lines.push(linked),
             }
         }
 
@@ -3353,15 +3428,30 @@ impl App {
 
     fn handle_resize(&mut self) {
         let (cols, rows) = Crust::terminal_size();
-        self.cols = cols;
-        self.rows = rows;
-        let (top, left, right, bottom) = create_panes(cols, rows, self.width, self.border, &self.config);
-        self.top = top;
-        self.left = left;
-        self.right = right;
-        self.bottom = bottom;
-        // Restore per-view top bar bg color
-        self.restore_view_top_bg();
+        // Pane recreation discards prev_frame and forces a full repaint of
+        // every cell on the next render — only do it when the terminal really
+        // resized. The post-editor return path used to drop ~50ms here for no
+        // reason because the size hadn't actually changed.
+        if cols != self.cols || rows != self.rows {
+            self.cols = cols;
+            self.rows = rows;
+            let (top, left, right, bottom) = create_panes(cols, rows, self.width, self.border, &self.config);
+            self.top = top;
+            self.left = left;
+            self.right = right;
+            self.bottom = bottom;
+            self.restore_view_top_bg();
+        } else {
+            // Size unchanged: panes kept their prev_frame from before the
+            // screen wipe. Without invalidating, the next `say()` diff-render
+            // sees "no change" and writes nothing — top/bottom bars stay
+            // invisible until something else triggers a re-render. Mark all
+            // panes stale so render_all repaints fully.
+            self.top.invalidate();
+            self.left.invalidate();
+            self.right.invalidate();
+            self.bottom.invalidate();
+        }
         Crust::clear_screen();
         // clear_screen wipes the pane borders too; redraw them before content
         // so the right pane border isn't missing after compose / external editor.
@@ -4441,9 +4531,10 @@ impl App {
             .arg(format!("{} {}", editor, crust::shell_escape(&tmpfile)))
             .status();
         Crust::init();
-        Crust::clear_screen();
+        // handle_resize() does clear_screen + create_panes (if size changed) +
+        // render_all in one pass — no need for the duplicate clear / render_all
+        // we used to do, which doubled the post-editor repaint cost.
         self.handle_resize();
-        self.render_all();
         let body = std::fs::read_to_string(&tmpfile).ok()?.trim_end().to_string();
         let _ = std::fs::remove_file(&tmpfile);
         if body.is_empty() { None } else { Some(body) }
@@ -5449,12 +5540,16 @@ impl App {
         // open-at-line argument. Other editors get the bare invocation.
         let editor_short = std::path::Path::new(&editor).file_name()
             .and_then(|s| s.to_str()).unwrap_or(&editor);
-        let supports_plus = editor_short == "vim" || editor_short == "vi"
-            || editor_short == "nvim" || editor_short == "scribe";
+        let is_vim_family = editor_short == "vim" || editor_short == "vi" || editor_short == "nvim";
+        let supports_plus = is_vim_family || editor_short == "scribe";
+        // editor_args (e.g. `-c "set ft=mail"`) is vim-syntax. Don't pass it
+        // to non-vim editors — scribe reads `-c` as a filename. Strip args
+        // for the editor family that doesn't understand them.
+        let args = if is_vim_family { editor_args.as_str() } else { "" };
         let cmd_str = if supports_plus {
-            format!("{} +{} {} {}", editor, cursor_line, editor_args, escaped_file)
+            format!("{} +{} {} {}", editor, cursor_line, args, escaped_file)
         } else {
-            format!("{} {} {}", editor, editor_args, escaped_file)
+            format!("{} {} {}", editor, args, escaped_file)
         };
         let status = std::process::Command::new("sh")
             .arg("-c")
@@ -5462,15 +5557,16 @@ impl App {
             .status();
 
         Crust::init();
-        Crust::clear_screen();
+        // No explicit clear_screen here: handle_resize() below clears + redraws
+        // in one go, and skipping the duplicate avoids ~30-50ms of redundant
+        // clear+repaint when the user lands back from the editor.
 
         if let Ok(s) = status {
             if s.success() {
                 if let Ok(content) = std::fs::read_to_string(&tmpfile) {
                     if content.trim() != template.trim() {
                         let tc = self.config.theme_colors.clone();
-                        self.handle_resize();
-                        self.render_all(); // redraw full UI before address picker
+                        self.handle_resize(); // single redraw; render_all is inside
 
                         // Expand addresses in the composed content
                         let mut final_content = content.clone();
@@ -8564,6 +8660,35 @@ fn truncate_str(s: &str, max: usize) -> String {
         let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{}\u{2026}", truncated)
     }
+}
+
+/// Per-sender ASCII avatar: a single uppercase initial in a deterministic
+/// color drawn from a curated palette. `sender` is the canonical key (so
+/// `g@isene.com` always gets the same color regardless of `sender_name`
+/// variations across messages). The initial prefers `sender_name`'s first
+/// letter when present (display name people will recognise) and falls back
+/// to the email user-part.
+fn sender_avatar(sender: &str, sender_name: Option<&str>) -> (char, u8) {
+    let initial = sender_name
+        .and_then(|n| n.trim().chars().next())
+        .or_else(|| sender.split('@').next().and_then(|u| u.chars().next()))
+        .unwrap_or('?')
+        .to_ascii_uppercase();
+    // FNV-1a 64-bit on the lowercased email so capitalisation drift across
+    // mailers doesn't shuffle a contact's color from message to message.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in sender.to_ascii_lowercase().bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    // 32 visually-distinct bright 256-color indices. No dim/gray/very-dark
+    // entries — the avatar must be readable on the pane bg.
+    const PALETTE: [u8; 32] = [
+        9, 10, 11, 12, 13, 14, 33, 39, 45, 51, 75, 81, 87, 99, 105, 111,
+        117, 141, 147, 159, 165, 171, 177, 183, 189, 201, 207, 213, 219, 225, 226, 220,
+    ];
+    let color = PALETTE[(h as usize) % PALETTE.len()];
+    (initial, color)
 }
 
 /// Parse a JSON array string like `["a@b.com","c@d.com"]` into a comma-separated display string.
