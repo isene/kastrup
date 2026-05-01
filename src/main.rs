@@ -414,6 +414,12 @@ struct App {
 
     showing_image: bool,
     right_pane_msg_id: Option<i64>,
+    /// Cached rendered body for the most-recent message rendered in the
+    /// right pane. Re-rendering the SAME message (cursor bounce, resize,
+    /// return-from-editor) reuses this instead of re-running the full
+    /// MIME → html_to_text → collapse → linkify pipeline. Invalidated
+    /// when msg.id or msg.content hash changes.
+    body_cache: Option<(i64, u64, String)>,
     pending_forward_ids: Vec<i64>,
     pending_forward_attachments: Vec<String>,
     pending_reply_id: Option<i64>,
@@ -553,6 +559,7 @@ fn main() {
         feedback_expires: None,
         showing_image: false,
         right_pane_msg_id: None,
+            body_cache: None,
         pending_forward_ids: Vec::new(),
         pending_forward_attachments: Vec::new(),
         pending_reply_id: None,
@@ -1345,6 +1352,29 @@ impl App {
         let tc = &self.config.theme_colors;
         let (_, scolor) = source_info(&msg.source_type, tc);
 
+        // Body-render cache: re-rendering the same message (cursor bounce,
+        // resize, return-from-editor) reuses the pre-styled lines instead
+        // of running the full MIME → html_to_text → collapse → linkify
+        // pipeline again. Fingerprint = content + html_content lengths;
+        // changes if either body grew/shrank (which is what happens on
+        // full-content lazy-load).
+        let content_fp = (msg.content.len() as u64)
+            ^ ((msg.html_content.as_ref().map_or(0, |h| h.len()) as u64) << 32);
+        let cache_key = (msg.id, content_fp);
+        let current_id = Some(msg.id);
+        let msg_changed = current_id != self.right_pane_msg_id;
+        if !msg_changed && msg.id != 0 {
+            if let Some((cid, cfp, ref text)) = self.body_cache {
+                if (cid, cfp) == cache_key {
+                    // Cache hit — reuse rendered text; skip the heavy pipeline.
+                    self.right.set_text(text);
+                    self.right.full_refresh();
+                    if self.right.border { self.right.border_refresh(); }
+                    return;
+                }
+            }
+        }
+
         let mut lines = Vec::new();
 
         // From
@@ -1577,12 +1607,17 @@ impl App {
             }
         }
 
-        // Only reset scroll when viewing a different message
-        let current_id = self.filtered_messages.get(self.index).map(|m| m.id);
-        let msg_changed = current_id != self.right_pane_msg_id;
+        // Reset scroll only when viewing a different message; reuse the
+        // earlier-computed `current_id`/`msg_changed` so we don't recompute
+        // — we already need them for the body cache below.
         self.right_pane_msg_id = current_id;
 
-        self.right.set_text(&lines.join("\n"));
+        let rendered = lines.join("\n");
+        // Stash for next render of the same message + content fingerprint.
+        if msg.id != 0 {
+            self.body_cache = Some((cache_key.0, cache_key.1, rendered.clone()));
+        }
+        self.right.set_text(&rendered);
         if msg_changed {
             self.right.ix = 0;
             self.right.full_refresh();
@@ -2754,32 +2789,55 @@ impl App {
         let current_id = self.filtered_messages.get(self.index).map(|m| m.id);
 
         let ids: Vec<i64> = self.delete_marked.iter().copied().collect();
+        let id_set: std::collections::HashSet<i64> = ids.iter().copied().collect();
 
-        // Delete maildir files from disk
+        // Pre-build id→msg lookup so the per-id scan is O(1) instead of O(N).
+        // For 14 deletes × 20 000 messages this drops 280 K compares to a
+        // single linear scan + HashMap lookups.
+        let mut id_to_msg: std::collections::HashMap<i64, &Message> =
+            std::collections::HashMap::with_capacity(ids.len());
+        for m in &self.filtered_messages {
+            if id_set.contains(&m.id) { id_to_msg.insert(m.id, m); }
+        }
+
+        // Cache `read_dir` results per parent directory. The slow path
+        // (filename's flag suffix changed since metadata was captured)
+        // previously walked the entire maildir per ID. Now: at most one
+        // scan per unique directory across the whole purge, and entries
+        // are looked up by base-name in a HashMap.
+        let mut dir_cache: std::collections::HashMap<
+            std::path::PathBuf,
+            std::collections::HashMap<String, std::path::PathBuf>,
+        > = std::collections::HashMap::new();
+
         for &id in &ids {
-            if let Some(msg) = self.filtered_messages.iter().find(|m| m.id == id) {
-                if let Some(file) = msg.metadata.get("maildir_file").and_then(|v| v.as_str()) {
-                    let path = std::path::Path::new(file);
-                    if path.exists() {
-                        let _ = std::fs::remove_file(path);
-                    } else if let Some(dir) = path.parent() {
-                        // Filename may have changed (flag suffix). Find by base name.
-                        let base = path.file_name().and_then(|f| f.to_str())
-                            .and_then(|f| f.split(":2,").next())
-                            .unwrap_or("");
-                        if !base.is_empty() {
-                            if let Ok(entries) = std::fs::read_dir(dir) {
-                                for entry in entries.flatten() {
-                                    let name = entry.file_name();
-                                    if name.to_str().map(|n| n.starts_with(base)).unwrap_or(false) {
-                                        let _ = std::fs::remove_file(entry.path());
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+            let Some(msg) = id_to_msg.get(&id) else { continue };
+            let Some(file) = msg.metadata.get("maildir_file").and_then(|v| v.as_str()) else { continue };
+            let path = std::path::Path::new(file);
+            if path.exists() {
+                let _ = std::fs::remove_file(path);
+                continue;
+            }
+            let Some(dir) = path.parent() else { continue };
+            let base = match path.file_name().and_then(|f| f.to_str())
+                .and_then(|f| f.split(":2,").next()) {
+                Some(b) if !b.is_empty() => b.to_string(),
+                _ => continue,
+            };
+            let dir_buf = dir.to_path_buf();
+            let by_base = dir_cache.entry(dir_buf.clone()).or_insert_with(|| {
+                let mut m = std::collections::HashMap::new();
+                if let Ok(entries) = std::fs::read_dir(&dir_buf) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        let b = name.split(":2,").next().unwrap_or(&name).to_string();
+                        m.insert(b, entry.path());
                     }
                 }
+                m
+            });
+            if let Some(p) = by_base.get(&base) {
+                let _ = std::fs::remove_file(p);
             }
         }
 
