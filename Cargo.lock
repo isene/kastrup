@@ -148,6 +148,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fe2o3-highlight"
+version = "0.1.0"
+dependencies = [
+ "fe2o3-crust",
+ "regex",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -328,10 +336,11 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "kastrup"
-version = "0.1.72"
+version = "0.1.74"
 dependencies = [
  "fe2o3-crust",
  "fe2o3-glow",
+ "fe2o3-highlight",
  "libc",
  "regex",
  "rusqlite",

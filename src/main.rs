@@ -192,39 +192,16 @@ fn shorten_url_label(url: &str) -> String {
     if rest.is_empty() { host.to_string() } else { format!("{}/…", host) }
 }
 
-/// Pre-color email addresses with `\x1b[38;5;177m...{restore}` so they show
-/// in light purple regardless of the surrounding block color (sig / quote
-/// level / header). Mirrors scribe's email-mode tokenizer for 1-for-1
-/// visual parity between scribe-compose and kastrup right-pane.
-///
-/// `outer_fg = Some(c)` restores fg to color c after the email span (used
-/// when the line will be wrapped in an outer color); `None` restores to
-/// the terminal's default fg via SGR 39 (used for plain body lines).
-///
-/// Run on the raw line BEFORE `hyperlink_urls`. The URL regex stops at
-/// `\x1b` (control char) so the inserted color escapes don't perturb the
-/// subsequent URL pass.
-fn color_emails(line: &str, outer_fg: Option<u8>) -> String {
-    use std::sync::OnceLock;
-    static EMAIL_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = EMAIL_RE.get_or_init(|| regex::Regex::new(
-        r#"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"#
-    ).unwrap());
-    let restore: String = match outer_fg {
-        Some(c) => format!("\x1b[38;5;{}m", c),
-        None    => "\x1b[39m".to_string(),
-    };
-    re.replace_all(line, |caps: &regex::Captures| {
-        format!("\x1b[38;5;177m{}{}", &caps[0], restore)
-    }).into_owned()
-}
+// color_emails moved to the shared `highlight` crate (highlight::email).
+// Kastrup, scribe, and any future consumer share the exact same email
+// tokenization so their output is byte-for-byte identical.
 
 /// Build a header row with KEY bold and VALUE non-bold (mirrors scribe's
 /// `HeaderBold` style). Both share the same fg color. Inline email
 /// addresses inside the value are colored 177 with the outer color
 /// restored after.
 fn header_row(key: &str, value: &str, color: u8) -> String {
-    let val_styled = color_emails(value, Some(color));
+    let val_styled = highlight::color_emails(value, Some(color));
     format!(
         "{} \x1b[38;5;{}m{}\x1b[39m",
         style::bold(&style::fg(key, color)),
@@ -1674,7 +1651,7 @@ impl App {
             // Apply email coloring (177 with restore-to-outer) before
             // hyperlink_urls so the URL pass — which also stops at \x1b
             // bytes — doesn't span across the email's color escapes.
-            let with_emails = color_emails(line, outer);
+            let with_emails = highlight::color_emails(line, outer);
             let linked = hyperlink_urls(&with_emails);
             match outer {
                 Some(c) => lines.push(style::fg(&linked, c)),
@@ -3242,27 +3219,21 @@ impl App {
         self.width = if self.width >= 6 { 1 } else { self.width + 1 };
         self.config.pane_width = self.width;
         self.config.save();
-        self.handle_resize();
-        if self.left.border { self.left.border_refresh(); }
-        if self.right.border { self.right.border_refresh(); }
+        self.rebuild_panes();
     }
 
     fn cycle_width_reverse(&mut self) {
         self.width = if self.width <= 1 { 6 } else { self.width - 1 };
         self.config.pane_width = self.width;
         self.config.save();
-        self.handle_resize();
-        if self.left.border { self.left.border_refresh(); }
-        if self.right.border { self.right.border_refresh(); }
+        self.rebuild_panes();
     }
 
     fn cycle_border(&mut self) {
         self.border = (self.border + 1) % 4;
         self.config.border_style = self.border;
         self.config.save();
-        self.handle_resize();
-        if self.left.border { self.left.border_refresh(); }
-        if self.right.border { self.right.border_refresh(); }
+        self.rebuild_panes();
     }
 
     fn cycle_date_format(&mut self) {
@@ -3432,6 +3403,10 @@ impl App {
         // every cell on the next render — only do it when the terminal really
         // resized. The post-editor return path used to drop ~50ms here for no
         // reason because the size hadn't actually changed.
+        //
+        // Layout-config changes (cycle_width, cycle_border) must NOT use this
+        // path — they need pane recreation but cols/rows haven't changed.
+        // They call `rebuild_panes()` instead.
         if cols != self.cols || rows != self.rows {
             self.cols = cols;
             self.rows = rows;
@@ -3455,6 +3430,27 @@ impl App {
         Crust::clear_screen();
         // clear_screen wipes the pane borders too; redraw them before content
         // so the right pane border isn't missing after compose / external editor.
+        if self.left.border { self.left.border_refresh(); }
+        if self.right.border { self.right.border_refresh(); }
+        self.render_all();
+    }
+
+    /// Rebuild every pane and redraw — used when the LAYOUT changes
+    /// (`cycle_width`, `cycle_border`) but the terminal size has not. The
+    /// size-aware shortcut in `handle_resize` would otherwise leave the
+    /// panes at their old geometry and the change would only take effect
+    /// after a kastrup restart.
+    fn rebuild_panes(&mut self) {
+        let (cols, rows) = Crust::terminal_size();
+        self.cols = cols;
+        self.rows = rows;
+        let (top, left, right, bottom) = create_panes(cols, rows, self.width, self.border, &self.config);
+        self.top = top;
+        self.left = left;
+        self.right = right;
+        self.bottom = bottom;
+        self.restore_view_top_bg();
+        Crust::clear_screen();
         if self.left.border { self.left.border_refresh(); }
         if self.right.border { self.right.border_refresh(); }
         self.render_all();
