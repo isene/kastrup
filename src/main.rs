@@ -386,6 +386,18 @@ fn prev_pref(p: &mut PrefType) {
     }
 }
 
+fn pad_visible(s: &str, target: usize) -> String {
+    let w = crust::display_width(s);
+    if w >= target {
+        s.to_string()
+    } else {
+        let mut out = String::with_capacity(s.len() + (target - w));
+        out.push_str(s);
+        for _ in 0..(target - w) { out.push(' '); }
+        out
+    }
+}
+
 struct App {
     top: Pane,
     left: Pane,
@@ -823,8 +835,8 @@ impl App {
             "v" => { self.view_attachments(); }
             "V" => { self.toggle_inline_image(); }
             "D" => { self.download_images(); }
-            "x" => { self.open_external(); }
-            "X" => { self.open_in_browser(); }
+            "x" => { self.open_html_in_scroll(); }
+            "X" => { self.open_html_in_external_browser(); }
 
             // Search / filter
             "/" => { self.search_prompt(); }
@@ -1544,7 +1556,7 @@ impl App {
         // HTML indicator
         let has_mime_html = msg.content.contains("Content-Type:") && msg.content.lines().any(|l| l.starts_with("--") && l.len() > 5);
         if msg.html_content.is_some() || has_mime_html {
-            lines.push(style::fg("HTML mail, press x to open in browser", tc.html_hint));
+            lines.push(style::fg("HTML mail — x: open in scroll · X: open in browser", tc.html_hint));
             lines.push(String::new());
         }
 
@@ -3521,73 +3533,49 @@ impl App {
         }
     }
 
-    fn open_external(&mut self) {
-        // x key: open in default browser (xdg-open / Firefox)
-        // Ensure full content loaded for HTML
-        if !self.filtered_messages.get(self.index).map(|m| m.full_loaded).unwrap_or(true) {
-            let id = self.filtered_messages[self.index].id;
-            if let Some((content, html)) = self.db.get_message_content(id) {
-                self.filtered_messages[self.index].content = content;
-                self.filtered_messages[self.index].html_content = html;
-                self.filtered_messages[self.index].full_loaded = true;
-            }
-        }
+    fn open_html_in_external_browser(&mut self) {
+        // X key: open the message's HTML in the system default browser
+        // (xdg-open → typically Firefox). For messages with a "link"
+        // metadata field (RSS, web sources), opens that URL directly.
+        self.ensure_full_loaded();
         if let Some(msg) = self.filtered_messages.get(self.index) {
             if let Some(link) = msg.metadata.get("link").and_then(|v| v.as_str()) {
                 let _ = std::process::Command::new("xdg-open").arg(link)
                     .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
                 self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
-            } else {
-                // Get best HTML to display: html_content > MIME extraction > raw content
-                let html = if let Some(ref h) = msg.html_content {
-                    h.clone()
-                } else if msg.content.contains("Content-Type:") || msg.content.lines().any(|l| l.starts_with("--") && l.len() > 5) {
-                    extract_mime_html(&msg.content).unwrap_or_else(|| {
-                        // Wrap raw text in HTML as last resort
-                        let text = msg.content.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-                        format!("<html><head><meta charset=\"utf-8\"><style>body{{font-family:monospace;white-space:pre-wrap;padding:1em}}</style></head><body>{}</body></html>", text)
-                    })
-                } else if msg.content.contains("<html") || msg.content.contains("<body") || msg.content.trim_start().starts_with('<') {
-                    msg.content.clone()
-                } else {
+                return;
+            }
+            let html = match best_html_for_message(msg) {
+                Some(h) => h,
+                None => {
                     self.set_feedback("No HTML content to open", self.config.theme_colors.feedback_warn);
                     return;
-                };
-                let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
-                if std::fs::write(&path, &html).is_ok() {
-                    let _ = std::process::Command::new("xdg-open").arg(&path)
-                        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
-                    self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
                 }
+            };
+            let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
+            if std::fs::write(&path, &html).is_ok() {
+                let _ = std::process::Command::new("xdg-open").arg(&path)
+                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+                self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
             }
         }
     }
 
-    fn open_in_browser(&mut self) {
-        // X key: open in Scroll (terminal browser)
+    fn open_html_in_scroll(&mut self) {
+        // x key: open the message's HTML in scroll (tier 1, no JS).
+        // Stays in the terminal — fast path through the renderer
+        // without any boa/Servo overhead.
+        self.ensure_full_loaded();
         if let Some(msg) = self.filtered_messages.get(self.index) {
             let url = if let Some(link) = msg.metadata.get("link").and_then(|v| v.as_str()) {
                 Some(link.to_string())
             } else {
-                let html = if let Some(ref h) = msg.html_content {
-                    Some(h.clone())
-                } else if msg.content.contains("Content-Type:") || msg.content.lines().any(|l| l.starts_with("--") && l.len() > 5) {
-                    Some(extract_mime_html(&msg.content).unwrap_or_else(|| {
-                        let text = msg.content.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-                        format!("<html><head><meta charset=\"utf-8\"><style>body{{font-family:monospace;white-space:pre-wrap;padding:1em}}</style></head><body>{}</body></html>", text)
-                    }))
-                } else if msg.content.contains("<html") || msg.content.contains("<body") || msg.content.trim_start().starts_with('<') {
-                    Some(msg.content.clone())
-                } else {
-                    None
-                };
-                html.map(|h| {
+                best_html_for_message(msg).map(|h| {
                     let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
                     let _ = std::fs::write(&path, &h);
                     format!("file://{}", path)
                 })
             };
-
             if let Some(url) = url {
                 Crust::cleanup();
                 let _ = std::process::Command::new("scroll").arg(&url).status();
@@ -3596,6 +3584,20 @@ impl App {
                 self.handle_resize();
             } else {
                 self.set_feedback("No content to open", self.config.theme_colors.feedback_warn);
+            }
+        }
+    }
+
+    /// Lazy-load the full message content from the DB if the in-memory
+    /// row is just the listing snapshot. Both x/X paths need the full
+    /// body before they can extract HTML.
+    fn ensure_full_loaded(&mut self) {
+        if !self.filtered_messages.get(self.index).map(|m| m.full_loaded).unwrap_or(true) {
+            let id = self.filtered_messages[self.index].id;
+            if let Some((content, html)) = self.db.get_message_content(id) {
+                self.filtered_messages[self.index].content = content;
+                self.filtered_messages[self.index].html_content = html;
+                self.filtered_messages[self.index].full_loaded = true;
             }
         }
     }
@@ -4119,15 +4121,19 @@ impl App {
     }
 
     fn show_preferences(&mut self) {
-        let pw = 80u16.min(self.cols.saturating_sub(4));
-        let ph = 20u16.min(self.rows.saturating_sub(6));
+        let pw = 90u16.min(self.cols.saturating_sub(2));
+        let ph = 38u16.min(self.rows.saturating_sub(2));
         let px = (self.cols.saturating_sub(pw)) / 2;
         let py = (self.rows.saturating_sub(ph)) / 2;
         let mut popup = Pane::new(px, py, pw, ph, 255, 235);
         popup.border = true;
+        popup.scroll = false;
         popup.border_refresh();
 
-        let mut items: Vec<(&str, PrefType)> = vec![
+        let lw: usize = 36usize.min((pw as usize).saturating_sub(30)).max(20);
+        let rw: usize = (pw as usize).saturating_sub(lw + 5);
+
+        let mut prefs: Vec<(&str, PrefType)> = vec![
             ("Default view", PrefType::Text(self.config.default_view.clone())),
             ("Color theme", PrefType::Choice(vec!["Default", "Mutt", "Ocean", "Forest", "Amber"], self.config.color_theme.clone())),
             ("Date format", PrefType::Choice(vec!["%b %e", "%d/%m %H:%M", "%m/%d %H:%M", "%Y-%m-%d %H:%M", "%d.%m %H:%M", "%d %b %H:%M", "%b %d %H:%M"], self.date_format.clone())),
@@ -4142,32 +4148,160 @@ impl App {
             ("SMTP command", PrefType::Text(self.config.smtp_command.clone())),
         ];
 
-        let mut sel = 0usize;
+        let collect_colors = |tc: &config::ThemeColors| -> Vec<(&'static str, u8)> {
+            vec![
+                ("Unread", tc.unread),
+                ("Read", tc.read),
+                ("Accent", tc.accent),
+                ("Thread", tc.thread),
+                ("DM", tc.dm),
+                ("Tag", tc.tag),
+                ("Star", tc.star),
+                ("Quote 1", tc.quote1),
+                ("Quote 2", tc.quote2),
+                ("Quote 3", tc.quote3),
+                ("Quote 4", tc.quote4),
+                ("Signature", tc.sig),
+                ("Link", tc.link),
+                ("Email row", tc.src_email),
+                ("Email icon", tc.src_email_icon),
+                ("Discord row", tc.src_discord),
+                ("Discord icon", tc.src_discord_icon),
+                ("Slack row", tc.src_slack),
+                ("Slack icon", tc.src_slack_icon),
+                ("Telegram row", tc.src_telegram),
+                ("Telegram icon", tc.src_telegram_icon),
+                ("WhatsApp row", tc.src_whatsapp),
+                ("WhatsApp icon", tc.src_whatsapp_icon),
+                ("Reddit row", tc.src_reddit),
+                ("Reddit icon", tc.src_reddit_icon),
+                ("RSS row", tc.src_rss),
+                ("RSS icon", tc.src_rss_icon),
+                ("Web row", tc.src_web),
+                ("Web icon", tc.src_web_icon),
+                ("Messenger row", tc.src_messenger),
+                ("Messenger icon", tc.src_messenger_icon),
+                ("Instagram row", tc.src_instagram),
+                ("Instagram icon", tc.src_instagram_icon),
+                ("WeeChat row", tc.src_weechat),
+                ("WeeChat icon", tc.src_weechat_icon),
+                ("Default row", tc.src_default),
+                ("Default icon", tc.src_default_icon),
+                ("Header from", tc.header_from),
+                ("Header subj", tc.header_subj),
+                ("Header date", tc.header_date),
+                ("Header label", tc.header_label),
+                ("Separator", tc.separator),
+                ("Attachment", tc.attachment),
+                ("HTML hint", tc.html_hint),
+                ("Replied", tc.replied),
+                ("Delete mark", tc.delete_mark),
+                ("Attach ind", tc.attach_ind),
+                ("Date fg", tc.date_fg),
+                ("View all", tc.view_all),
+                ("View new", tc.view_new),
+                ("View sources", tc.view_sources),
+                ("View custom", tc.view_custom),
+                ("View starred", tc.view_starred),
+                ("Info fg", tc.info_fg),
+                ("Hint fg", tc.hint_fg),
+                ("Prefix fg", tc.prefix_fg),
+                ("No msg", tc.no_msg),
+                ("Feedback warn", tc.feedback_warn),
+                ("Feedback ok", tc.feedback_ok),
+                ("Feedback info", tc.feedback_info),
+                ("Content fg", tc.content_fg),
+                ("Content bg", tc.content_bg),
+                ("List fg", tc.list_fg),
+                ("List bg", tc.list_bg),
+                ("Border fg", tc.border_fg),
+            ]
+        };
+
+        let mut colors = collect_colors(&self.config.theme_colors);
+
+        let body_rows = (ph as usize).saturating_sub(4);
+        let mut pref_sel = 0usize;
+        let mut color_sel = 0usize;
+        let mut active_left = true;
+        let mut color_scroll = 0usize;
         let mut dirty = false;
-        let mut theme_preset_changed = false;
+
+        let footer = format!(
+            " {}",
+            style::fg(
+                "\u{2191}\u{2193}\u{2190}\u{2192}: nav  h/l: \u{00B1}1  H/L: \u{00B1}10  Enter: edit  W: Save  ESC: Close",
+                self.config.theme_colors.hint_fg
+            )
+        );
 
         loop {
-            let mut lines = Vec::new();
-            lines.push(format!(" {}", style::fg(&style::bold("Preferences"), self.config.theme_colors.view_custom)));
-            lines.push(String::new());
-
-            for (i, (label, ptype)) in items.iter().enumerate() {
-                let label_fmt = format!("{:<18}", label);
-                let max_val = (pw as usize).saturating_sub(26);
-                let value_str = match ptype {
-                    PrefType::Bool(v) => if *v { style::fg("Yes", self.config.theme_colors.feedback_ok) } else { style::fg("No", 196) },
-                    PrefType::Choice(_, current) => style::fg(current, self.config.theme_colors.view_custom),
-                    PrefType::Text(v) => if v.len() > max_val { format!("{}...", &v[..max_val.saturating_sub(3)]) } else { v.clone() },
-                    PrefType::Num(v, _, _) => format!("{}", v),
-                };
-                if i == sel {
-                    lines.push(format!(" {} \u{25C0} {} \u{25B6}", style::reverse(&label_fmt), value_str));
-                } else {
-                    lines.push(format!(" {}   {}  ", label_fmt, value_str));
+            // Auto-scroll right column
+            if body_rows > 0 {
+                if color_sel < color_scroll { color_scroll = color_sel; }
+                if color_sel >= color_scroll + body_rows {
+                    color_scroll = color_sel + 1 - body_rows;
                 }
             }
+
+            let mut lines: Vec<String> = Vec::with_capacity(body_rows + 4);
+            lines.push(format!(" {}", style::fg(&style::bold("Settings"), self.config.theme_colors.view_custom)));
             lines.push(String::new());
-            lines.push(style::fg(" j/k navigate  l/h change  Enter edit  W:Save  ESC:Close", self.config.theme_colors.hint_fg));
+
+            let can_scroll_up = color_scroll > 0;
+            let can_scroll_down = color_scroll + body_rows < colors.len();
+
+            for row in 0..body_rows {
+                // Left side
+                let left_raw = if row < prefs.len() {
+                    let (label, ptype) = &prefs[row];
+                    let label_pad = format!("{:<14}", label);
+                    let val_max = lw.saturating_sub(22);
+                    let value_str = match ptype {
+                        PrefType::Bool(v) => if *v { style::fg("Yes", self.config.theme_colors.feedback_ok) } else { style::fg("No", 196) },
+                        PrefType::Choice(_, current) => style::fg(current, self.config.theme_colors.view_custom),
+                        PrefType::Text(v) => if v.len() > val_max { format!("{}...", &v[..val_max.saturating_sub(3)]) } else { v.clone() },
+                        PrefType::Num(v, _, _) => format!("{}", v),
+                    };
+                    if active_left && pref_sel == row {
+                        format!(" {} \u{25C0} {} \u{25B6}", style::reverse(&label_pad), value_str)
+                    } else {
+                        format!(" {}   {}  ", label_pad, value_str)
+                    }
+                } else {
+                    String::new()
+                };
+                let left_padded = pad_visible(&left_raw, lw);
+
+                // Right side
+                let right_raw = {
+                    let idx = color_scroll + row;
+                    if idx < colors.len() {
+                        let (label, val) = colors[idx];
+                        let swatch = style::fg("\u{2588}\u{2588}\u{2588}", val);
+                        let label_pad = format!("{:<16}", label);
+                        if !active_left && color_sel == idx {
+                            format!(" {} \u{25C0} {} {:>3} \u{25B6}", style::reverse(&label_pad), swatch, val)
+                        } else {
+                            format!(" {}   {} {:>3}  ", label_pad, swatch, val)
+                        }
+                    } else {
+                        String::new()
+                    }
+                };
+                let marker = if row == 0 && can_scroll_up {
+                    style::fg("\u{25B3}", self.config.theme_colors.hint_fg)
+                } else if row + 1 == body_rows && can_scroll_down {
+                    style::fg("\u{25BD}", self.config.theme_colors.hint_fg)
+                } else {
+                    " ".to_string()
+                };
+                let right_padded = pad_visible(&right_raw, rw.saturating_sub(1));
+
+                lines.push(format!("{} \u{2502} {}{}", left_padded, right_padded, marker));
+            }
+            lines.push(String::new());
+            lines.push(footer.clone());
 
             popup.set_text(&lines.join("\n"));
             popup.ix = 0;
@@ -4176,188 +4310,189 @@ impl App {
             let Some(key) = Input::getchr(None) else { continue };
             match key.as_str() {
                 "ESC" | "q" => { dirty = false; break; }
-                "W" => { break; } // dirty stays true, will save
-                "j" | "DOWN" => { if sel < items.len() - 1 { sel += 1; } }
-                "k" | "UP" => { if sel > 0 { sel -= 1; } }
-                "l" | "RIGHT" => { next_pref(&mut items[sel].1); dirty = true; if sel == 1 { theme_preset_changed = true; } }
-                "h" | "LEFT" => { prev_pref(&mut items[sel].1); dirty = true; if sel == 1 { theme_preset_changed = true; } }
-                "ENTER" => {
-                    if sel == 1 {
-                        // Color theme: open theme color detail editor
-                        self.show_theme_colors_popup();
+                "W" => { dirty = true; break; }
+                "UP" | "k" => {
+                    if active_left {
+                        if pref_sel > 0 { pref_sel -= 1; }
+                    } else if color_sel > 0 { color_sel -= 1; }
+                }
+                "DOWN" | "j" => {
+                    if active_left {
+                        if pref_sel + 1 < prefs.len() { pref_sel += 1; }
+                    } else if color_sel + 1 < colors.len() { color_sel += 1; }
+                }
+                "LEFT" => { active_left = true; }
+                "RIGHT" => { active_left = false; }
+                "l" => {
+                    if active_left {
+                        next_pref(&mut prefs[pref_sel].1);
                         dirty = true;
-                        // Full redraw after theme color sub-popup
-                        self.handle_resize();
-                        popup.full_refresh();
-                        popup.border_refresh();
+                        if prefs[pref_sel].0 == "Color theme" {
+                            if let PrefType::Choice(_, theme) = &prefs[pref_sel].1 {
+                                colors = collect_colors(&config::ThemeColors::for_theme(theme));
+                            }
+                        }
                     } else {
-                        let label = items[sel].0.to_string();
-                        match &mut items[sel].1 {
+                        colors[color_sel].1 = (colors[color_sel].1 as u16 + 1).min(255) as u8;
+                        dirty = true;
+                    }
+                }
+                "h" => {
+                    if active_left {
+                        prev_pref(&mut prefs[pref_sel].1);
+                        dirty = true;
+                        if prefs[pref_sel].0 == "Color theme" {
+                            if let PrefType::Choice(_, theme) = &prefs[pref_sel].1 {
+                                colors = collect_colors(&config::ThemeColors::for_theme(theme));
+                            }
+                        }
+                    } else {
+                        colors[color_sel].1 = colors[color_sel].1.saturating_sub(1);
+                        dirty = true;
+                    }
+                }
+                "L" => {
+                    if !active_left {
+                        colors[color_sel].1 = (colors[color_sel].1 as u16 + 10).min(255) as u8;
+                        dirty = true;
+                    }
+                }
+                "H" => {
+                    if !active_left {
+                        colors[color_sel].1 = colors[color_sel].1.saturating_sub(10);
+                        dirty = true;
+                    }
+                }
+                "ENTER" => {
+                    if active_left {
+                        let label = prefs[pref_sel].0.to_string();
+                        match &mut prefs[pref_sel].1 {
                             PrefType::Text(val) => {
                                 let new_val = self.prompt(&format!("{}: ", label), val);
                                 if !new_val.is_empty() { *val = new_val; dirty = true; }
-                                // Restore popup's bottom hint (prompt overwrites status bar)
-                                self.bottom.say(&style::fg(" j/k navigate  l/h change  Enter edit  W:Save  ESC:Close", self.config.theme_colors.hint_fg));
+                                self.bottom.say(&footer);
                             }
-                            _ => { next_pref(&mut items[sel].1); dirty = true; }
+                            _ => {
+                                next_pref(&mut prefs[pref_sel].1);
+                                dirty = true;
+                                if label == "Color theme" {
+                                    if let PrefType::Choice(_, theme) = &prefs[pref_sel].1 {
+                                        colors = collect_colors(&config::ThemeColors::for_theme(theme));
+                                    }
+                                }
+                            }
                         }
+                    } else {
+                        let input = self.prompt("Color (0-255): ", &colors[color_sel].1.to_string());
+                        self.bottom.say(&footer);
+                        if let Ok(v) = input.parse::<u8>() { colors[color_sel].1 = v; dirty = true; }
                     }
                 }
                 _ => {}
             }
         }
 
-        // Apply settings back
-        if dirty {
-            for (label, ptype) in &items {
-                match (*label, ptype) {
-                    ("Default view", PrefType::Text(v)) => self.config.default_view = v.clone(),
-                    ("Color theme", PrefType::Choice(_, v)) => {
-                        self.config.color_theme = v.clone();
-                        if theme_preset_changed {
-                            self.config.theme_colors = config::ThemeColors::for_theme(v);
-                        }
-                    }
-                    ("Date format", PrefType::Choice(_, v)) => { self.date_format = v.clone(); self.config.date_format = v.clone(); }
-                    ("Sort order", PrefType::Choice(_, v)) => self.sort_order = v.clone(),
-                    ("Sort inverted", PrefType::Bool(v)) => self.sort_inverted = *v,
-                    ("Pane width", PrefType::Num(v, _, _)) => {
-                        self.width = *v as u16;
-                        self.handle_resize();
-                    }
-                    ("Border style", PrefType::Num(v, _, _)) => {
-                        self.border = *v;
-                        self.handle_resize();
-                    }
-                    ("Confirm purge", PrefType::Bool(v)) => self.config.confirm_purge = *v,
-                    ("Download folder", PrefType::Text(v)) => self.config.download_folder = v.clone(),
-                    ("Editor args", PrefType::Text(v)) => self.config.editor_args = v.clone(),
-                    ("Default email", PrefType::Text(v)) => self.config.default_email = v.clone(),
-                    ("SMTP command", PrefType::Text(v)) => self.config.smtp_command = v.clone(),
-                    _ => {}
-                }
-            }
-            self.config.save();
-            self.sort_messages();
-            self.rebuild_display();
+        if !dirty {
+            self.handle_resize();
+            if self.left.border { self.left.border_refresh(); }
+            if self.right.border { self.right.border_refresh(); }
+            self.render_top_bar();
+            return;
         }
-        self.handle_resize(); // Rebuild panes (restore_view_top_bg called inside)
-        if self.left.border { self.left.border_refresh(); }
-        if self.right.border { self.right.border_refresh(); }
-        self.render_top_bar();
-    }
 
-    fn show_theme_colors_popup(&mut self) {
-        let pw = 50u16.min(self.cols.saturating_sub(4));
-        let ph = 34u16.min(self.rows.saturating_sub(4));
-        let px = (self.cols.saturating_sub(pw)) / 2;
-        let py = 3;
-        let mut popup = Pane::new(px, py, pw, ph, 255, 235);
-        popup.border = true;
-        popup.scroll = true;
-        popup.border_refresh();
-
-        // Build editable color list from theme_colors
-        let mut colors: Vec<(&str, u8)> = vec![
-            ("Unread", self.config.theme_colors.unread),
-            ("Read", self.config.theme_colors.read),
-            ("Accent", self.config.theme_colors.accent),
-            ("Thread", self.config.theme_colors.thread),
-            ("DM", self.config.theme_colors.dm),
-            ("Tag", self.config.theme_colors.tag),
-            ("Star", self.config.theme_colors.star),
-            ("Quote 1", self.config.theme_colors.quote1),
-            ("Quote 2", self.config.theme_colors.quote2),
-            ("Quote 3", self.config.theme_colors.quote3),
-            ("Quote 4", self.config.theme_colors.quote4),
-            ("Signature", self.config.theme_colors.sig),
-            ("Link", self.config.theme_colors.link),
-            ("Email", self.config.theme_colors.src_email),
-            ("Discord", self.config.theme_colors.src_discord),
-            ("Slack", self.config.theme_colors.src_slack),
-            ("Telegram", self.config.theme_colors.src_telegram),
-            ("WhatsApp", self.config.theme_colors.src_whatsapp),
-            ("Reddit", self.config.theme_colors.src_reddit),
-            ("RSS", self.config.theme_colors.src_rss),
-            ("Web", self.config.theme_colors.src_web),
-            ("Messenger", self.config.theme_colors.src_messenger),
-            ("Instagram", self.config.theme_colors.src_instagram),
-            ("WeeChat", self.config.theme_colors.src_weechat),
-            ("Content fg", self.config.theme_colors.content_fg),
-            ("Content bg", self.config.theme_colors.content_bg),
-            ("List fg", self.config.theme_colors.list_fg),
-            ("List bg", self.config.theme_colors.list_bg),
-            ("Border fg", self.config.theme_colors.border_fg),
-        ];
-
-        let mut sel = 0usize;
-        let mut save = false;
-
-        loop {
-            let mut lines = Vec::new();
-            lines.push(format!(" {}", style::fg(&style::bold("Theme Colors"), self.config.theme_colors.view_custom)));
-            lines.push(String::new());
-            for (i, (label, val)) in colors.iter().enumerate() {
-                let swatch = style::fg("\u{2588}\u{2588}\u{2588}", *val);
-                let label_fmt = format!("{:<12}", label);
-                if i == sel {
-                    lines.push(format!(" {} \u{25C0} {} {:>3} \u{25B6}", style::reverse(&label_fmt), swatch, val));
-                } else {
-                    lines.push(format!(" {}   {} {:>3}  ", label_fmt, swatch, val));
-                }
-            }
-            lines.push(String::new());
-            lines.push(style::fg(" h/l:\u{00B1}1  H/L:\u{00B1}10  Enter:type  W:Save  ESC:Close", self.config.theme_colors.hint_fg));
-
-            popup.set_text(&lines.join("\n"));
-            // Scroll to keep selected item visible (sel + 2 for header lines)
-            let vis_h = popup.h as usize;
-            let item_line = sel + 2; // 2 header lines before items
-            if item_line >= popup.ix + vis_h.saturating_sub(2) {
-                popup.ix = (item_line + 3).saturating_sub(vis_h);
-            } else if item_line < popup.ix + 1 {
-                popup.ix = item_line.saturating_sub(1);
-            }
-            popup.full_refresh();
-
-            let Some(key) = Input::getchr(None) else { continue };
-            match key.as_str() {
-                "ESC" | "q" => { save = false; break; }
-                "W" => { save = true; break; }
-                "j" | "DOWN" => { if sel < colors.len() - 1 { sel += 1; } }
-                "k" | "UP" => { if sel > 0 { sel -= 1; } }
-                "l" | "RIGHT" => { colors[sel].1 = (colors[sel].1 as u16 + 1).min(255) as u8; }
-                "h" | "LEFT" => { colors[sel].1 = colors[sel].1.saturating_sub(1); }
-                "L" => { colors[sel].1 = (colors[sel].1 as u16 + 10).min(255) as u8; }
-                "H" => { colors[sel].1 = colors[sel].1.saturating_sub(10); }
-                "ENTER" => {
-                    let input = self.prompt("Color (0-255): ", &colors[sel].1.to_string());
-                    self.render_bottom_bar();
-                    if let Ok(v) = input.parse::<u8>() { colors[sel].1 = v; }
-                }
+        // Apply prefs
+        for (label, ptype) in &prefs {
+            match (*label, ptype) {
+                ("Default view", PrefType::Text(v)) => self.config.default_view = v.clone(),
+                ("Color theme", PrefType::Choice(_, v)) => self.config.color_theme = v.clone(),
+                ("Date format", PrefType::Choice(_, v)) => { self.date_format = v.clone(); self.config.date_format = v.clone(); }
+                ("Sort order", PrefType::Choice(_, v)) => self.sort_order = v.clone(),
+                ("Sort inverted", PrefType::Bool(v)) => self.sort_inverted = *v,
+                ("Pane width", PrefType::Num(v, _, _)) => self.width = *v as u16,
+                ("Border style", PrefType::Num(v, _, _)) => self.border = *v,
+                ("Confirm purge", PrefType::Bool(v)) => self.config.confirm_purge = *v,
+                ("Download folder", PrefType::Text(v)) => self.config.download_folder = v.clone(),
+                ("Editor args", PrefType::Text(v)) => self.config.editor_args = v.clone(),
+                ("Default email", PrefType::Text(v)) => self.config.default_email = v.clone(),
+                ("SMTP command", PrefType::Text(v)) => self.config.smtp_command = v.clone(),
                 _ => {}
             }
         }
 
-        if !save { return; }
-
-        // Apply colors back
+        // Apply colors
         let tc = &mut self.config.theme_colors;
-        tc.unread = colors[0].1;   tc.read = colors[1].1;
-        tc.accent = colors[2].1;   tc.thread = colors[3].1;
-        tc.dm = colors[4].1;       tc.tag = colors[5].1;
-        tc.star = colors[6].1;     tc.quote1 = colors[7].1;
-        tc.quote2 = colors[8].1;   tc.quote3 = colors[9].1;
-        tc.quote4 = colors[10].1;  tc.sig = colors[11].1;
-        tc.link = colors[12].1;    tc.src_email = colors[13].1;
-        tc.src_discord = colors[14].1;  tc.src_slack = colors[15].1;
-        tc.src_telegram = colors[16].1; tc.src_whatsapp = colors[17].1;
-        tc.src_reddit = colors[18].1;   tc.src_rss = colors[19].1;
-        tc.src_web = colors[20].1;      tc.src_messenger = colors[21].1;
-        tc.src_instagram = colors[22].1; tc.src_weechat = colors[23].1;
-        tc.content_fg = colors[24].1;  tc.content_bg = colors[25].1;
-        tc.list_fg = colors[26].1;     tc.list_bg = colors[27].1;
-        tc.border_fg = colors[28].1;
+        for (label, val) in &colors {
+            let v = *val;
+            match *label {
+                "Unread" => tc.unread = v,
+                "Read" => tc.read = v,
+                "Accent" => tc.accent = v,
+                "Thread" => tc.thread = v,
+                "DM" => tc.dm = v,
+                "Tag" => tc.tag = v,
+                "Star" => tc.star = v,
+                "Quote 1" => tc.quote1 = v,
+                "Quote 2" => tc.quote2 = v,
+                "Quote 3" => tc.quote3 = v,
+                "Quote 4" => tc.quote4 = v,
+                "Signature" => tc.sig = v,
+                "Link" => tc.link = v,
+                "Email row" => tc.src_email = v,
+                "Email icon" => tc.src_email_icon = v,
+                "Discord row" => tc.src_discord = v,
+                "Discord icon" => tc.src_discord_icon = v,
+                "Slack row" => tc.src_slack = v,
+                "Slack icon" => tc.src_slack_icon = v,
+                "Telegram row" => tc.src_telegram = v,
+                "Telegram icon" => tc.src_telegram_icon = v,
+                "WhatsApp row" => tc.src_whatsapp = v,
+                "WhatsApp icon" => tc.src_whatsapp_icon = v,
+                "Reddit row" => tc.src_reddit = v,
+                "Reddit icon" => tc.src_reddit_icon = v,
+                "RSS row" => tc.src_rss = v,
+                "RSS icon" => tc.src_rss_icon = v,
+                "Web row" => tc.src_web = v,
+                "Web icon" => tc.src_web_icon = v,
+                "Messenger row" => tc.src_messenger = v,
+                "Messenger icon" => tc.src_messenger_icon = v,
+                "Instagram row" => tc.src_instagram = v,
+                "Instagram icon" => tc.src_instagram_icon = v,
+                "WeeChat row" => tc.src_weechat = v,
+                "WeeChat icon" => tc.src_weechat_icon = v,
+                "Default row" => tc.src_default = v,
+                "Default icon" => tc.src_default_icon = v,
+                "Header from" => tc.header_from = v,
+                "Header subj" => tc.header_subj = v,
+                "Header date" => tc.header_date = v,
+                "Header label" => tc.header_label = v,
+                "Separator" => tc.separator = v,
+                "Attachment" => tc.attachment = v,
+                "HTML hint" => tc.html_hint = v,
+                "Replied" => tc.replied = v,
+                "Delete mark" => tc.delete_mark = v,
+                "Attach ind" => tc.attach_ind = v,
+                "Date fg" => tc.date_fg = v,
+                "View all" => tc.view_all = v,
+                "View new" => tc.view_new = v,
+                "View sources" => tc.view_sources = v,
+                "View custom" => tc.view_custom = v,
+                "View starred" => tc.view_starred = v,
+                "Info fg" => tc.info_fg = v,
+                "Hint fg" => tc.hint_fg = v,
+                "Prefix fg" => tc.prefix_fg = v,
+                "No msg" => tc.no_msg = v,
+                "Feedback warn" => tc.feedback_warn = v,
+                "Feedback ok" => tc.feedback_ok = v,
+                "Feedback info" => tc.feedback_info = v,
+                "Content fg" => tc.content_fg = v,
+                "Content bg" => tc.content_bg = v,
+                "List fg" => tc.list_fg = v,
+                "List bg" => tc.list_bg = v,
+                "Border fg" => tc.border_fg = v,
+                _ => {}
+            }
+        }
+
         // Apply pane colors
         self.left.fg = tc.list_fg as u16;
         self.left.bg = tc.list_bg as u16;
@@ -4365,9 +4500,16 @@ impl App {
         self.right.fg = tc.content_fg as u16;
         self.right.bg = tc.content_bg as u16;
         self.right.border_fg = Some(tc.border_fg as u16);
+
         self.config.save();
-        self.render_all();
+        self.sort_messages();
+        self.rebuild_display();
+        self.handle_resize();
+        if self.left.border { self.left.border_refresh(); }
+        if self.right.border { self.right.border_refresh(); }
+        self.render_top_bar();
     }
+
 }
 
 // --- Compose / Reply / Forward ---
@@ -5538,14 +5680,22 @@ impl App {
             .and_then(|s| s.to_str()).unwrap_or(&editor);
         let is_vim_family = editor_short == "vim" || editor_short == "vi" || editor_short == "nvim";
         let supports_plus = is_vim_family || editor_short == "scribe";
+        let is_scribe = editor_short == "scribe";
         // editor_args (e.g. `-c "set ft=mail"`) is vim-syntax. Don't pass it
         // to non-vim editors — scribe reads `-c` as a filename. Strip args
         // for the editor family that doesn't understand them.
         let args = if is_vim_family { editor_args.as_str() } else { "" };
+        // scribe auto-enables spell on Email-kind files; that fires
+        // hunspell + does an initial pass over the buffer, costing
+        // hundreds of ms before the editor is usable. The compose
+        // flow doesn't need spell-on-open — pass --no-spell so the
+        // user lands on the body instantly. They can :set spell once
+        // they're done typing if they want a final check.
+        let scribe_extra = if is_scribe { " --no-spell" } else { "" };
         let cmd_str = if supports_plus {
-            format!("{} +{} {} {}", editor, cursor_line, args, escaped_file)
+            format!("{} +{}{} {} {}", editor, cursor_line, scribe_extra, args, escaped_file)
         } else {
-            format!("{} {} {}", editor, args, escaped_file)
+            format!("{}{} {} {}", editor, scribe_extra, args, escaped_file)
         };
         let status = std::process::Command::new("sh")
             .arg("-c")
@@ -7537,6 +7687,50 @@ fn extract_mime_text_depth(raw: &str, depth: usize) -> Option<String> {
     }
 }
 
+/// Pick the most useful HTML representation of a message for the
+/// "open in scroll / browser" path. Tries, in order:
+///   1. `msg.html_content` if it has a real body (catches truncated
+///      DB rows that contain only a DOCTYPE — those are useless and
+///      we want to fall through).
+///   2. MIME-extracted HTML from raw content (text/html part of a
+///      multipart payload).
+///   3. Raw content if it looks like HTML on its own.
+///   4. Plain text wrapped in a minimal HTML page so the user sees
+///      *something* rather than a blank scroll.
+/// Returns None only if there's literally no message body at all.
+fn best_html_for_message(msg: &Message) -> Option<String> {
+    let has_real_body = |s: &str| -> bool {
+        let lower = s.to_ascii_lowercase();
+        lower.contains("<body") && s.len() > 200
+    };
+    if let Some(h) = msg.html_content.as_ref() {
+        if has_real_body(h) { return Some(h.clone()); }
+        // else: fall through — the row is degenerate (e.g. DOCTYPE only)
+    }
+    if msg.content.contains("Content-Type:")
+        || msg.content.lines().any(|l| l.starts_with("--") && l.len() > 5)
+    {
+        if let Some(h) = extract_mime_html(&msg.content) {
+            if has_real_body(&h) || !h.is_empty() { return Some(h); }
+        }
+    }
+    let trimmed = msg.content.trim_start();
+    if trimmed.starts_with("<html") || trimmed.starts_with("<body") || trimmed.starts_with('<') {
+        if has_real_body(&msg.content) { return Some(msg.content.clone()); }
+    }
+    // Plain-text fallback. Wrap in a minimal HTML page so even a
+    // text-only newsletter renders as something the user can read.
+    if msg.content.trim().is_empty() { return None; }
+    let escaped = msg.content
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    Some(format!(
+        "<html><head><meta charset=\"utf-8\"></head><body><pre>{}</pre></body></html>",
+        escaped
+    ))
+}
+
 /// Extract raw HTML from MIME multipart content (for browser display).
 fn extract_mime_html(raw: &str) -> Option<String> {
     extract_mime_html_depth(raw, 0)
@@ -8413,21 +8607,33 @@ fn is_invisible_format_char(c: char) -> bool {
 
 // --- Utilities ---
 
-fn source_info(source_type: &str, tc: &config::ThemeColors) -> (&'static str, u8) {
-    match source_type {
-        "discord" => ("\u{25C6}", tc.src_discord),
-        "slack" => ("#", tc.src_slack),
-        "telegram" => ("\u{2708}", tc.src_telegram),
-        "whatsapp" => ("\u{25C9}", tc.src_whatsapp),
-        "reddit" => ("\u{00AE}", tc.src_reddit),
-        "email" | "maildir" | "imap" | "gmail" => ("\u{2709}", tc.src_email),
-        "rss" => ("\u{25C8}", tc.src_rss),
-        "web" | "webpage" => ("\u{25CE}", tc.src_web),
-        "messenger" => ("\u{260E}", tc.src_messenger),
-        "instagram" => ("\u{25C8}", tc.src_instagram),
-        "weechat" | "workspace" => ("\u{2318}", tc.src_weechat),
-        _ => ("\u{2022}", tc.src_default),
-    }
+/// Returns `(pre-styled icon, row text color)`. The icon string
+/// embeds its own SGR color so that — even when the caller wraps
+/// the whole row in a different `style::fg(row_color)` — the icon
+/// shows the configured `src_<source>_icon` colour while sender /
+/// subject text continues in `src_<source>`. Both colors are
+/// user-configurable per source via `~/.kastrup/config.yml`.
+fn source_info(source_type: &str, tc: &config::ThemeColors) -> (String, u8) {
+    let (glyph, icon_color, row_color) = match source_type {
+        "discord"  => ("\u{25C6}", tc.src_discord_icon,  tc.src_discord),
+        "slack"    => ("#",        tc.src_slack_icon,    tc.src_slack),
+        "telegram" => ("\u{2708}", tc.src_telegram_icon, tc.src_telegram),
+        "whatsapp" => ("\u{25C9}", tc.src_whatsapp_icon, tc.src_whatsapp),
+        "reddit"   => ("\u{00AE}", tc.src_reddit_icon,   tc.src_reddit),
+        // `@` instead of the old U+2709 ✉ envelope: single-cell,
+        // text-weight, doesn't dominate the row.
+        "email" | "maildir" | "imap" | "gmail" => ("@", tc.src_email_icon, tc.src_email),
+        "rss"      => ("\u{25C8}", tc.src_rss_icon,      tc.src_rss),
+        "web" | "webpage" => ("\u{25CE}", tc.src_web_icon, tc.src_web),
+        "messenger" => ("\u{260E}", tc.src_messenger_icon, tc.src_messenger),
+        "instagram" => ("\u{25C8}", tc.src_instagram_icon, tc.src_instagram),
+        "weechat" | "workspace" => ("\u{2318}", tc.src_weechat_icon, tc.src_weechat),
+        _ => ("\u{2022}", tc.src_default_icon, tc.src_default),
+    };
+    // \x1b[39m resets only the foreground (not bg/style) so the
+    // row's outer style continues unaffected after the icon.
+    let styled = format!("\x1b[38;5;{}m{}\x1b[39m", icon_color, glyph);
+    (styled, row_color)
 }
 
 /// Format a unix timestamp using a simple date format string.

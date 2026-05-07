@@ -43,19 +43,35 @@ pub struct ThemeColors {
     pub feedback_warn: u8,
     pub feedback_ok: u8,
     pub feedback_info: u8,
-    // Source type colors
+    // Source type colors. Each source has a *row text color* (used
+    // for sender / subject) and an optional *icon color* that, if set
+    // to a value other than the row color, paints just the leading
+    // glyph (e.g. `@` for email) without recolouring the rest of
+    // the row.
     pub src_email: u8,
+    pub src_email_icon: u8,
     pub src_discord: u8,
+    pub src_discord_icon: u8,
     pub src_slack: u8,
+    pub src_slack_icon: u8,
     pub src_telegram: u8,
+    pub src_telegram_icon: u8,
     pub src_whatsapp: u8,
+    pub src_whatsapp_icon: u8,
     pub src_reddit: u8,
+    pub src_reddit_icon: u8,
     pub src_rss: u8,
+    pub src_rss_icon: u8,
     pub src_web: u8,
+    pub src_web_icon: u8,
     pub src_messenger: u8,
+    pub src_messenger_icon: u8,
     pub src_instagram: u8,
+    pub src_instagram_icon: u8,
     pub src_weechat: u8,
+    pub src_weechat_icon: u8,
     pub src_default: u8,
+    pub src_default_icon: u8,
     pub content_fg: u8,
     pub content_bg: u8,
     pub list_fg: u8,
@@ -80,9 +96,20 @@ impl Default for ThemeColors {
             info_fg: 252, hint_fg: 245, prefix_fg: 248,
             no_msg: 245,
             feedback_warn: 220, feedback_ok: 40, feedback_info: 245,
+            // Default row text colors per source (sender + subject).
             src_email: 39, src_discord: 99, src_slack: 35, src_telegram: 51,
             src_whatsapp: 40, src_reddit: 202, src_rss: 226, src_web: 208,
             src_messenger: 33, src_instagram: 205, src_weechat: 75, src_default: 15,
+            // Icon colors. Default each icon to the same as the row
+            // color so behaviour is unchanged from earlier builds —
+            // the only outlier is email, where `@` reads better as
+            // a quiet light-gray separator (244) than as a colored
+            // glyph against the message line.
+            src_email_icon: 244,
+            src_discord_icon: 99, src_slack_icon: 35, src_telegram_icon: 51,
+            src_whatsapp_icon: 40, src_reddit_icon: 202, src_rss_icon: 226,
+            src_web_icon: 208, src_messenger_icon: 33, src_instagram_icon: 205,
+            src_weechat_icon: 75, src_default_icon: 15,
             content_fg: 252, content_bg: 0, list_fg: 252, list_bg: 0, border_fg: 238,
         }
     }
@@ -232,21 +259,57 @@ impl Config {
             "default_view": self.default_view,
             "editor_args": self.editor_args,
         });
-        data["colors"] = serde_json::json!({
-            "unread": tc.unread, "read": tc.read, "accent": tc.accent,
-            "thread": tc.thread, "dm": tc.dm, "tag": tc.tag, "star": tc.star,
-            "quote1": tc.quote1, "quote2": tc.quote2, "quote3": tc.quote3, "quote4": tc.quote4,
-            "sig": tc.sig, "link": tc.link,
-            "src_email": tc.src_email, "src_discord": tc.src_discord,
-            "src_slack": tc.src_slack, "src_telegram": tc.src_telegram,
-            "src_whatsapp": tc.src_whatsapp, "src_reddit": tc.src_reddit,
-            "src_rss": tc.src_rss, "src_web": tc.src_web,
-            "src_messenger": tc.src_messenger, "src_instagram": tc.src_instagram,
-            "src_weechat": tc.src_weechat, "src_default": tc.src_default,
-            "content_fg": tc.content_fg, "content_bg": tc.content_bg,
-            "list_fg": tc.list_fg, "list_bg": tc.list_bg,
-            "border_fg": tc.border_fg,
-        });
+        // Build the colors map manually — the json! macro's
+        // recursion depth blows out around ~25 entries on stable.
+        let mut colors_map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        let put = |m: &mut serde_json::Map<String, serde_json::Value>, k: &str, v: u8| {
+            m.insert(k.to_string(), serde_json::json!(v));
+        };
+        put(&mut colors_map, "unread", tc.unread);
+        put(&mut colors_map, "read", tc.read);
+        put(&mut colors_map, "accent", tc.accent);
+        put(&mut colors_map, "thread", tc.thread);
+        put(&mut colors_map, "dm", tc.dm);
+        put(&mut colors_map, "tag", tc.tag);
+        put(&mut colors_map, "star", tc.star);
+        put(&mut colors_map, "quote1", tc.quote1);
+        put(&mut colors_map, "quote2", tc.quote2);
+        put(&mut colors_map, "quote3", tc.quote3);
+        put(&mut colors_map, "quote4", tc.quote4);
+        put(&mut colors_map, "sig", tc.sig);
+        put(&mut colors_map, "link", tc.link);
+        // Source row + icon colors. icon variants embed in the
+        // pre-styled glyph; row variants color the rest of the line.
+        put(&mut colors_map, "src_email", tc.src_email);
+        put(&mut colors_map, "src_email_icon", tc.src_email_icon);
+        put(&mut colors_map, "src_discord", tc.src_discord);
+        put(&mut colors_map, "src_discord_icon", tc.src_discord_icon);
+        put(&mut colors_map, "src_slack", tc.src_slack);
+        put(&mut colors_map, "src_slack_icon", tc.src_slack_icon);
+        put(&mut colors_map, "src_telegram", tc.src_telegram);
+        put(&mut colors_map, "src_telegram_icon", tc.src_telegram_icon);
+        put(&mut colors_map, "src_whatsapp", tc.src_whatsapp);
+        put(&mut colors_map, "src_whatsapp_icon", tc.src_whatsapp_icon);
+        put(&mut colors_map, "src_reddit", tc.src_reddit);
+        put(&mut colors_map, "src_reddit_icon", tc.src_reddit_icon);
+        put(&mut colors_map, "src_rss", tc.src_rss);
+        put(&mut colors_map, "src_rss_icon", tc.src_rss_icon);
+        put(&mut colors_map, "src_web", tc.src_web);
+        put(&mut colors_map, "src_web_icon", tc.src_web_icon);
+        put(&mut colors_map, "src_messenger", tc.src_messenger);
+        put(&mut colors_map, "src_messenger_icon", tc.src_messenger_icon);
+        put(&mut colors_map, "src_instagram", tc.src_instagram);
+        put(&mut colors_map, "src_instagram_icon", tc.src_instagram_icon);
+        put(&mut colors_map, "src_weechat", tc.src_weechat);
+        put(&mut colors_map, "src_weechat_icon", tc.src_weechat_icon);
+        put(&mut colors_map, "src_default", tc.src_default);
+        put(&mut colors_map, "src_default_icon", tc.src_default_icon);
+        put(&mut colors_map, "content_fg", tc.content_fg);
+        put(&mut colors_map, "content_bg", tc.content_bg);
+        put(&mut colors_map, "list_fg", tc.list_fg);
+        put(&mut colors_map, "list_bg", tc.list_bg);
+        put(&mut colors_map, "border_fg", tc.border_fg);
+        data["colors"] = serde_json::Value::Object(colors_map);
         data["default_email"] = serde_json::json!(self.default_email);
         data["smtp_command"] = serde_json::json!(self.smtp_command);
         data["download_folder"] = serde_json::json!(self.download_folder);
@@ -372,17 +435,29 @@ impl Config {
             if let Some(v) = colors.get("sig").and_then(|v| v.as_u64()) { tc.sig = v as u8; }
             if let Some(v) = colors.get("link").and_then(|v| v.as_u64()) { tc.link = v as u8; }
             if let Some(v) = colors.get("src_email").and_then(|v| v.as_u64()) { tc.src_email = v as u8; }
+            if let Some(v) = colors.get("src_email_icon").and_then(|v| v.as_u64()) { tc.src_email_icon = v as u8; }
             if let Some(v) = colors.get("src_discord").and_then(|v| v.as_u64()) { tc.src_discord = v as u8; }
+            if let Some(v) = colors.get("src_discord_icon").and_then(|v| v.as_u64()) { tc.src_discord_icon = v as u8; }
             if let Some(v) = colors.get("src_slack").and_then(|v| v.as_u64()) { tc.src_slack = v as u8; }
+            if let Some(v) = colors.get("src_slack_icon").and_then(|v| v.as_u64()) { tc.src_slack_icon = v as u8; }
             if let Some(v) = colors.get("src_telegram").and_then(|v| v.as_u64()) { tc.src_telegram = v as u8; }
+            if let Some(v) = colors.get("src_telegram_icon").and_then(|v| v.as_u64()) { tc.src_telegram_icon = v as u8; }
             if let Some(v) = colors.get("src_whatsapp").and_then(|v| v.as_u64()) { tc.src_whatsapp = v as u8; }
+            if let Some(v) = colors.get("src_whatsapp_icon").and_then(|v| v.as_u64()) { tc.src_whatsapp_icon = v as u8; }
             if let Some(v) = colors.get("src_reddit").and_then(|v| v.as_u64()) { tc.src_reddit = v as u8; }
+            if let Some(v) = colors.get("src_reddit_icon").and_then(|v| v.as_u64()) { tc.src_reddit_icon = v as u8; }
             if let Some(v) = colors.get("src_rss").and_then(|v| v.as_u64()) { tc.src_rss = v as u8; }
+            if let Some(v) = colors.get("src_rss_icon").and_then(|v| v.as_u64()) { tc.src_rss_icon = v as u8; }
             if let Some(v) = colors.get("src_web").and_then(|v| v.as_u64()) { tc.src_web = v as u8; }
+            if let Some(v) = colors.get("src_web_icon").and_then(|v| v.as_u64()) { tc.src_web_icon = v as u8; }
             if let Some(v) = colors.get("src_messenger").and_then(|v| v.as_u64()) { tc.src_messenger = v as u8; }
+            if let Some(v) = colors.get("src_messenger_icon").and_then(|v| v.as_u64()) { tc.src_messenger_icon = v as u8; }
             if let Some(v) = colors.get("src_instagram").and_then(|v| v.as_u64()) { tc.src_instagram = v as u8; }
+            if let Some(v) = colors.get("src_instagram_icon").and_then(|v| v.as_u64()) { tc.src_instagram_icon = v as u8; }
             if let Some(v) = colors.get("src_weechat").and_then(|v| v.as_u64()) { tc.src_weechat = v as u8; }
+            if let Some(v) = colors.get("src_weechat_icon").and_then(|v| v.as_u64()) { tc.src_weechat_icon = v as u8; }
             if let Some(v) = colors.get("src_default").and_then(|v| v.as_u64()) { tc.src_default = v as u8; }
+            if let Some(v) = colors.get("src_default_icon").and_then(|v| v.as_u64()) { tc.src_default_icon = v as u8; }
             if let Some(v) = colors.get("content_fg").and_then(|v| v.as_u64()) { tc.content_fg = v as u8; }
             if let Some(v) = colors.get("content_bg").and_then(|v| v.as_u64()) { tc.content_bg = v as u8; }
             if let Some(v) = colors.get("list_fg").and_then(|v| v.as_u64()) { tc.list_fg = v as u8; }
