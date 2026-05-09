@@ -42,39 +42,94 @@ cp target/release/kastrup ~/.local/bin/
 
 ## Key Bindings
 
+### Navigation
 | Key | Action |
 |-----|--------|
-| j/k, Up/Down | Navigate messages |
-| Enter | Open message / expand section |
-| A | All messages view |
-| N | New/unread messages |
-| S | Source management |
+| j/k, Down/Up | Move cursor |
+| h, Left | Collapse current thread (threaded view) |
+| Space | Toggle thread collapse |
+| Home / End | First / last message |
+| PgDn / PgUp | Page down / up |
+| Enter | Open message (or expand section in threaded view) |
+| n / p | Next / previous unread |
+| J | Jump to date |
+| G | Cycle view mode (flat / threaded / folder) |
+
+### Views
+| Key | Action |
+|-----|--------|
+| A | All messages |
+| N | New (unread) |
+| Ctrl-S | Sources management |
 | 0-9 | Custom views |
-| Space | Toggle read/unread |
-| * | Toggle star |
-| t | Tag/untag message |
-| T | Tag all |
+| F1-F12 | Extended custom views |
+| F | Favorites browser |
+| L | Load more messages |
+| Ctrl-R | Refresh current view |
+| Ctrl-F | Edit filter |
+| K | Kill (close) view |
+
+### Message Operations
+| Key | Action |
+|-----|--------|
+| R | Toggle read / unread |
+| M | Mark all as read |
+| `*` / `-` | Toggle star |
+| t / T | Tag message / tag all |
+| Ctrl-T | Tag by regex |
 | d | Mark for deletion |
-| $ | Purge deleted |
+| `<` | Purge deleted |
+| u / U | Mark unseen |
+| Shift-Space | Mark browsed as read |
+
+### Compose & Reply
+| Key | Action |
+|-----|--------|
 | r | Reply |
-| f | Forward |
-| c | Compose new |
-| / | Search |
-| G | Cycle view mode (flat/threaded/folder) |
-| V | View inline images |
-| v | View/save attachments |
-| x | Open in browser |
-| X | Open in Scroll |
+| e | Reply in editor |
+| g | Reply-all |
+| f | Forward (then `i` inline / `a` attach) |
+| m | Compose new |
+| E | Edit draft |
+
+### Attachments & External
+| Key | Action |
+|-----|--------|
+| v | View / save attachments |
+| V | Toggle inline image |
+| D | Download images to disk |
+| x | Open in external app |
+| X | Open HTML in browser |
+
+### Search & AI
+| Key | Action |
+|-----|--------|
+| / | Search messages (notmuch + DB substring fallback) |
+| **S** | **`:search`** — natural-language query → claude translates to a `Filters` JSON spec → applied to the message list |
+| @ | Address book |
+| l | Label message |
+| s | File / save message |
+| `+` | Add to favorites |
+| I | AI assistant menu (draft / summarize / translate / ask) |
+| **c** | **`:claude PROMPT`** — pipe message + custom prompt to `claude -p`, response shown in the right pane |
+| **C** | **`:chat`** — suspend kastrup, open interactive `claude` with the current message snapshot as context |
+| **`:`** | **Colon prompt** — type any verb explicitly: `:claude PROMPT`, `:search QUERY`, `:chat`, `:q`/`:quit` |
+| Esc | Clear sticky search, return to current view |
 | Z | Open in Tock (calendar events) |
+
+### UI
+| Key | Action |
+|-----|--------|
+| o | Cycle sort order |
+| i | Invert sort |
+| w / W | Cycle pane width forward / back |
+| H | Set top-bar (view) colour |
 | B | Folder browser |
-| l | Manage labels |
-| I | AI assistant |
-| u/U | Mark message unseen |
-| C | Preferences |
-| w/W | Cycle pane width forward/back |
-| Ctrl+B | Toggle borders |
-| Ctrl+L | Refresh display |
-| ? | Help |
+| Ctrl-B | Cycle border style |
+| P | Preferences |
+| y / Y | Copy message ID / copy right pane content |
+| Ctrl-L | Force redraw |
+| ? | Help (press again for extended help) |
 | q | Quit |
 
 ## Configuration

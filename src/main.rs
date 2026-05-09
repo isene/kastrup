@@ -418,6 +418,13 @@ struct App {
     running: bool,
     current_view: String,
     active_folder: Option<String>,
+    /// Sticky filter from `:search` or `/`. While set, the periodic
+    /// `refresh_current_view` polls this filter instead of the
+    /// `current_view`'s rules — without it, search results were being
+    /// blanked every 5 s by the dirty-DB reconciliation. Cleared by
+    /// `switch_to_view`, `refresh_view`, or pressing Esc.
+    active_search_filter: Option<Filters>,
+    active_search_label: String,
     in_source_view: bool,
     index: usize,
 
@@ -569,6 +576,8 @@ fn main() {
         running: true,
         current_view: "A".to_string(),
         active_folder: None,
+        active_search_filter: None,
+        active_search_label: String::new(),
         in_source_view: false,
         index: 0,
         filtered_messages: Vec::new(),
@@ -782,7 +791,8 @@ impl App {
             // View switching
             "A" => { self.switch_to_view("A"); }
             "N" => { self.switch_to_view("N"); }
-            "S" => { self.show_sources(); }
+            "S" => { self.search_command(); }
+            "C-S" => { self.show_sources(); }
             "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
                 self.switch_to_view(key);
             }
@@ -858,8 +868,18 @@ impl App {
             "w" => { self.cycle_width(); }
             "W" => { self.cycle_width_reverse(); }
             "D" => { self.cycle_date_format(); }
-            "c" => { self.set_view_color(); }
-            "C" => { self.show_preferences(); }
+            "H" => { self.set_view_color(); }
+            "P" => { self.show_preferences(); }
+
+            // Claude integration (mirrors scribe's :claude / :chat)
+            "c" => { self.claude_command(); }
+            "C" => { self.chat_command(); }
+
+            // Vim-style `:` command prompt — types out the colon command
+            // explicitly (e.g. `:claude tighten this`, `:search …`,
+            // `:chat`, `:q`). Each shortcut letter delegates here so the
+            // semantics are identical regardless of entry path.
+            ":" => { self.colon_command(); }
             "?" => {
                 if self.showing_help && !self.help_extended {
                     self.show_extended_help();
@@ -895,6 +915,17 @@ impl App {
             // Resize
             "RESIZE" => { self.handle_resize(); }
             "C-L" => { self.force_redraw(); }
+
+            // Esc: drop sticky search, reload current view.
+            "ESC" => {
+                if self.active_search_filter.is_some() {
+                    self.active_search_filter = None;
+                    self.active_search_label.clear();
+                    let key = self.current_view.clone();
+                    self.switch_to_view(&key);
+                    self.set_feedback("search cleared", self.config.theme_colors.feedback_ok);
+                }
+            }
 
             // Quit
             "q" | "Q" => { self.running = false; }
@@ -1919,6 +1950,9 @@ impl App {
         self.active_folder = None;
         self.in_source_view = false;
         self.index = 0;
+        // Switching views always abandons any sticky search.
+        self.active_search_filter = None;
+        self.active_search_label.clear();
 
         // Restore per-view thread mode from DB settings
         let mode_key = format!("thread_mode_{}", key);
@@ -2015,6 +2049,36 @@ impl App {
         let saved_index = self.index;
         let old_ids: Vec<i64> = self.filtered_messages.iter().map(|m| m.id).collect();
         let old_read: Vec<bool> = self.filtered_messages.iter().map(|m| m.read).collect();
+
+        // Sticky search filter wins over the current_view's rules. The
+        // periodic poll fires every 5s and used to silently overwrite
+        // search results — by re-running the saved filter here, the
+        // search list keeps refreshing as new matching messages arrive.
+        if let Some(ref f) = self.active_search_filter {
+            let limit = self.config.load_limit;
+            self.filtered_messages = self.db.get_messages(f, limit, 0);
+            for msg in &mut self.filtered_messages {
+                if let Some(st) = self.source_type_map.get(&msg.source_id) {
+                    msg.source_type = st.clone();
+                }
+            }
+            // Best-effort cursor preservation: keep cursor on same id
+            // if it survived; otherwise stay at the same index slot.
+            if let Some(id) = saved_id {
+                if let Some(pos) = self.filtered_messages.iter().position(|m| m.id == id) {
+                    self.index = pos;
+                } else {
+                    self.index = saved_index.min(self.filtered_messages.len().saturating_sub(1));
+                }
+            }
+            // Mute warnings about unread caches we don't use here.
+            let _ = (old_ids, old_read);
+            self.sort_messages();
+            self.rebuild_display();
+            self.left.full_refresh();
+            self.render_all();
+            return;
+        }
 
         // Rebuild filters for the current view (same logic as switch_to_view but no index=0)
         let key = self.current_view.clone();
@@ -3345,7 +3409,7 @@ impl App {
 {}\n\
   A              All messages\n\
   N              New (unread)\n\
-  S              Sources\n\
+  Ctrl-S         Sources management\n\
   0-9            Custom views\n\
   F1-F12         Extended views\n\
   F              Favorites browser\n\
@@ -3377,22 +3441,28 @@ impl App {
   x              Open in external app\n\
   X              Open HTML in browser\n\n\
 {}\n\
-  /              Search messages\n\
+  /              Search messages (notmuch + DB substring)\n\
+  S              :search (claude → Filters → message list)\n\
   l              Label message\n\
   s              File/save message\n\
   +              Add to favorites\n\
   I              AI assistant / plugins\n\
+  c              :claude PROMPT (response in right pane)\n\
+  C              :chat (suspend, claude w/ message context)\n\
+  :              Colon command (claude/chat/search/q)\n\
+  Esc            Clear sticky search, return to current view\n\
   Z              Tock action\n\n\
 {}\n\
   o              Cycle sort order\n\
   i              Invert sort\n\
   w/W            Cycle pane width forward/back\n\
-  c              Set top bar color\n\
+  H              Set top bar (view) colour\n\
   B              Folder browser\n\
   Ctrl-B         Cycle border style\n\
   D              Cycle date format\n\
-  C              Preferences\n\
+  P              Preferences\n\
   y/Y            Copy ID / copy content\n\
+  @              Address book\n\
   Ctrl-L         Redraw\n\
   q              Quit",
             style::bold("Kastrup - Messaging Hub"),
@@ -3700,7 +3770,8 @@ impl App {
                 let json_str = String::from_utf8_lossy(&output.stdout);
                 if let Ok(results) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
                     if !results.is_empty() {
-                        // Search DB for matching content
+                        // Search DB for matching content; persist the
+                        // filter so the 5s refresh keeps these results.
                         let mut filters = Filters::default();
                         filters.content_pattern = Some(query.clone());
                         self.filtered_messages = self.db.get_messages(&filters, 500, 0);
@@ -3710,7 +3781,9 @@ impl App {
                             }
                         }
                         self.index = 0;
-                        self.set_feedback(&format!("Notmuch: {} results", self.filtered_messages.len()), self.config.theme_colors.feedback_ok);
+                        self.active_search_label = format!("/{}", query);
+                        self.active_search_filter = Some(filters);
+                        self.set_feedback(&format!("Notmuch: {} results  (Esc clears)", self.filtered_messages.len()), self.config.theme_colors.feedback_ok);
                         self.render_all();
                         return;
                     }
@@ -7181,6 +7254,341 @@ impl App {
         self.right.full_refresh();
         if self.right.border { self.right.border_refresh(); }
         self.set_feedback("AI response shown in right pane", tc.feedback_ok);
+    }
+
+    /// `c` — vim/scribe-style `:claude PROMPT`. Prompts the user, then
+    /// delegates. Empty prompt cancels.
+    fn claude_command(&mut self) {
+        let user_prompt = self.prompt(":claude ", "");
+        self.render_bottom_bar();
+        if user_prompt.trim().is_empty() { return; }
+        self.run_claude_with_prompt(&user_prompt);
+    }
+
+    /// Body of `:claude` — pipe the current message body + `user_prompt`
+    /// through `claude -p`, show the response in the right pane. Used
+    /// both by the `c` shortcut and by the `:` colon-command dispatch.
+    fn run_claude_with_prompt(&mut self, user_prompt: &str) {
+        let (is_header, sender, subject, content) = match self.filtered_messages.get(self.index) {
+            Some(m) => (
+                m.is_header,
+                m.sender_name.as_deref().unwrap_or(&m.sender).to_string(),
+                m.subject.as_deref().unwrap_or("").to_string(),
+                if m.content.len() > 8000 { m.content[..8000].to_string() } else { m.content.clone() },
+            ),
+            None => return,
+        };
+        if is_header { return; }
+        let user_prompt = user_prompt.to_string();
+
+        let tc = self.config.theme_colors.clone();
+        self.set_feedback("Asking claude…", tc.unread);
+        // Force a footer paint so the user sees the status while
+        // claude -p runs (can take 5-30s).
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+
+        let full_prompt = format!(
+            "{}\n\nContext, email from {} about \"{}\":\n{}",
+            user_prompt, sender, subject, content
+        );
+
+        let result = std::process::Command::new("claude")
+            .arg("-p")
+            .arg(&full_prompt)
+            .output();
+        let response = if let Ok(output) = result {
+            if output.status.success() {
+                String::from_utf8_lossy(&output.stdout).to_string()
+            } else {
+                self.ai_fallback_openai(&full_prompt)
+            }
+        } else {
+            self.ai_fallback_openai(&full_prompt)
+        };
+        if response.is_empty() {
+            self.set_feedback("claude returned empty response", tc.feedback_warn);
+            return;
+        }
+
+        self.right.set_text(&format!("{}\n{}\n\n{}",
+            style::bold(&style::fg("claude", tc.view_custom)),
+            style::fg(&format!("> {}", user_prompt), tc.unread),
+            response.trim_end()));
+        self.right.ix = 0;
+        self.right.full_refresh();
+        if self.right.border { self.right.border_refresh(); }
+        self.set_feedback("claude response shown in right pane", tc.feedback_ok);
+    }
+
+    /// `S` — `:search`. Prompts the user, then delegates.
+    fn search_command(&mut self) {
+        let query = self.prompt(":search ", "");
+        self.render_bottom_bar();
+        if query.trim().is_empty() { return; }
+        self.run_search_with_query(&query);
+    }
+
+    /// Body of `:search` — natural-language query → claude translates
+    /// to a `Filters` JSON spec → filter pipeline runs the query
+    /// against the heathrow DB. Live source list is included in the
+    /// prompt so claude can resolve names. On parse failure, falls
+    /// back to a content_pattern substring search using the raw query.
+    fn run_search_with_query(&mut self, query: &str) {
+        let query = query.to_string();
+        let tc = self.config.theme_colors.clone();
+        // Build a compact live source roster so claude can resolve names.
+        let mut roster = String::new();
+        for src in &self.sources_list {
+            roster.push_str(&format!("- id={} type={} name=\"{}\"\n",
+                src.id, src.plugin_type, src.name));
+        }
+        if roster.is_empty() {
+            roster.push_str("(no sources registered)\n");
+        }
+
+        let system_prompt = format!(
+            "You are a search assistant for kastrup, a unified messaging hub backed by a SQLite \
+            heathrow.db. Given a user's natural-language query, output a single JSON object \
+            matching this Rust struct (omit fields that aren't constrained):\n\
+            \n\
+            {{\n\
+            \"source_id\": int|null,           // exact source id\n\
+            \"source_ids\": [int]|null,        // list of source ids\n\
+            \"is_read\": bool|null,            // true=only read, false=only unread\n\
+            \"is_starred\": bool|null,\n\
+            \"folder\": str|null,              // exact maildir folder name\n\
+            \"sender_pattern\": str|null,      // SQL LIKE pattern, e.g. \"%bob%\"\n\
+            \"source_type\": str|null,         // \"email\" | \"rss\" | \"irc\" | \"messenger\" | \"instagram\" | \"workspace\"\n\
+            \"content_pattern\": str|null      // SQL LIKE pattern matching subject+body\n\
+            }}\n\
+            \n\
+            Rules:\n\
+            - Output ONLY the JSON, no markdown fences, no commentary.\n\
+            - Use SQL LIKE wildcards (%) liberally for substring matching.\n\
+            - For \"unread\" / \"new\" set is_read=false.\n\
+            - For \"starred\" / \"flagged\" set is_starred=true.\n\
+            - Map source/channel mentions against the roster below.\n\
+            \n\
+            Available sources:\n{}\n\
+            User query: {}",
+            roster, query
+        );
+
+        self.set_feedback("Asking claude…", tc.unread);
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+
+        let result = std::process::Command::new("claude")
+            .arg("-p")
+            .arg(&system_prompt)
+            .output();
+        let raw = if let Ok(output) = result {
+            if output.status.success() {
+                String::from_utf8_lossy(&output.stdout).to_string()
+            } else {
+                self.ai_fallback_openai(&system_prompt)
+            }
+        } else {
+            self.ai_fallback_openai(&system_prompt)
+        };
+        if raw.trim().is_empty() {
+            self.set_feedback("claude returned empty response", tc.feedback_warn);
+            return;
+        }
+
+        // Strip occasional markdown-fence wrappers claude sometimes
+        // adds despite instructions.
+        let cleaned = raw.trim();
+        let cleaned = cleaned.trim_start_matches("```json").trim_start_matches("```")
+            .trim_end_matches("```").trim();
+
+        let mut filters = match serde_json::from_str::<serde_json::Value>(cleaned) {
+            Ok(v) => self.filters_from_json(&v),
+            Err(_) => {
+                // Fallback: treat the raw query as a content substring.
+                let mut f = Filters::default();
+                f.content_pattern = Some(format!("%{}%", query));
+                f
+            }
+        };
+        // Belt-and-braces: if claude returned a totally empty filter,
+        // fall back to substring search instead of returning the whole
+        // DB.
+        let any_set = filters.source_id.is_some()
+            || filters.source_ids.is_some()
+            || filters.is_read.is_some()
+            || filters.is_starred.is_some()
+            || filters.folder.is_some()
+            || filters.sender_pattern.is_some()
+            || filters.source_type.is_some()
+            || filters.content_pattern.is_some();
+        if !any_set {
+            filters.content_pattern = Some(format!("%{}%", query));
+        }
+
+        // Apply + persist so the 5s refresh doesn't blank the results.
+        self.filtered_messages = self.db.get_messages(&filters, 500, 0);
+        for msg in &mut self.filtered_messages {
+            if let Some(st) = self.source_type_map.get(&msg.source_id) {
+                msg.source_type = st.clone();
+            }
+        }
+        self.index = 0;
+        let n = self.filtered_messages.len();
+        let summary = self.filter_summary(&filters);
+        self.active_search_label = format!(":search “{}”", query);
+        self.active_search_filter = Some(filters);
+        self.set_feedback(
+            &format!(":search → {} match{}  [{}]  (Esc clears)",
+                n,
+                if n == 1 { "" } else { "es" },
+                summary),
+            tc.feedback_ok);
+        self.render_all();
+    }
+
+    /// Decode a JSON object (claude's response) into a `Filters` struct.
+    /// Unknown / missing fields are left as None.
+    fn filters_from_json(&self, v: &serde_json::Value) -> Filters {
+        let mut f = Filters::default();
+        if let Some(x) = v.get("source_id").and_then(|x| x.as_i64()) { f.source_id = Some(x); }
+        if let Some(arr) = v.get("source_ids").and_then(|x| x.as_array()) {
+            let ids: Vec<i64> = arr.iter().filter_map(|e| e.as_i64()).collect();
+            if !ids.is_empty() { f.source_ids = Some(ids); }
+        }
+        if let Some(x) = v.get("is_read").and_then(|x| x.as_bool()) { f.is_read = Some(x); }
+        if let Some(x) = v.get("is_starred").and_then(|x| x.as_bool()) { f.is_starred = Some(x); }
+        if let Some(x) = v.get("folder").and_then(|x| x.as_str()) {
+            if !x.is_empty() { f.folder = Some(x.to_string()); }
+        }
+        if let Some(x) = v.get("sender_pattern").and_then(|x| x.as_str()) {
+            if !x.is_empty() { f.sender_pattern = Some(x.to_string()); }
+        }
+        if let Some(x) = v.get("source_type").and_then(|x| x.as_str()) {
+            if !x.is_empty() { f.source_type = Some(x.to_string()); }
+        }
+        if let Some(x) = v.get("content_pattern").and_then(|x| x.as_str()) {
+            if !x.is_empty() { f.content_pattern = Some(x.to_string()); }
+        }
+        f
+    }
+
+    /// Compact one-line summary of which Filters fields are active —
+    /// shown in the feedback bar after `:search` so the user can see
+    /// how claude interpreted their query.
+    fn filter_summary(&self, f: &Filters) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(id) = f.source_id { parts.push(format!("source={}", id)); }
+        if let Some(ref ids) = f.source_ids { parts.push(format!("sources={:?}", ids)); }
+        if let Some(b) = f.is_read { parts.push(format!("read={}", b)); }
+        if let Some(b) = f.is_starred { parts.push(format!("starred={}", b)); }
+        if let Some(ref s) = f.folder { parts.push(format!("folder={}", s)); }
+        if let Some(ref s) = f.sender_pattern { parts.push(format!("from={}", s)); }
+        if let Some(ref s) = f.source_type { parts.push(format!("type={}", s)); }
+        if let Some(ref s) = f.content_pattern { parts.push(format!("text={}", s)); }
+        if parts.is_empty() { "no filter".to_string() } else { parts.join(" ") }
+    }
+
+    /// `:` — generic colon-command prompt. Lets the user type any
+    /// command verb explicitly instead of hunting for the shortcut
+    /// (`:claude PROMPT`, `:search QUERY`, `:chat`, `:q`/`:quit`). Each
+    /// verb dispatches to the same code path as its shortcut, so
+    /// behaviour stays identical regardless of how the user invoked it.
+    /// Unknown verbs surface a feedback warning rather than failing
+    /// silently.
+    fn colon_command(&mut self) {
+        let raw = self.prompt(":", "");
+        self.render_bottom_bar();
+        let line = raw.trim();
+        if line.is_empty() { return; }
+        // Split into verb + remainder. `splitn(2, char::is_whitespace)`
+        // preserves the rest of the line as-is so prompts that include
+        // their own colons / arguments aren't mangled.
+        let mut it = line.splitn(2, char::is_whitespace);
+        let verb = it.next().unwrap_or("");
+        let rest = it.next().unwrap_or("").trim_start();
+        match verb {
+            "claude" => {
+                if rest.is_empty() {
+                    self.set_feedback(":claude needs a prompt", self.config.theme_colors.feedback_warn);
+                } else {
+                    self.run_claude_with_prompt(rest);
+                }
+            }
+            "chat" => { self.chat_command(); }
+            "search" => {
+                if rest.is_empty() {
+                    self.set_feedback(":search needs a query", self.config.theme_colors.feedback_warn);
+                } else {
+                    self.run_search_with_query(rest);
+                }
+            }
+            "q" | "quit" => { self.running = false; }
+            other => {
+                self.set_feedback(&format!("unknown command: {}", other),
+                    self.config.theme_colors.feedback_warn);
+            }
+        }
+    }
+
+    /// `C` — scribe-style `:chat`. Snapshots the current message to a
+    /// tempfile, suspends kastrup, execs `claude` interactively with
+    /// an initial prompt that points at the snapshot. On exit, the
+    /// terminal is handed back to kastrup and the snapshot is removed.
+    fn chat_command(&mut self) {
+        let (is_header, sender, subject, content) = match self.filtered_messages.get(self.index) {
+            Some(m) => (
+                m.is_header,
+                m.sender_name.as_deref().unwrap_or(&m.sender).to_string(),
+                m.subject.as_deref().unwrap_or("").to_string(),
+                m.content.clone(),
+            ),
+            None => return,
+        };
+        if is_header {
+            self.set_feedback(":chat needs a message selected", self.config.theme_colors.feedback_warn);
+            return;
+        }
+
+        let pid = std::process::id();
+        let tmpfile = format!("/tmp/kastrup-chat-{}.txt", pid);
+        let snapshot = format!(
+            "From: {}\nSubject: {}\n\n{}\n",
+            sender, subject, content
+        );
+        if std::fs::write(&tmpfile, &snapshot).is_err() {
+            self.set_feedback("could not write chat snapshot", self.config.theme_colors.feedback_warn);
+            return;
+        }
+
+        let initial = format!(
+            "I'm reading an email in kastrup. The full message (sender, subject, body) is in {}. \
+            Help me work with this email — read the snapshot when you need to. \
+            When you're done, /exit returns me to kastrup.",
+            tmpfile
+        );
+
+        // Hand the terminal off to claude. Bracketed-paste mode would
+        // interfere with claude's input handling, so disable it for
+        // the duration. Mirrors scribe's run_chat_session.
+        use std::io::Write as _;
+        print!("\x1b[?2004l");
+        let _ = std::io::stdout().flush();
+        Crust::cleanup();
+        Crust::clear_screen();
+
+        let _ = std::process::Command::new("claude")
+            .arg(&initial)
+            .status();
+
+        // Restore kastrup's terminal state and force a full repaint.
+        Crust::init();
+        print!("\x1b[?2004h");
+        let _ = std::io::stdout().flush();
+        let _ = std::fs::remove_file(&tmpfile);
+        self.handle_resize();
+        self.set_feedback("back from chat", self.config.theme_colors.feedback_ok);
     }
 
     fn run_ai_plugin(&mut self, label: &str, command: &str) {
