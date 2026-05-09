@@ -5451,7 +5451,11 @@ impl App {
             template.push('\n');
         }
 
-        self.run_editor_compose_at(&template, Some(2)); // cursor on To: line
+        // `m` = compose new. Land on line 2 (the empty `To: `), at column
+        // 5 (right after `To: `), in Insert mode so the next keystroke
+        // types the recipient. Reply/forward paths still use the plain
+        // `run_editor_compose_at` because their To: is already filled in.
+        self.run_editor_compose_at_full(&template, Some(2), Some(5), true);
     }
 
     /// Get displayable text content from a message, converting HTML if needed.
@@ -5806,6 +5810,22 @@ impl App {
     }
 
     fn run_editor_compose_at(&mut self, template: &str, start_line: Option<usize>) {
+        self.run_editor_compose_at_full(template, start_line, None, false);
+    }
+
+    /// Same as `run_editor_compose_at` plus column hint and "start in
+    /// Insert mode". Both extras are scribe-only — the column gets
+    /// passed as `--col N` (1-indexed chars), insert as `--insert`.
+    /// vim/vi/nvim ignore the unknown flags via shell expansion (we
+    /// just don't add them); other editors aren't sent the flags
+    /// either, so this stays compatible with whatever `$EDITOR` is.
+    fn run_editor_compose_at_full(
+        &mut self,
+        template: &str,
+        start_line: Option<usize>,
+        start_col: Option<usize>,
+        start_insert: bool,
+    ) {
         let tmpfile = format!("/tmp/kastrup_compose_{}.eml", std::process::id());
         if std::fs::write(&tmpfile, template).is_err() {
             self.set_feedback("Failed to create temp file", 196);
@@ -5841,11 +5861,34 @@ impl App {
         // flow doesn't need spell-on-open — pass --no-spell so the
         // user lands on the body instantly. They can :set spell once
         // they're done typing if they want a final check.
-        let scribe_extra = if is_scribe { " --no-spell" } else { "" };
-        let cmd_str = if supports_plus {
-            format!("{} +{}{} {} {}", editor, cursor_line, scribe_extra, args, escaped_file)
+        let mut scribe_extra = String::new();
+        if is_scribe {
+            scribe_extra.push_str(" --no-spell");
+            if let Some(c) = start_col {
+                scribe_extra.push_str(&format!(" --col {}", c));
+            }
+            if start_insert {
+                scribe_extra.push_str(" --insert");
+            }
+        }
+        // For vim, simulate insert-after-To: with `-c startinsert` plus a
+        // column move. Cheap and worth it: `m` is the daily compose path.
+        let vim_extra = if is_vim_family && (start_col.is_some() || start_insert) {
+            let mut extra = String::new();
+            if let Some(c) = start_col {
+                extra.push_str(&format!(" -c \"normal! {}|\"", c));
+            }
+            if start_insert {
+                extra.push_str(" -c startinsert");
+            }
+            extra
         } else {
-            format!("{}{} {} {}", editor, scribe_extra, args, escaped_file)
+            String::new()
+        };
+        let cmd_str = if supports_plus {
+            format!("{} +{}{}{} {} {}", editor, cursor_line, scribe_extra, vim_extra, args, escaped_file)
+        } else {
+            format!("{}{}{} {} {}", editor, scribe_extra, vim_extra, args, escaped_file)
         };
         let status = std::process::Command::new("sh")
             .arg("-c")
