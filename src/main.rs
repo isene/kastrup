@@ -7269,9 +7269,11 @@ impl App {
     /// through `claude -p`, show the response in the right pane. Used
     /// both by the `c` shortcut and by the `:` colon-command dispatch.
     fn run_claude_with_prompt(&mut self, user_prompt: &str) {
-        let (is_header, sender, subject, content) = match self.filtered_messages.get(self.index) {
+        let (is_header, msg_id, thread_id, sender, subject, content) = match self.filtered_messages.get(self.index) {
             Some(m) => (
                 m.is_header,
+                m.id,
+                m.thread_id.clone(),
                 m.sender_name.as_deref().unwrap_or(&m.sender).to_string(),
                 m.subject.as_deref().unwrap_or("").to_string(),
                 if m.content.len() > 8000 { m.content[..8000].to_string() } else { m.content.clone() },
@@ -7288,9 +7290,21 @@ impl App {
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
 
+        // Reference line so a Claude Code session with the heathrow
+        // skill loaded can pull thread / sender history live. Plain
+        // `claude -p` without the skill ignores this and works off the
+        // inline content below — no regression either way.
+        let mut ref_line = format!("Message reference: heathrow:{}", msg_id);
+        if let Some(ref tid) = thread_id {
+            if !tid.is_empty() {
+                ref_line.push_str(&format!(" (thread: {})", tid));
+            }
+        }
+        ref_line.push_str(" — pull thread / sender history via the heathrow skill if available.");
+
         let full_prompt = format!(
-            "{}\n\nContext, email from {} about \"{}\":\n{}",
-            user_prompt, sender, subject, content
+            "{}\n\n{}\n\nContext, email from {} about \"{}\":\n{}",
+            user_prompt, ref_line, sender, subject, content
         );
 
         let result = std::process::Command::new("claude")
@@ -7537,9 +7551,11 @@ impl App {
     /// an initial prompt that points at the snapshot. On exit, the
     /// terminal is handed back to kastrup and the snapshot is removed.
     fn chat_command(&mut self) {
-        let (is_header, sender, subject, content) = match self.filtered_messages.get(self.index) {
+        let (is_header, msg_id, thread_id, sender, subject, content) = match self.filtered_messages.get(self.index) {
             Some(m) => (
                 m.is_header,
+                m.id,
+                m.thread_id.clone(),
                 m.sender_name.as_deref().unwrap_or(&m.sender).to_string(),
                 m.subject.as_deref().unwrap_or("").to_string(),
                 m.content.clone(),
@@ -7554,19 +7570,29 @@ impl App {
         let pid = std::process::id();
         let tmpfile = format!("/tmp/kastrup-chat-{}.txt", pid);
         let snapshot = format!(
-            "From: {}\nSubject: {}\n\n{}\n",
-            sender, subject, content
+            "heathrow:{}\nFrom: {}\nSubject: {}\n\n{}\n",
+            msg_id, sender, subject, content
         );
         if std::fs::write(&tmpfile, &snapshot).is_err() {
             self.set_feedback("could not write chat snapshot", self.config.theme_colors.feedback_warn);
             return;
         }
 
+        // Reference the message both by its heathrow:ID handle (so the
+        // heathrow skill can pull thread / sender history / related
+        // messages live from the DB) and by the inline tempfile snapshot
+        // (a no-tools fallback). Thread id, when present, lets the skill
+        // pull the rest of the thread without re-deriving it.
+        let thread_hint = match thread_id.as_deref() {
+            Some(tid) if !tid.is_empty() => format!(" Thread id: {}.", tid),
+            _ => String::new(),
+        };
         let initial = format!(
-            "I'm reading an email in kastrup. The full message (sender, subject, body) is in {}. \
-            Help me work with this email — read the snapshot when you need to. \
+            "I'm reading email heathrow:{} in kastrup. Use the heathrow skill to pull \
+            thread / sender history / related messages from the DB when useful.{} \
+            The current message body is also snapshotted to {} for quick reference. \
             When you're done, /exit returns me to kastrup.",
-            tmpfile
+            msg_id, thread_hint, tmpfile
         );
 
         // Hand the terminal off to claude. Bracketed-paste mode would
