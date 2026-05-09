@@ -1,6 +1,7 @@
 mod config;
 mod database;
 mod log;
+mod mailfile;
 mod message;
 mod organizer;
 mod poller;
@@ -443,6 +444,12 @@ struct App {
     browsed_ids: HashSet<i64>,
     unseen_ids: HashSet<i64>,
 
+    /// Optional asmite count-file writer, mirrored from
+    /// `~/.gmail.conf`. When present, every read-state mutation
+    /// triggers `sync_mail_count()` so the strip display reflects
+    /// kastrup's own reads (not just gmail-idle deliveries).
+    mailfile_cfg: Option<mailfile::MailfileConfig>,
+
     folder_collapsed: HashMap<String, bool>,
     folder_count_cache: HashMap<String, (i64, i64)>,
 
@@ -527,19 +534,36 @@ fn main() {
     let border = config.border_style;
     let (top, left, right, bottom) = create_panes(cols, rows, width, border, &config);
 
+    // Load the asmite-count-file config (mirrors what gmail-idle writes
+    // so the strip display drops the count when the user reads here too).
+    // Cloned into the writer thread so unread-affecting ops can rewrite
+    // the count file synchronously with the DB mutation.
+    let mailfile_cfg_main: Option<mailfile::MailfileConfig> = {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        mailfile::MailfileConfig::load(std::path::Path::new(&home))
+    };
+
     // Spawn background DB writer thread
     let (write_tx, write_rx) = std_mpsc::channel::<DbWriteOp>();
     let writer_db = db.clone();
     let messages_dirty = Arc::new(AtomicBool::new(false));
     let writer_dirty = messages_dirty.clone();
+    let writer_mailfile = mailfile_cfg_main.clone();
     std::thread::spawn(move || {
         while let Ok(op) = write_rx.recv() {
+            // Track whether this op changes counts the asmite cares about
+            // (unread or folder membership). Rewriting the count file on
+            // every op would be wasteful; gate it.
+            let mut counts_dirty = false;
             match op {
-                DbWriteOp::MarkRead(id) => { writer_db.mark_as_read(id); }
-                DbWriteOp::MarkUnread(id) => { writer_db.mark_as_unread(id); }
+                DbWriteOp::MarkRead(id) => { writer_db.mark_as_read(id); counts_dirty = true; }
+                DbWriteOp::MarkUnread(id) => { writer_db.mark_as_unread(id); counts_dirty = true; }
                 DbWriteOp::ToggleStar(id) => { writer_db.toggle_star(id); }
-                DbWriteOp::DeleteMessages(ids) => { writer_db.delete_messages(&ids); }
-                DbWriteOp::UpdateFolder(id, folder, meta) => { writer_db.update_message_folder(id, &folder, &meta); }
+                DbWriteOp::DeleteMessages(ids) => { writer_db.delete_messages(&ids); counts_dirty = true; }
+                DbWriteOp::UpdateFolder(id, folder, meta) => {
+                    writer_db.update_message_folder(id, &folder, &meta);
+                    counts_dirty = true;
+                }
                 DbWriteOp::UpdateLabels(id, json) => {
                     let conn = writer_db.conn.lock().unwrap();
                     let _ = conn.execute("UPDATE messages SET labels = ? WHERE id = ?", rusqlite::params![json, id]);
@@ -562,6 +586,12 @@ fn main() {
             // so the periodic refresh actually fetches. SetSetting is a
             // false positive but cheap — one extra refresh vs 720/hour saved.
             writer_dirty.store(true, Ordering::Relaxed);
+            if counts_dirty {
+                if let Some(ref cfg) = writer_mailfile {
+                    let counts = writer_db.all_folder_counts();
+                    mailfile::write_count_file(cfg, &counts);
+                }
+            }
         }
     });
 
@@ -592,6 +622,7 @@ fn main() {
         delete_marked: HashSet::new(),
         browsed_ids: HashSet::new(),
         unseen_ids: HashSet::new(),
+        mailfile_cfg: mailfile_cfg_main,
         folder_collapsed: HashMap::new(),
         folder_count_cache: HashMap::new(),
         feedback_message: None,
@@ -626,6 +657,11 @@ fn main() {
     if app.db.is_empty() && app.db.get_sources(false).is_empty() {
         app.first_run_wizard();
     }
+
+    // Sync the asmite count file from current DB state at startup so a
+    // stale count from before this version was running gets corrected
+    // immediately, not on the next read mutation.
+    app.sync_mail_count();
 
     // Start background poller
     let (poller_tx, poller_rx) = std::sync::mpsc::channel();
@@ -2062,6 +2098,17 @@ impl App {
                     msg.source_type = st.clone();
                 }
             }
+            // Newly arrived unread messages get put in unseen_ids so the
+            // background refresh tick can't auto-mark them read just because
+            // the cursor's index happens to land on the new row. The user
+            // has to actually navigate to them (existing render-side logic
+            // at line 1319-1322 clears the protection on navigate-away-and-back).
+            let old_id_set: HashSet<i64> = old_ids.iter().copied().collect();
+            for msg in &self.filtered_messages {
+                if !msg.read && !old_id_set.contains(&msg.id) {
+                    self.unseen_ids.insert(msg.id);
+                }
+            }
             // Best-effort cursor preservation: keep cursor on same id
             // if it survived; otherwise stay at the same index slot.
             if let Some(id) = saved_id {
@@ -2072,7 +2119,7 @@ impl App {
                 }
             }
             // Mute warnings about unread caches we don't use here.
-            let _ = (old_ids, old_read);
+            let _ = old_read;
             self.sort_messages();
             self.rebuild_display();
             self.left.full_refresh();
@@ -2130,6 +2177,16 @@ impl App {
         let old_id_set: std::collections::HashSet<i64> = old_ids.iter().copied().collect();
         let new_id_set: std::collections::HashSet<i64> =
             self.filtered_messages.iter().map(|m| m.id).collect();
+        // Newly arrived unread messages get added to unseen_ids so the
+        // background refresh tick can't auto-mark them read just because
+        // the cursor's index happens to land on the new row. Existing
+        // render-side logic at line 1319-1322 clears the protection
+        // when the user explicitly navigates away and back.
+        for msg in &self.filtered_messages {
+            if !msg.read && !old_id_set.contains(&msg.id) {
+                self.unseen_ids.insert(msg.id);
+            }
+        }
         if old_id_set == new_id_set && !old_ids.is_empty() {
             let pos: std::collections::HashMap<i64, usize> =
                 old_ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
@@ -2744,7 +2801,20 @@ impl App {
 // --- Message operations ---
 
 impl App {
+    /// Rewrite the asmite count file from current DB state. No-op when
+    /// `~/.gmail.conf` doesn't expose `$mailfile`/`$mailboxes`. Called
+    /// after every synchronous read-state mutation; the async writer
+    /// thread does the same after `MarkRead`/`MarkUnread`/`Delete`/
+    /// `UpdateFolder` so both paths stay in sync.
+    fn sync_mail_count(&self) {
+        if let Some(ref cfg) = self.mailfile_cfg {
+            let counts = self.db.all_folder_counts();
+            mailfile::write_count_file(cfg, &counts);
+        }
+    }
+
     fn open_message(&mut self) {
+        let mut became_read = false;
         if self.show_threaded {
             if let Some(msg) = self.display_messages.get_mut(self.index) {
                 if msg.is_header { return; }
@@ -2752,6 +2822,7 @@ impl App {
                 if !msg.read {
                     self.db.mark_as_read(msg.id);
                     msg.read = true;
+                    became_read = true;
                     // Also mark in filtered_messages
                     if let Some(fm) = self.filtered_messages.iter_mut().find(|m| m.id == msg.id) {
                         fm.read = true;
@@ -2770,6 +2841,7 @@ impl App {
             if !msg.read {
                 self.db.mark_as_read(msg.id);
                 msg.read = true;
+                became_read = true;
             }
             if !msg.full_loaded {
                 if let Some((content, html)) = self.db.get_message_content(msg.id) {
@@ -2779,6 +2851,7 @@ impl App {
                 }
             }
         }
+        if became_read { self.sync_mail_count(); }
         self.render_all();
     }
 
@@ -2810,12 +2883,14 @@ impl App {
             self.set_feedback(
                 &format!("Marked {} tagged as {}", tagged_ids.len(), label),
                 self.config.theme_colors.feedback_ok);
+            self.sync_mail_count();
             self.render_all();
             return;
         }
         if let Some(msg) = self.filtered_messages.get_mut(self.index) {
             let new_state = self.db.toggle_read(msg.id);
             msg.read = new_state;
+            self.sync_mail_count();
             self.render_all();
         }
     }
@@ -2828,6 +2903,7 @@ impl App {
             msg.read = true;
         }
         self.set_feedback("Marked all as read", self.config.theme_colors.feedback_ok);
+        self.sync_mail_count();
         self.render_all();
     }
 
@@ -4072,6 +4148,7 @@ impl App {
         }
         self.browsed_ids.clear();
         self.set_feedback(&format!("Marked {} browsed message(s) as read", count), self.config.theme_colors.feedback_ok);
+        self.sync_mail_count();
         self.render_all();
     }
 
