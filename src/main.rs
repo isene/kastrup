@@ -7478,14 +7478,26 @@ impl App {
         let query = query.to_string();
         let tc = self.config.theme_colors.clone();
         // Build a compact live source roster so claude can resolve names.
+        // Also derive the distinct set of plugin_type values present in the
+        // DB — `source_type` is filtered by EXACT plugin_type match, so the
+        // prompt must use the actual schema values (e.g. "maildir" for
+        // email accounts, not the friendly word "email").
         let mut roster = String::new();
+        let mut types_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for src in &self.sources_list {
             roster.push_str(&format!("- id={} type={} name=\"{}\"\n",
                 src.id, src.plugin_type, src.name));
+            types_set.insert(src.plugin_type.clone());
         }
         if roster.is_empty() {
             roster.push_str("(no sources registered)\n");
         }
+        let types_list = if types_set.is_empty() {
+            "(none)".to_string()
+        } else {
+            types_set.iter().map(|t| format!("\"{}\"", t))
+                .collect::<Vec<_>>().join(" | ")
+        };
 
         let system_prompt = format!(
             "You are a search assistant for kastrup, a unified messaging hub backed by a SQLite \
@@ -7499,20 +7511,27 @@ impl App {
             \"is_starred\": bool|null,\n\
             \"folder\": str|null,              // exact maildir folder name\n\
             \"sender_pattern\": str|null,      // SQL LIKE pattern, e.g. \"%bob%\"\n\
-            \"source_type\": str|null,         // \"email\" | \"rss\" | \"irc\" | \"messenger\" | \"instagram\" | \"workspace\"\n\
+            \"source_type\": str|null,         // EXACT plugin_type (see roster); valid values: {}\n\
             \"content_pattern\": str|null      // SQL LIKE pattern matching subject+body\n\
             }}\n\
             \n\
             Rules:\n\
             - Output ONLY the JSON, no markdown fences, no commentary.\n\
             - Use SQL LIKE wildcards (%) liberally for substring matching.\n\
+            - Preserve special characters (æ, ø, å, é, etc.) verbatim in patterns —\n\
+              do NOT transliterate them to ASCII.\n\
             - For \"unread\" / \"new\" set is_read=false.\n\
             - For \"starred\" / \"flagged\" set is_starred=true.\n\
+            - For \"email\" / \"mail\" set source_type to whichever roster type\n\
+              represents email (typically \"maildir\"); never invent values not in\n\
+              the valid-values list above.\n\
+            - Only set source_type when the user explicitly constrains the\n\
+              channel; sender_pattern alone is usually enough.\n\
             - Map source/channel mentions against the roster below.\n\
             \n\
             Available sources:\n{}\n\
             User query: {}",
-            roster, query
+            types_list, roster, query
         );
 
         self.set_feedback("Asking claude…", tc.unread);
