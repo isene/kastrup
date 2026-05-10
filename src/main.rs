@@ -7350,10 +7350,15 @@ impl App {
 
         self.set_feedback("Asking AI...", tc.unread);
 
-        // Try claude CLI first, then curl to OpenAI
+        // Try claude CLI first, then curl to OpenAI.
+        // stdin must be /dev/null: kastrup runs in raw-mode TTY, so
+        // claude inherits that fd and prints "Warning: no stdin data
+        // received in 3s, proceeding without it." onto stdout, which
+        // contaminates the response we then try to parse.
         let result = std::process::Command::new("claude")
             .arg("-p")
             .arg(&ai_prompt)
+            .stdin(std::process::Stdio::null())
             .output();
 
         let response = if let Ok(output) = result {
@@ -7430,6 +7435,7 @@ impl App {
         let result = std::process::Command::new("claude")
             .arg("-p")
             .arg(&full_prompt)
+            .stdin(std::process::Stdio::null())
             .output();
         let response = if let Ok(output) = result {
             if output.status.success() {
@@ -7516,6 +7522,7 @@ impl App {
         let result = std::process::Command::new("claude")
             .arg("-p")
             .arg(&system_prompt)
+            .stdin(std::process::Stdio::null())
             .output();
         let raw = if let Ok(output) = result {
             if output.status.success() {
@@ -7531,15 +7538,22 @@ impl App {
             return;
         }
 
-        // Strip occasional markdown-fence wrappers claude sometimes
-        // adds despite instructions.
-        let cleaned = raw.trim();
-        let cleaned = cleaned.trim_start_matches("```json").trim_start_matches("```")
-            .trim_end_matches("```").trim();
-
-        let mut filters = match serde_json::from_str::<serde_json::Value>(cleaned) {
-            Ok(v) => self.filters_from_json(&v),
-            Err(_) => {
+        // Robust JSON extraction: locate the outermost `{ … }` and
+        // parse just that. This survives markdown fences, leading
+        // warnings (the 3-s "no stdin data" notice was the original
+        // 0-result trigger), and any other preamble/postamble noise.
+        // Walk the bytes tracking quote state so a `}` inside a string
+        // doesn't close the object early.
+        let json_slice = extract_json_object(&raw);
+        let mut filters = match json_slice.and_then(|s|
+            serde_json::from_str::<serde_json::Value>(s).ok())
+        {
+            Some(v) => self.filters_from_json(&v),
+            None => {
+                log::info(&format!(
+                    "search: claude response unparseable, falling back to substring. raw={:?}",
+                    raw.chars().take(300).collect::<String>()
+                ));
                 // Fallback: treat the raw query as a content substring.
                 let mut f = Filters::default();
                 f.content_pattern = Some(format!("%{}%", query));
@@ -8121,6 +8135,39 @@ impl App {
 }
 
 // --- MIME / QP decoding ---
+
+/// Find the outermost JSON object literal in `s` and return a slice
+/// covering it (inclusive of the braces). Walks bytes tracking string
+/// state so a brace inside `"…"` doesn't close the object early.
+/// Returns None if the input has no balanced object.
+fn extract_json_object(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+    let mut depth: i32 = 0;
+    let mut in_str = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if escape { escape = false; continue; }
+        if in_str {
+            match b {
+                b'\\' => escape = true,
+                b'"'  => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 { return Some(&s[start..=i]); }
+            }
+            _ => {}
+        }
+    }
+    None
+}
 
 /// Extract readable text from raw MIME multipart content.
 fn extract_mime_text(raw: &str) -> Option<String> {
