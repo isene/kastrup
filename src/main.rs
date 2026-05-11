@@ -68,6 +68,27 @@ struct FolderEntry {
 /// (newsletter HTML→text emitters often do that). Patterns are
 /// deliberately narrow — anchor cannot contain brackets — so they
 /// don't chew up prose that happens to contain bracketed phrases.
+/// Case-insensitive `strip_prefix` for RFC-style mail headers. Pass
+/// the header name without the colon (e.g. "To", "Cc", "Bcc"); the
+/// function matches `"<name>: "` regardless of case (`"To: "`,
+/// `"to: "`, `"CC: "`, `"BCC: "`, …). Returns the value portion.
+/// Centralised so all four compose-header parsers stay consistent —
+/// the user can type any casing and the To/Cc/Bcc expansion catches it.
+fn strip_header_ci<'a>(line: &'a str, header: &str) -> Option<&'a str> {
+    let need = header.len() + 2; // "<name>: "
+    if line.len() < need { return None; }
+    let (prefix, rest) = line.split_at(need);
+    let bytes = prefix.as_bytes();
+    if bytes[header.len()] != b':' || bytes[header.len() + 1] != b' ' {
+        return None;
+    }
+    if prefix[..header.len()].eq_ignore_ascii_case(header) {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
 fn collapse_bracketed_links(body: &str) -> String {
     use std::sync::OnceLock;
     static EMBEDDED: OnceLock<regex::Regex> = OnceLock::new();
@@ -3517,7 +3538,7 @@ impl App {
   x              Open in external app\n\
   X              Open HTML in browser\n\n\
 {}\n\
-  /              Search messages (notmuch + DB substring)\n\
+  /              Search messages (DB content substring, sticky)\n\
   S              :search (claude → Filters → message list)\n\
   l              Label message\n\
   s              File/save message\n\
@@ -3831,56 +3852,41 @@ impl App {
         }
     }
 
+    /// `/` — search across the entire SQLite DB, all sources. The
+    /// query is wrapped in `%…%` and passed as a content_pattern
+    /// filter; the filter is persisted as the active sticky search
+    /// so the 5s background refresh doesn't blank the results. The
+    /// previous implementation ran `notmuch search` first, but
+    /// notmuch only indexes maildir (4 of 5 source types missed) and
+    /// kastrup already indexes everything into the DB on ingest, so
+    /// keeping a second Xapian index in lock-step was wasted work
+    /// (and one more `notmuch new` subprocess spawn per delivery).
     fn search_prompt(&mut self) {
         let query = self.prompt("/", "");
         self.render_bottom_bar();
         if query.is_empty() { return; }
 
-        // Try notmuch first
-        let notmuch = std::process::Command::new("notmuch")
-            .args(["search", "--format=json", "--output=summary", &query])
-            .output();
-
-        if let Ok(output) = notmuch {
-            if output.status.success() {
-                let json_str = String::from_utf8_lossy(&output.stdout);
-                if let Ok(results) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
-                    if !results.is_empty() {
-                        // Search DB for matching content; persist the
-                        // filter so the 5s refresh keeps these results.
-                        let mut filters = Filters::default();
-                        filters.content_pattern = Some(query.clone());
-                        self.filtered_messages = self.db.get_messages(&filters, 500, 0);
-                        for msg in &mut self.filtered_messages {
-                            if let Some(st) = self.source_type_map.get(&msg.source_id) {
-                                msg.source_type = st.clone();
-                            }
-                        }
-                        self.index = 0;
-                        self.active_search_label = format!("/{}", query);
-                        self.active_search_filter = Some(filters);
-                        self.set_feedback(&format!("Notmuch: {} results  (Esc clears)", self.filtered_messages.len()), self.config.theme_colors.feedback_ok);
-                        self.render_all();
-                        return;
-                    }
-                }
+        let mut filters = Filters::default();
+        filters.content_pattern = Some(format!("%{}%", query));
+        self.filtered_messages = self.db.get_messages(&filters, 500, 0);
+        for msg in &mut self.filtered_messages {
+            if let Some(st) = self.source_type_map.get(&msg.source_id) {
+                msg.source_type = st.clone();
             }
         }
-
-        // Fallback: simple DB substring search
-        let lower = query.to_lowercase();
-        if let Some(pos) = self.filtered_messages.iter().skip(self.index + 1).position(|msg| {
-            let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
-            let subject = msg.subject.as_deref().unwrap_or("");
-            sender.to_lowercase().contains(&lower)
-                || subject.to_lowercase().contains(&lower)
-                || msg.content.to_lowercase().contains(&lower)
-        }) {
-            self.index = self.index + 1 + pos;
-            self.render_all();
+        self.index = 0;
+        let n = self.filtered_messages.len();
+        self.active_search_label = format!("/{}", query);
+        self.active_search_filter = Some(filters);
+        if n > 0 {
+            self.set_feedback(
+                &format!("/ → {} match{}  (Esc clears)",
+                    n, if n == 1 { "" } else { "es" }),
+                self.config.theme_colors.feedback_ok);
         } else {
             self.set_feedback("No matches found", self.config.theme_colors.feedback_warn);
         }
+        self.render_all();
     }
 
     fn set_view_color(&mut self) {
@@ -5565,9 +5571,9 @@ impl App {
             } else if line.trim().is_empty() {
                 in_body = true;
             } else if let Some(v) = line.strip_prefix("From: ") { from = v.to_string(); }
-            else if let Some(v) = line.strip_prefix("To: ") { to = v.to_string(); }
-            else if let Some(v) = line.strip_prefix("Cc: ") { cc = v.to_string(); }
-            else if let Some(v) = line.strip_prefix("Bcc: ") { bcc = v.to_string(); }
+            else if let Some(v) = strip_header_ci(line, "To") { to = v.to_string(); }
+            else if let Some(v) = strip_header_ci(line, "Cc") { cc = v.to_string(); }
+            else if let Some(v) = strip_header_ci(line, "Bcc") { bcc = v.to_string(); }
             else if let Some(v) = line.strip_prefix("Subject: ") { subject = v.to_string(); }
         }
 
@@ -5619,11 +5625,11 @@ impl App {
             } else if line.trim().is_empty() {
                 in_body = true;
                 result.push('\n');
-            } else if let Some(val) = line.strip_prefix("To: ") {
+            } else if let Some(val) = strip_header_ci(line, "To") {
                 result.push_str(&format!("To: {}\n", self.expand_address_field_interactive(val)));
-            } else if let Some(val) = line.strip_prefix("Cc: ") {
+            } else if let Some(val) = strip_header_ci(line, "Cc") {
                 result.push_str(&format!("Cc: {}\n", self.expand_address_field_interactive(val)));
-            } else if let Some(val) = line.strip_prefix("Bcc: ") {
+            } else if let Some(val) = strip_header_ci(line, "Bcc") {
                 result.push_str(&format!("Bcc: {}\n", self.expand_address_field_interactive(val)));
             } else {
                 result.push_str(line);
@@ -6062,9 +6068,9 @@ impl App {
             if in_body { body_lines.push(line); }
             else if line.trim().is_empty() { in_body = true; }
             else if let Some(val) = line.strip_prefix("From: ") { from = val.trim().to_string(); }
-            else if let Some(val) = line.strip_prefix("To: ") { to = val.trim().to_string(); }
-            else if let Some(val) = line.strip_prefix("Cc: ") { cc = val.trim().to_string(); }
-            else if let Some(val) = line.strip_prefix("Bcc: ") { bcc = val.trim().to_string(); }
+            else if let Some(val) = strip_header_ci(line, "To") { to = val.trim().to_string(); }
+            else if let Some(val) = strip_header_ci(line, "Cc") { cc = val.trim().to_string(); }
+            else if let Some(val) = strip_header_ci(line, "Bcc") { bcc = val.trim().to_string(); }
             else if let Some(val) = line.strip_prefix("Subject: ") { subject = val.trim().to_string(); }
             else if let Some(val) = line.strip_prefix("Reply-To: ") { reply_to = val.trim().to_string(); }
         }
@@ -6178,11 +6184,11 @@ impl App {
                 in_body = true;
             } else if let Some(val) = line.strip_prefix("From: ") {
                 from = val.trim().to_string();
-            } else if let Some(val) = line.strip_prefix("To: ") {
+            } else if let Some(val) = strip_header_ci(line, "To") {
                 to = val.trim().to_string();
-            } else if let Some(val) = line.strip_prefix("Cc: ") {
+            } else if let Some(val) = strip_header_ci(line, "Cc") {
                 cc = val.trim().to_string();
-            } else if let Some(val) = line.strip_prefix("Bcc: ") {
+            } else if let Some(val) = strip_header_ci(line, "Bcc") {
                 bcc = val.trim().to_string();
             } else if let Some(val) = line.strip_prefix("Subject: ") {
                 subject = val.trim().to_string();

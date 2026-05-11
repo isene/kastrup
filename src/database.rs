@@ -238,11 +238,41 @@ impl Database {
             .unwrap_or_default();
         drop(stmt);
 
-        // Group by maildir_file; within each group keep id=MIN, queue others for delete
+        // Group by the maildir BASENAME (stable across folder moves
+        // and flag changes), not the full filesystem path. When a
+        // message is saved/archived the parent dir changes but the
+        // basename (and its `:2,FLAGS` suffix is also stripped here)
+        // stays the same — so two rows that share a basename are
+        // the same physical message and one must go.
+        //
+        // We also accept rows whose `maildir_file` is missing by
+        // falling back to the external_id's basename component.
         let mut groups: HashMap<String, Vec<(i64, String, Option<String>)>> = HashMap::new();
         for (id, ext, folder, file) in &rows {
-            if let Some(f) = file {
-                groups.entry(f.clone())
+            let key = file.as_deref()
+                .and_then(|f| std::path::Path::new(f).file_name())
+                .and_then(|f| f.to_str())
+                .map(|s| s.split(":2,").next().unwrap_or(s).to_string())
+                .or_else(|| {
+                    // Fallback: pull basename out of the external_id.
+                    let no_flags = ext.split(":2,").next().unwrap_or(ext);
+                    // Skip past "maildir_<folder>_" to the digit-run.
+                    let bytes = no_flags.as_bytes();
+                    let mut i = 0;
+                    while i < bytes.len() {
+                        if bytes[i].is_ascii_digit() {
+                            let start = i;
+                            while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+                            let run = i - start;
+                            if (9..=12).contains(&run) && i < bytes.len() && bytes[i] == b'.' {
+                                return Some(no_flags[start..].to_string());
+                            }
+                        } else { i += 1; }
+                    }
+                    None
+                });
+            if let Some(k) = key {
+                groups.entry(k)
                     .or_default()
                     .push((*id, ext.clone(), folder.clone()));
             }

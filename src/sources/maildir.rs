@@ -9,6 +9,30 @@ pub fn sync_maildir(maildir_path: &str, known_ids: &HashSet<String>, last_sync: 
 
     let mut messages = Vec::new();
 
+    // Build a folder-agnostic dedup set of bare maildir basenames.
+    // The known_ids set holds full ext_ids like
+    //   `maildir_INBOX_1715407823.M123P12.host:2,RS`
+    // plus the folder-prefixed base without flags
+    //   `maildir_INBOX_1715407823.M123P12.host`
+    // Neither catches the case where the user MOVES the file from
+    // INBOX to a different folder (Save / Archive): the folder
+    // component flips and the prefixed form no longer matches.
+    // Strip both the leading `maildir_<folder>_` AND the trailing
+    // `:2,FLAGS` so we end up with just the maildir basename
+    // (`<epoch>.<unique>.<host>`) and store that. Then a moved file
+    // is recognised as known regardless of which folder it lives in
+    // now.
+    let known_bases: HashSet<String> = known_ids.iter()
+        .filter_map(|k| {
+            let no_flags = k.split(":2,").next().unwrap_or(k);
+            let no_prefix = no_flags.strip_prefix("maildir_").unwrap_or(no_flags);
+            // Folder names can contain underscores, so scan from the
+            // right for the FIRST `<10+ digits>.` run (maildir epoch)
+            // and take everything from there.
+            extract_maildir_basename(no_prefix).map(str::to_string)
+        })
+        .collect();
+
     // Discover folders
     let mut folders: Vec<(String, PathBuf)> = vec![("INBOX".to_string(), root.to_path_buf())];
     if let Ok(entries) = std::fs::read_dir(root) {
@@ -64,6 +88,14 @@ pub fn sync_maildir(maildir_path: &str, known_ids: &HashSet<String>, last_sync: 
                     || known_ids.contains(base)
                     || known_ids.contains(&base_pre)
                 { continue; }
+                // Folder-move dedup: same physical message in a
+                // different maildir folder. The bare basename is the
+                // stable identity; if we've seen it elsewhere, this
+                // is the post-Save / post-Archive view of the same
+                // message — skip.
+                if let Some(b) = extract_maildir_basename(base) {
+                    if known_bases.contains(b) { continue; }
+                }
 
                 // Parse email headers
                 if let Some(msg) = parse_maildir_file(&path, folder_name, &filename) {
@@ -363,4 +395,67 @@ fn parse_date(date_str: &str) -> Option<i64> {
     let days = era * 146097 + doe - 719468;
 
     Some(days * 86400 + hour * 3600 + min * 60 + sec - tz_offset)
+}
+
+/// Extract the stable maildir basename from a string that may be
+/// `<folder>_<basename>` (where folder can itself contain `_`), just
+/// `<basename>`, or anything else. Maildir basenames per DJB's spec
+/// begin with `<unix-epoch-seconds>` (10+ digits today, ≤2001 had
+/// fewer) followed by `.`. We scan from the LEFT for the FIRST
+/// digit-run-followed-by-`.` and treat everything from there to the
+/// end (minus any `:2,FLAGS` suffix) as the basename. Returns None
+/// when no such anchor is found (unusual — degraded gracefully by
+/// the caller's fallback dedup checks).
+fn extract_maildir_basename(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n {
+        // Find a digit run.
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < n && bytes[i].is_ascii_digit() { i += 1; }
+            // 10 digits = today's epoch width. Accept 9-12 to be tolerant.
+            let run_len = i - start;
+            if (9..=12).contains(&run_len) && i < n && bytes[i] == b'.' {
+                // Strip optional trailing `:2,FLAGS`.
+                let tail = s[start..].split(":2,").next().unwrap_or(&s[start..]);
+                return Some(tail);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basename_extracted_from_prefixed_id() {
+        let s = "maildir_INBOX_1715407823.M123P12.host:2,RS";
+        assert_eq!(extract_maildir_basename(s), Some("1715407823.M123P12.host"));
+    }
+
+    #[test]
+    fn basename_extracted_when_folder_has_underscores() {
+        let s = "maildir_PassionFruits.Archive_1715407823.M123P12.host:2,S";
+        assert_eq!(extract_maildir_basename(s), Some("1715407823.M123P12.host"));
+        let s = "maildir_some_dotted_folder_1715407823.M123P12.host";
+        assert_eq!(extract_maildir_basename(s), Some("1715407823.M123P12.host"));
+    }
+
+    #[test]
+    fn basename_unchanged_when_no_prefix() {
+        let s = "1715407823.M123P12.host";
+        assert_eq!(extract_maildir_basename(s), Some("1715407823.M123P12.host"));
+    }
+
+    #[test]
+    fn basename_none_when_no_epoch_anchor() {
+        let s = "not-a-maildir-name";
+        assert_eq!(extract_maildir_basename(s), None);
+    }
 }
