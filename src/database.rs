@@ -8,7 +8,7 @@ use crate::message::Message;
 use crate::source::Source;
 
 /// Filter criteria for querying messages
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Filters {
     pub source_id: Option<i64>,
     pub source_ids: Option<Vec<i64>>,
@@ -52,8 +52,26 @@ impl Database {
         let is_new = !path.exists();
         let conn = Connection::open(&path)
             .map_err(|e| format!("Failed to open database: {}", e))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
-            .map_err(|e| format!("Failed to set pragmas: {}", e))?;
+        // WAL + tuning aimed at "background daemon, never freeze the desktop":
+        //   - synchronous=NORMAL is safe under WAL (no corruption risk,
+        //     only loses the last commit on a power cut). FULL was
+        //     issuing an extra fsync per commit that landed in the
+        //     foreground IO queue.
+        //   - wal_autocheckpoint=200 keeps each WAL flush small
+        //     (~800 KB), so a checkpoint never becomes a multi-second
+        //     IO stall. The default 1000 batches more, costs less
+        //     total IO but spikes harder — wrong tradeoff for a
+        //     laptop where the user sees the spike.
+        //   - journal_size_limit caps the WAL at 64 MB so it can't
+        //     grow into a giant during a long write burst.
+        //   - busy_timeout=5000 unchanged: writers wait politely.
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;\n\
+             PRAGMA synchronous=NORMAL;\n\
+             PRAGMA wal_autocheckpoint=200;\n\
+             PRAGMA journal_size_limit=67108864;\n\
+             PRAGMA busy_timeout=5000;"
+        ).map_err(|e| format!("Failed to set pragmas: {}", e))?;
         if is_new {
             Self::create_schema(&conn)?;
         }
@@ -485,7 +503,64 @@ impl Database {
         new != 0
     }
 
-    /// Mark all messages as read, optionally filtered
+    /// Unread maildir rows only, scoped to the given source_ids so
+    /// the planner uses `idx_messages_source` instead of a full-table
+    /// scan. Combined with `read = 0`, the result set is exactly the
+    /// files that still need an `S` flag appended — typically zero
+    /// or a handful, even on a 250k-message DB. Used by
+    /// `mark_all_read` to avoid the metadata-LIKE scan that was
+    /// freezing the UI for seconds.
+    pub fn collect_unread_maildir_targets(
+        &self,
+        view_filter: Option<&Filters>,
+        maildir_source_ids: &[i64],
+    ) -> Vec<(serde_json::Value, i64)> {
+        if maildir_source_ids.is_empty() { return Vec::new(); }
+        let conn = self.conn.lock().unwrap();
+        let ph: Vec<&str> = maildir_source_ids.iter().map(|_| "?").collect();
+        let mut sql = format!(
+            "SELECT id, metadata FROM messages \
+             WHERE source_id IN ({}) AND (read = 0 OR read IS NULL) \
+               AND metadata IS NOT NULL",
+            ph.join(",")
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        for id in maildir_source_ids { param_values.push(Box::new(*id)); }
+        if let Some(f) = view_filter {
+            if let Some(sid) = f.source_id {
+                sql.push_str(" AND source_id = ?");
+                param_values.push(Box::new(sid));
+            }
+            if let Some(ref ids) = f.source_ids {
+                if !ids.is_empty() {
+                    let ph2: Vec<&str> = ids.iter().map(|_| "?").collect();
+                    sql.push_str(&format!(" AND source_id IN ({})", ph2.join(",")));
+                    for id in ids { param_values.push(Box::new(*id)); }
+                }
+            }
+            if let Some(ref folder) = f.folder {
+                sql.push_str(" AND folder = ?");
+                param_values.push(Box::new(folder.clone()));
+            }
+        }
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|b| b.as_ref()).collect();
+        let mut out = Vec::new();
+        let Ok(mut stmt) = conn.prepare(&sql) else { return out; };
+        let rows = stmt.query_map(refs.as_slice(), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        });
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                let (id, meta_opt) = row;
+                let Some(meta_str) = meta_opt else { continue };
+                let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) else { continue };
+                out.push((meta, id));
+            }
+        }
+        out
+    }
+
     pub fn mark_all_as_read(&self, view_filter: Option<&Filters>) {
         let conn = self.conn.lock().unwrap();
         match view_filter {
