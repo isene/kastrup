@@ -25,6 +25,15 @@ enum DbWriteOp {
     UpdateLabels(i64, String),
     UpdateMetadata(i64, String),
     SyncMaildirFlag(serde_json::Value, i64),
+    /// Mark-all-read end-to-end: collect unread maildir rows (scoped
+    /// to maildir source_ids + `read = 0`, so the scan is tiny even
+    /// on a 250k-message DB), flip read=1, then rename files +
+    /// bulk-update metadata. The whole thing runs on the writer
+    /// thread so the main loop never holds the conn mutex.
+    MarkAllReadBulk {
+        filters: Option<database::Filters>,
+        maildir_source_ids: Vec<i64>,
+    },
     SetSetting(String, String),
     Execute(String, Vec<String>), // raw SQL with string params
 }
@@ -542,14 +551,34 @@ fn main() {
         }
     }
 
+    // Phase-timing: emit a single line per startup phase so the next
+    // slow run (anything double-digit ms is suspect on a hot path,
+    // anything double-digit s is screaming for attention) tells us
+    // exactly which step blew the budget. Hot when idle: log writes
+    // ~6 lines once at startup, nothing on idle.
+    let t0 = std::time::Instant::now();
+    let mut phase = std::time::Instant::now();
+    let mut log_phase = |name: &str, p: &mut std::time::Instant| {
+        let now = std::time::Instant::now();
+        log::info(&format!("startup phase: {} took {} ms (total {} ms)",
+            name, now.duration_since(*p).as_millis(),
+            now.duration_since(t0).as_millis()));
+        *p = now;
+    };
+
     Crust::init();
     Crust::set_app_identity("Kastrup");
     let (cols, rows) = Crust::terminal_size();
+    log_phase("crust init + identity + termsize", &mut phase);
 
     let config = Config::load();
+    log_phase("config load", &mut phase);
     let db = Arc::new(Database::new().expect("Failed to open heathrow database"));
+    log_phase("database open + pragmas (incl. any WAL replay)", &mut phase);
     let source_type_map = db.get_source_type_map();
+    log_phase("source type map", &mut phase);
     let views = db.get_views();
+    log_phase("views", &mut phase);
 
     let width = config.pane_width;
     let border = config.border_style;
@@ -564,13 +593,16 @@ fn main() {
         mailfile::MailfileConfig::load(std::path::Path::new(&home))
     };
 
-    // Spawn background DB writer thread
+    // Spawn background DB writer thread. We KEEP the JoinHandle this
+    // time so the shutdown sequence can wait for the writer's final
+    // WAL truncate (otherwise the OS kills the thread mid-checkpoint
+    // when main returns, and the truncate-on-quit guarantee evaporates).
     let (write_tx, write_rx) = std_mpsc::channel::<DbWriteOp>();
     let writer_db = db.clone();
     let messages_dirty = Arc::new(AtomicBool::new(false));
     let writer_dirty = messages_dirty.clone();
     let writer_mailfile = mailfile_cfg_main.clone();
-    std::thread::spawn(move || {
+    let writer_handle = std::thread::spawn(move || {
         while let Ok(op) = write_rx.recv() {
             // Track whether this op changes counts the asmite cares about
             // (unread or folder membership). Rewriting the count file on
@@ -596,6 +628,40 @@ fn main() {
                 DbWriteOp::SyncMaildirFlag(metadata, id) => {
                     sync_maildir_seen_flag_bg(&metadata, &writer_db, id);
                 }
+                DbWriteOp::MarkAllReadBulk { filters, maildir_source_ids } => {
+                    // 1. Collect unread maildir targets BEFORE flipping read=1.
+                    //    Filter is `source_id IN (maildir-ids) AND read=0` so
+                    //    sqlite hits `idx_messages_read`/source index instead
+                    //    of full-scanning 250k rows.
+                    let targets = writer_db.collect_unread_maildir_targets(
+                        filters.as_ref(), &maildir_source_ids,
+                    );
+                    // 2. Flip read=1 across the filter scope.
+                    writer_db.mark_all_as_read(filters.as_ref());
+                    // 3. Rename files OUTSIDE the conn lock so concurrent
+                    //    reads aren't blocked during fs work.
+                    let mut updates: Vec<(String, i64)> = Vec::with_capacity(targets.len());
+                    for (metadata, id) in &targets {
+                        if let Some(new_meta) = rename_maildir_add_seen(metadata) {
+                            let json = serde_json::to_string(&new_meta).unwrap_or_default();
+                            updates.push((json, *id));
+                        }
+                    }
+                    // 4. Bulk metadata UPDATE under a single transaction.
+                    if !updates.is_empty() {
+                        let conn = writer_db.conn.lock().unwrap();
+                        let tx = conn.unchecked_transaction();
+                        if let Ok(tx) = tx {
+                            if let Ok(mut stmt) = tx.prepare("UPDATE messages SET metadata = ? WHERE id = ?") {
+                                for (json, id) in &updates {
+                                    let _ = stmt.execute(rusqlite::params![json, id]);
+                                }
+                            }
+                            let _ = tx.commit();
+                        }
+                    }
+                    counts_dirty = true;
+                }
                 DbWriteOp::SetSetting(key, val) => { writer_db.set_setting(&key, &val); }
                 DbWriteOp::Execute(sql, params) => {
                     let conn = writer_db.conn.lock().unwrap();
@@ -614,6 +680,16 @@ fn main() {
                 }
             }
         }
+        // Channel closed → main thread is shutting down. Force a
+        // TRUNCATE checkpoint here so the WAL is empty when the next
+        // launch opens the DB: no replay work on startup. Pays the
+        // checkpoint cost once on the quit side, in the background,
+        // after the user has already pressed q — they don't see it.
+        let conn = writer_db.conn.lock().unwrap();
+        let t = std::time::Instant::now();
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        log::info(&format!("shutdown: wal_checkpoint(TRUNCATE) took {} ms",
+            t.elapsed().as_millis()));
     });
 
     let mut app = App {
@@ -673,6 +749,7 @@ fn main() {
     app.sort_order = app.config.sort_order.clone();
     app.sort_inverted = app.config.sort_inverted;
     app.date_format = app.config.date_format.clone();
+    log_phase("app construction + config defaults", &mut phase);
 
     // First-run wizard if database is empty
     if app.db.is_empty() && app.db.get_sources(false).is_empty() {
@@ -683,12 +760,14 @@ fn main() {
     // stale count from before this version was running gets corrected
     // immediately, not on the next read mutation.
     app.sync_mail_count();
+    log_phase("sync_mail_count (folder counts query)", &mut phase);
 
     // Start background poller
     let (poller_tx, poller_rx) = std::sync::mpsc::channel();
     let poller = poller::Poller::start(app.db.clone(), poller_tx);
     app.poller = Some(poller);
     app.poller_rx = Some(poller_rx);
+    log_phase("poller spawn", &mut phase);
 
     // Render-first, scrape-later: paint chrome (panes, borders, top/bottom
     // bars) into the alt-screen with whatever's in memory so the user sees a
@@ -763,6 +842,14 @@ fn main() {
     }
     log::info("Dropping app...");
     drop(app);
+    // Wait for the writer thread to finish draining the channel +
+    // running its shutdown wal_checkpoint(TRUNCATE). Bounded by the
+    // queued op count (normally 0 — every interactive op flushes
+    // before quit) plus the checkpoint itself (~ms on a sub-MB WAL).
+    // Worth the wait: next startup has zero WAL replay work.
+    let t = std::time::Instant::now();
+    let _ = writer_handle.join();
+    log::info(&format!("writer thread joined in {} ms", t.elapsed().as_millis()));
     log::info("Cleanup...");
     Crust::cleanup();
     log::info("Exit.");
@@ -1086,8 +1173,14 @@ impl App {
     }
 
     fn render_top_bar(&mut self) {
-        let (_, unread, _) = self.cached_stats();
+        // Unread + total both scoped to the current view. The previous
+        // "9543 unread / 12 msgs" mixed scopes — `9543` was the DB-wide
+        // unread across every source (RSS feeds, every mailbox, every
+        // IM channel) while `12` was just the filtered view — so the
+        // ratio was meaningless. Count unread inside filtered_messages
+        // instead. It's a small loop, runs once per render, no DB hop.
         let total = self.filtered_messages.len() as i64;
+        let unread = self.filtered_messages.iter().filter(|m| !m.read).count() as i64;
 
         let tc = &self.config.theme_colors;
         let view_label = if let Some(ref folder) = self.active_folder {
@@ -1662,8 +1755,14 @@ impl App {
             // the pane — the attachment list + image hint already rendered
             // above tell the user what's there.
             extract_mime_text(raw).unwrap_or_default()
-        } else if raw.contains("Content-Transfer-Encoding: quoted-printable") {
-            // Single-part QP encoded
+        } else if raw.contains("Content-Transfer-Encoding: quoted-printable")
+                  || looks_quoted_printable(raw) {
+            // Single-part QP encoded. The first branch catches mails
+            // stored with their MIME headers intact; the second
+            // catches what the maildir parser leaves behind once it
+            // has stripped headers (the Nordea bug — the body was
+            // QP-encoded but the explicit CTE header was gone, so
+            // we render `p=E5` instead of `på`).
             let body_start = raw.find("\n\n").map(|p| p + 2)
                 .or_else(|| raw.find("\r\n\r\n").map(|p| p + 4))
                 .unwrap_or(0);
@@ -1707,6 +1806,13 @@ impl App {
         } else {
             extracted
         };
+        // Normalise line endings before we hand the body off to any
+        // text-splitting step. Some legacy clients emit CR-only line
+        // endings (no LF) inside base64'd text/plain parts; if we leave
+        // those `\r` bytes in, the terminal honours each one as a
+        // carriage-return when the right pane prints, jumping the cursor
+        // to column 1 and overwriting the left pane with body fragments.
+        let content = normalize_line_endings(content);
         // Detect and render Markdown tables in-place with Unicode box
         // borders. Non-table text passes through untouched, so the
         // subsequent quote/signature coloring still works.
@@ -2917,13 +3023,34 @@ impl App {
     }
 
     fn mark_all_read(&mut self) {
+        let okcol = self.config.theme_colors.feedback_ok;
+
         // Build filters matching current view
         let filters = self.current_view_filters();
-        self.db.mark_all_as_read(filters.as_ref());
+
+        // Identify maildir-typed sources so the writer can scope its
+        // unread-collect by `source_id IN (...)`. Cheap HashMap walk
+        // on cached metadata — no DB hit.
+        let maildir_source_ids: Vec<i64> = self.source_type_map.iter()
+            .filter_map(|(id, t)| if t == "maildir" { Some(*id) } else { None })
+            .collect();
+
+        // Hand the whole sequence off to the writer thread:
+        //   1. SELECT unread maildir rows (source-scoped, read=0 →
+        //      tiny result set even on a 250k-msg DB).
+        //   2. UPDATE messages SET read=1 across the filter scope.
+        //   3. Rename files outside the conn lock.
+        //   4. Bulk metadata UPDATE under one transaction.
+        // Main thread does the in-memory flip immediately so the UI
+        // reflects "read" without waiting on the writer.
+        let _ = self.write_tx.send(DbWriteOp::MarkAllReadBulk {
+            filters: filters.clone(),
+            maildir_source_ids,
+        });
         for msg in &mut self.filtered_messages {
             msg.read = true;
         }
-        self.set_feedback("Marked all as read", self.config.theme_colors.feedback_ok);
+        self.set_feedback("Marked all as read", okcol);
         self.sync_mail_count();
         self.render_all();
     }
@@ -3654,11 +3781,22 @@ impl App {
     }
 
     fn set_feedback(&mut self, msg: &str, color: u8) {
+        self.set_feedback_for(msg, color, std::time::Duration::from_secs(3));
+    }
+
+    /// Same as `set_feedback` but caller-controlled expiry. Long-
+    /// running operations (mark-all-read flag sync, big folder
+    /// moves, etc.) should set a generous timeout so the "still
+    /// working" line stays visible until the work is actually done —
+    /// the default 3-second expiry silently flips back to the key
+    /// hints while a background op is still running, hiding the
+    /// fact that kastrup is busy.
+    fn set_feedback_for(&mut self, msg: &str, color: u8, expires_in: std::time::Duration) {
         // Auto-log errors and warnings
         if color == 196 { log::error(msg); }
         else if color == self.config.theme_colors.feedback_warn { log::warn(msg); }
         self.feedback_message = Some((msg.to_string(), color));
-        self.feedback_expires = Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        self.feedback_expires = Some(std::time::Instant::now() + expires_in);
         self.render_bottom_bar();
     }
 
@@ -5474,7 +5612,12 @@ impl App {
             // Same attachment-only fallback as render_message_content —
             // prefer an empty body over dumping raw MIME into yank/search.
             extract_mime_text(raw).unwrap_or_default()
-        } else if raw.contains("Content-Transfer-Encoding: quoted-printable") {
+        } else if raw.contains("Content-Transfer-Encoding: quoted-printable")
+                  || looks_quoted_printable(raw) {
+            // Header-bearing form first, otherwise the bare-body
+            // heuristic — see `render_message_content` for the same
+            // shape and the same reason it has to live here too
+            // (yank / snippet / search go through this path).
             let body_start = raw.find("\n\n").map(|p| p + 2)
                 .or_else(|| raw.find("\r\n\r\n").map(|p| p + 4))
                 .unwrap_or(0);
@@ -5640,20 +5783,60 @@ impl App {
     }
 
     /// Expand addresses with interactive picker for ambiguous names.
+    /// A short name (no `@`, no `<`) MUST be resolved before sending —
+    /// silently letting "siv" or "phanit" through means the message is
+    /// undeliverable. The resolution waterfall:
+    ///   1. Single DB match → auto-expand.
+    ///   2. Multiple DB matches → numbered picker.
+    ///   3. No matches OR picker cancelled → bottom-bar prompt for the
+    ///      full address (the user types it manually).
+    /// If the user ESCs the prompt too, the short name is left as-is
+    /// and the review-screen pre-flight (see `unresolved_addresses_in`)
+    /// blocks the send until it's fixed.
     fn expand_address_field_interactive(&mut self, field: &str) -> String {
         field.split(',').map(|addr| {
             let addr = addr.trim();
             if addr.is_empty() || addr.contains('@') || addr.contains('<') {
                 return addr.to_string();
             }
-            // Try auto-expand first (single match)
             let expanded = self.expand_address_field(addr);
             if expanded != addr {
                 return expanded;
             }
-            // Multiple or no matches: show picker
-            self.pick_address(addr).unwrap_or_else(|| addr.to_string())
+            if let Some(picked) = self.pick_address(addr) {
+                return picked;
+            }
+            let typed = self.prompt(
+                &format!("Address for '{}' (ESC to keep): ", addr),
+                addr,
+            );
+            let typed = typed.trim();
+            if typed.is_empty() { addr.to_string() } else { typed.to_string() }
         }).collect::<Vec<_>>().join(", ")
+    }
+
+    /// Scan a composed message for any header value (To/Cc/Bcc) that
+    /// still holds an unresolved short name — i.e. a comma-separated
+    /// part with neither `@` nor `<`. Returns the offending bare names
+    /// so the caller can block sending and tell the user which to fix.
+    /// An empty Vec means every recipient is a real address.
+    fn unresolved_addresses_in(&self, content: &str) -> Vec<String> {
+        let mut bad = Vec::new();
+        for raw in content.lines() {
+            if raw.trim().is_empty() { break; } // headers end at first blank
+            let val_opt = strip_header_ci(raw, "To")
+                .or_else(|| strip_header_ci(raw, "Cc"))
+                .or_else(|| strip_header_ci(raw, "Bcc"));
+            let Some(val) = val_opt else { continue };
+            for part in val.split(',') {
+                let part = part.trim();
+                if part.is_empty() { continue; }
+                if !part.contains('@') && !part.contains('<') {
+                    bad.push(part.to_string());
+                }
+            }
+        }
+        bad
     }
 
     /// Expand a comma-separated address field. Each part that doesn't contain '@'
@@ -5665,9 +5848,16 @@ impl App {
             if addr.is_empty() || addr.contains('@') || addr.contains('<') {
                 return addr.to_string();
             }
-            // Look up in messages by sender_name, filtered by compose context
+            // Look up in messages by sender_name, filtered by compose context.
+            // Email composes (from any email-family source: maildir, gmail,
+            // imap, …) all search the full email address book — restricting
+            // a maildir-origin reply to only-maildir contacts hides every
+            // gmail/imap correspondent from the picker. Non-email composes
+            // (Discord, Slack, RSS, etc.) filter to the same source plugin
+            // so an IM compose doesn't suggest an email address.
             let conn = self.db.conn.lock().unwrap();
-            let is_email = self.compose_source_type.as_deref().unwrap_or("email") == "email";
+            let stype = self.compose_source_type.as_deref().unwrap_or("email");
+            let is_email = matches!(stype, "email" | "maildir" | "imap" | "gmail");
             let matches: Vec<(String, String)> = if is_email {
                 conn.prepare(
                     "SELECT DISTINCT sender, sender_name FROM messages \
@@ -5680,11 +5870,12 @@ impl App {
                     }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect())
                 }).unwrap_or_default()
             } else {
-                let stype = self.compose_source_type.as_deref().unwrap_or("");
+                // sources.plugin_type, not source_type — the column was
+                // renamed in v0.1.82 and this branch was missed.
                 conn.prepare(
                     "SELECT DISTINCT m.sender, m.sender_name FROM messages m \
                      JOIN sources s ON m.source_id = s.id \
-                     WHERE (m.sender_name LIKE ?1 OR m.sender LIKE ?1) AND s.source_type = ?2 \
+                     WHERE (m.sender_name LIKE ?1 OR m.sender LIKE ?1) AND s.plugin_type = ?2 \
                      ORDER BY m.timestamp DESC LIMIT 20"
                 ).ok().and_then(|mut stmt| {
                     let pattern = format!("%{}%", addr);
@@ -5719,8 +5910,12 @@ impl App {
     /// Show address picker when a To/Cc field has an unresolved name.
     /// Called when user presses 'e' to re-edit from the review screen.
     fn pick_address(&mut self, query: &str) -> Option<String> {
+        // Mirror the address-pool rules from expand_address_field: an email
+        // compose (any of email/maildir/imap/gmail) searches every email
+        // contact; other source types filter to their own plugin family.
         let conn = self.db.conn.lock().unwrap();
-        let is_email = self.compose_source_type.as_deref().unwrap_or("email") == "email";
+        let stype = self.compose_source_type.as_deref().unwrap_or("email");
+        let is_email = matches!(stype, "email" | "maildir" | "imap" | "gmail");
         let matches: Vec<(String, String)> = if is_email {
             conn.prepare(
                 "SELECT DISTINCT sender, sender_name FROM messages \
@@ -5733,11 +5928,12 @@ impl App {
                 }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect())
             }).unwrap_or_default()
         } else {
-            let stype = self.compose_source_type.as_deref().unwrap_or("");
+            // sources.plugin_type, not source_type — the column was
+            // renamed in v0.1.82 and this branch was missed.
             conn.prepare(
                 "SELECT DISTINCT m.sender, m.sender_name FROM messages m \
                  JOIN sources s ON m.source_id = s.id \
-                 WHERE (m.sender_name LIKE ?1 OR m.sender LIKE ?1) AND s.source_type = ?2 \
+                 WHERE (m.sender_name LIKE ?1 OR m.sender LIKE ?1) AND s.plugin_type = ?2 \
                  ORDER BY m.timestamp DESC LIMIT 20"
             ).ok().and_then(|mut stmt| {
                 let pattern = format!("%{}%", query);
@@ -5938,6 +6134,19 @@ impl App {
                                 "ENTER" => {
                                     let final_content = std::fs::read_to_string(&tmpfile)
                                         .unwrap_or_else(|_| content.clone());
+                                    // Block sending if any recipient is a bare short
+                                    // name. The user asked for a hard stop here:
+                                    // silently delivering to "siv" or "phanit"
+                                    // gives the MTA an undeliverable address and
+                                    // burns a "Sent" entry on the relayed copy.
+                                    let unresolved = self.unresolved_addresses_in(&final_content);
+                                    if !unresolved.is_empty() {
+                                        self.set_feedback(
+                                            &format!("Unresolved address: {}. Press e to fix.", unresolved.join(", ")),
+                                            tc.feedback_warn,
+                                        );
+                                        continue;
+                                    }
                                     // Warn if subject is empty (like mutt)
                                     let has_subject = final_content.lines()
                                         .take_while(|l| !l.is_empty())
@@ -5961,9 +6170,42 @@ impl App {
                                     break;
                                 }
                                 "e" => {
-                                    let _ = std::fs::remove_file(&tmpfile);
-                                    self.run_editor_compose_at(&content, None);
-                                    return;
+                                    // Re-edit. The initial-compose path treats
+                                    // "quit with no changes" as an abandon (it
+                                    // was a fresh draft the user clearly didn't
+                                    // want to send); re-edit must treat the same
+                                    // gesture as "looks good, never mind" — the
+                                    // user already committed to the message at
+                                    // the review screen. Re-launch the editor
+                                    // on the current (expanded) tmpfile rather
+                                    // than recursing back into the raw template,
+                                    // so they edit the version they're about to
+                                    // send. On return: if the file is unchanged,
+                                    // fall through to the review loop again
+                                    // (no re-expansion needed); if changed,
+                                    // re-run address expansion before re-showing
+                                    // review.
+                                    let pre_edit = std::fs::read_to_string(&tmpfile)
+                                        .unwrap_or_else(|_| final_content.clone());
+                                    Crust::cleanup();
+                                    let escaped_re = crust::shell_escape(&tmpfile);
+                                    let editor_short_re = std::path::Path::new(&editor).file_name()
+                                        .and_then(|s| s.to_str()).unwrap_or(editor.as_str());
+                                    let is_vim_re = matches!(editor_short_re, "vim" | "vi" | "nvim");
+                                    let scribe_re = if editor_short_re == "scribe" { " --no-spell" } else { "" };
+                                    let args_re = if is_vim_re { editor_args.as_str() } else { "" };
+                                    let cmd_re = format!("{}{} {} {}", editor, scribe_re, args_re, escaped_re);
+                                    let _ = std::process::Command::new("sh")
+                                        .arg("-c").arg(&cmd_re).status();
+                                    Crust::init();
+                                    self.handle_resize();
+                                    let post_edit = std::fs::read_to_string(&tmpfile)
+                                        .unwrap_or_else(|_| pre_edit.clone());
+                                    if post_edit.trim() != pre_edit.trim() {
+                                        final_content = self.expand_compose_addresses(&post_edit);
+                                        let _ = std::fs::write(&tmpfile, &final_content);
+                                    }
+                                    continue;
                                 }
                                 "p" => {
                                     let conn = self.db.conn.lock().unwrap();
@@ -6053,6 +6295,56 @@ impl App {
         let _ = std::fs::remove_file(&tmpfile);
         // Force full redraw after returning from editor (pane caches are stale)
         self.handle_resize();
+    }
+
+    /// Write the freshly-sent RFC822 message into a month-bucketed
+    /// Sent maildir (`~/Maildir/.Sent.YYYY-MM/cur/<unique>:2,S`),
+    /// creating the folder skeleton (`cur` / `new` / `tmp`) if it
+    /// doesn't exist yet. Mirrors heathrow's Ruby `save_to_sent`
+    /// so the resulting layout is what the user's downstream tools
+    /// (notmuch, RTFM browsing, etc.) already understand. Silent
+    /// no-op on error — failure to archive must not look like a
+    /// send failure to the user.
+    fn save_to_sent(&self, rfc_msg: &str) {
+        let home = match std::env::var("HOME") { Ok(h) => h, Err(_) => return };
+        // YYYY-MM via `date` — kastrup doesn't pull in chrono and the
+        // manual calendar arithmetic from SystemTime would be more
+        // code than this one subprocess per send is worth.
+        let ym_out = std::process::Command::new("date").arg("+%Y-%m").output();
+        let ym = match ym_out {
+            Ok(o) if o.status.success() => {
+                String::from_utf8_lossy(&o.stdout).trim().to_string()
+            }
+            _ => return,
+        };
+        if ym.is_empty() { return; }
+
+        let folder = std::path::PathBuf::from(&home)
+            .join("Main/Maildir")
+            .join(format!(".Sent.{}", ym));
+        for sub in ["cur", "new", "tmp"] {
+            let _ = std::fs::create_dir_all(folder.join(sub));
+        }
+
+        // Unique filename: <epoch_secs>.<pid>_<seq>.<hostname>:2,S
+        // `:2,S` flags the message as Seen so it doesn't appear unread
+        // when the maildir poller picks it up. The seq counter is the
+        // last 6 digits of nanoseconds — gives uniqueness within a
+        // process for back-to-back sends without needing a counter.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = now.as_secs();
+        let seq = (now.subsec_nanos() / 1000) % 1_000_000;
+        let pid = std::process::id();
+        let hostname = std::process::Command::new("hostname").output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "localhost".to_string());
+        let fname = format!("{}.{}_{}.{}:2,S", secs, pid, seq, hostname);
+        let _ = std::fs::write(folder.join("cur").join(&fname), rfc_msg);
     }
 
     fn handle_composed_message_with_attachments(&mut self, content: &str, attachments: &[String]) {
@@ -6145,6 +6437,7 @@ impl App {
         let result = std::process::Command::new("sh").arg("-c").arg(&cmd).output();
         match result {
             Ok(output) if output.status.success() => {
+                self.save_to_sent(&rfc_msg);
                 let _ = std::fs::remove_file(&smtp_tmpfile);
                 log::info(&format!("SMTP sent OK to {}", to));
                 self.set_feedback(&format!("Sent to {} ({} attachment(s))", to, attachments.len()), self.config.theme_colors.feedback_ok);
@@ -6275,6 +6568,7 @@ impl App {
 
         match result {
             Ok(output) if output.status.success() => {
+                self.save_to_sent(&rfc_msg);
                 let _ = std::fs::remove_file(&smtp_tmpfile);
                 log::info(&format!("SMTP sent OK to {}", to));
                 self.set_feedback(
@@ -6542,6 +6836,35 @@ impl App {
             return;
         }
 
+        // Fast path: `extract_mime_attachments` already decoded the
+        // full attachment to a temp file and stashed its path in the
+        // `source_file` field. Use it directly instead of paying for
+        // a second Python-based MIME walk, which was both slower and
+        // a constant source of subtle filename-matching bugs (folded
+        // header names, base64-encoded filenames, etc.). The Python
+        // re-extraction stays below as a fallback for attachment
+        // payloads that don't carry `source_file` — those come from
+        // other source plugins that populate `msg.attachments` with
+        // their own field set.
+        let cached = att.get("source_file").and_then(|v| v.as_str())
+            .filter(|p| !p.is_empty() && std::path::Path::new(p).exists());
+        if let Some(src) = cached {
+            if let Err(e) = std::fs::copy(src, &dest) {
+                self.set_feedback(&format!("Copy to {} failed: {}", dest, e),
+                    self.config.theme_colors.feedback_warn);
+                return;
+            }
+            if open {
+                let _ = std::process::Command::new("xdg-open").arg(&dest)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                self.set_feedback(&format!("Opened: {}", name),
+                    self.config.theme_colors.feedback_ok);
+            }
+            return;
+        }
+
         let Some(mf) = maildir_file else {
             self.set_feedback("No source file available", self.config.theme_colors.feedback_warn);
             return;
@@ -6552,34 +6875,42 @@ impl App {
             return;
         }
 
-        // Extract attachment using Python (always available, handles MIME properly)
+        // Extract attachment using Python (always available, handles MIME properly).
+        //
+        // Filename normalisation: Python's `email.message.Message.get_filename()`
+        // returns the value with the RFC 2822 folded newline still in
+        // place (e.g. `"…_May\n 2026.docx"`). Our Rust side unfolds
+        // headers before storing, so the strings disagree even though
+        // they refer to the same file. Run both through the same
+        // whitespace-collapse before comparing — that way a folded
+        // filename matches its unfolded counterpart, and double
+        // spaces inside a name are ignored too.
+        //
+        // The Index-fallback path was removed: when filename match
+        // fails it would pick whatever the N-th `walk()` part happened
+        // to be — typically the first inline image, since `walk()`
+        // visits the multipart container plus every part in order,
+        // independent of how the UI filters images. That produced
+        // silent truncated-file extractions for any folded filename.
+        // Now an unmatched name returns a clean failure the caller
+        // can surface via `set_feedback`.
         let py_script = format!(
             r#"
-import email, sys, os
+import email, sys, re
+def norm(s):
+    return re.sub(r'\s+', ' ', s).strip() if s else ''
 with open(sys.argv[1], 'rb') as f:
     msg = email.message_from_binary_file(f)
-target = sys.argv[2]
+target = norm(sys.argv[2])
 dest = sys.argv[3]
 for part in msg.walk():
-    fn = part.get_filename()
-    if fn and fn == target:
+    if norm(part.get_filename()) == target and target:
         data = part.get_payload(decode=True)
         if data:
             with open(dest, 'wb') as out:
                 out.write(data)
             sys.exit(0)
-# Fallback: try by index
-idx = int(sys.argv[4])
-i = 0
-for part in msg.walk():
-    if part.get_filename() or (part.get_content_maintype() != 'multipart' and part.get_content_maintype() != 'text'):
-        if i == idx:
-            data = part.get_payload(decode=True)
-            if data:
-                with open(dest, 'wb') as out:
-                    out.write(data)
-                sys.exit(0)
-        i += 1
+sys.exit(2)
 "#
         );
 
@@ -8301,6 +8632,17 @@ fn extract_mime_text_depth(raw: &str, depth: usize) -> Option<String> {
         })
         .or_else(|| html_part.map(|h| html_to_text(&h)).filter(|t| !t.trim().is_empty()));
 
+    // Normalise line endings on the extracted body. Legacy clients (and
+    // some receipt-system mailers, e.g. Mitt Dekkhotell) emit CR-only
+    // line terminators inside a base64 text/plain part. After base64
+    // decode the bare `\r` bytes survive into the string, and Rust's
+    // `str::lines()` only splits on `\n` or `\r\n` — so the whole body
+    // is treated as ONE logical line. When that line is later printed
+    // via the right pane's positioning, each embedded `\r` makes the
+    // terminal cursor jump to column 1 of the row, overwriting the
+    // adjacent left pane with body text. Convert CRLF → LF first, then
+    // any remaining bare CR → LF.
+    let body = body.map(normalize_line_endings);
     // When this is a calendar invite (text/calendar part present), put the
     // structured summary on top followed by the plain-text body. That way
     // the user sees "Title / When / Where / Organizer" first and the
@@ -8311,6 +8653,13 @@ fn extract_mime_text_depth(raw: &str, depth: usize) -> Option<String> {
         (None,      Some(text)) => Some(text),
         (None,      None)       => None,
     }
+}
+
+/// CRLF / CR-only → LF. Single allocation only when the input actually
+/// contains a CR; otherwise returns the original string unchanged.
+fn normalize_line_endings(s: String) -> String {
+    if !s.contains('\r') { return s; }
+    s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// Pick the most useful HTML representation of a message for the
@@ -8631,6 +8980,50 @@ fn parse_rrule_display(rrule: &str) -> String {
 
 /// Extract MIME attachments from raw content, decode to temp files, return as JSON Value array
 /// matching the DB attachment format so existing v/V handlers work.
+/// Collapse RFC 2822 header folding: a CR?LF followed by one or more
+/// SP/HT bytes is just a continuation, equivalent to a single space
+/// in the logical header value. Also normalises any leftover bare
+/// newlines (rare but seen on broken senders) so the result never
+/// contains control characters that would corrupt downstream paths.
+fn unfold_header_value(s: &str) -> String {
+    // Replace folding sequences first (newline + indent → single space),
+    // then squash any remaining stray newlines / tabs to spaces.
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\r' || b == b'\n' {
+            // Walk past CR/LF and any leading SP/HT on the next line.
+            i += 1;
+            if b == b'\r' && i < bytes.len() && bytes[i] == b'\n' { i += 1; }
+            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') { i += 1; }
+            out.push(' ');
+        } else if b == b'\t' {
+            out.push(' ');
+            i += 1;
+        } else {
+            // Copy one UTF-8 char rather than one byte so multi-byte
+            // sequences (æøå, etc.) survive intact.
+            let ch_len = utf8_char_len(bytes[i]);
+            out.push_str(std::str::from_utf8(&bytes[i..(i + ch_len).min(bytes.len())])
+                .unwrap_or(""));
+            i += ch_len;
+        }
+    }
+    // A trailing space is harmless on display but trims cleanly off
+    // tmpfile paths.
+    out.trim().to_string()
+}
+
+fn utf8_char_len(first_byte: u8) -> usize {
+    if first_byte < 0x80 { 1 }
+    else if first_byte < 0xC0 { 1 } // invalid leading byte; advance by one
+    else if first_byte < 0xE0 { 2 }
+    else if first_byte < 0xF0 { 3 }
+    else { 4 }
+}
+
 fn extract_mime_attachments(content: &str, msg_id: i64) -> Vec<serde_json::Value> {
     let mut atts = Vec::new();
     // Find all boundaries in the content (including nested)
@@ -8669,12 +9062,20 @@ fn extract_mime_attachments(content: &str, msg_id: i64) -> Vec<serde_json::Value
             let Some(ct_cap) = ct_re.captures(headers) else { continue };
             let ctype = ct_cap.get(1).unwrap().as_str().trim().to_string();
 
-            // Get filename from name= or filename=
+            // Get filename from name= or filename=. RFC 2822 lets a
+            // long quoted header value fold across lines: the newline
+            // sits inside the quoted string and the continuation line
+            // starts with whitespace. The regex's `[^"]+` happily
+            // captures right through it, so without unfolding we'd
+            // store `"…_May\n 2026.docx"` — that newline then ruins
+            // both the displayed name (hard wrap inside one row) and
+            // the tmpfile path (`xdg-open` chokes on a newline in
+            // the filename).
             let name_re = regex::Regex::new(r#"(?i)(?:name|filename)="([^"]+)""#).unwrap();
             let filename_raw = name_re.captures(headers)
                 .map(|c| c.get(1).unwrap().as_str().to_string())
                 .unwrap_or_else(|| format!("attachment_{}", atts.len() + 1));
-            let filename = sources::maildir::decode_rfc2047(&filename_raw);
+            let filename = sources::maildir::decode_rfc2047(&unfold_header_value(&filename_raw));
 
             // Skip if already found this filename
             if atts.iter().any(|a: &serde_json::Value| a["name"].as_str() == Some(&filename)) { continue; }
@@ -8813,10 +9214,41 @@ fn decode_quoted_printable(s: &str) -> String {
             i += 1;
         }
     }
-    String::from_utf8(bytes).unwrap_or_else(|e| {
-        // Fall back to lossy conversion
-        String::from_utf8_lossy(e.as_bytes()).into_owned()
-    })
+    // Try UTF-8 first. When that fails the bytes are almost always
+    // latin1 / Windows-1252 (the Nordics see plenty of these — bank
+    // mailers, .no government letters, etc.). The previous fallback
+    // was `from_utf8_lossy`, which substitutes U+FFFD and showed the
+    // user `?`-in-a-box wherever the original had `å` / `ø` / `æ`.
+    // Latin1 maps one byte → one codepoint with no possible failure
+    // and produces sensible text for any 8-bit-encoded payload; the
+    // small mismatch between latin1 and Cp1252 (a handful of
+    // punctuation glyphs in 0x80..0x9F) is barely visible compared
+    // to losing every Norwegian vowel.
+    String::from_utf8(bytes).unwrap_or_else(|e| latin1_to_utf8(e.as_bytes()))
+}
+
+/// Heuristic: does this look like a quoted-printable payload? Used by
+/// the render and yank paths to decide whether to QP-decode a body
+/// when the `Content-Transfer-Encoding` header has been stripped by
+/// the ingestion stage (the maildir parser does that). The soft
+/// line break `=\n` / `=\r\n` is the cleanest signal and rarely
+/// shows up in plain ASCII text; failing that we count `=XX` hex
+/// escapes and require a couple before declaring the body QP.
+fn looks_quoted_printable(s: &str) -> bool {
+    if s.contains("=\n") || s.contains("=\r\n") { return true; }
+    let bytes = s.as_bytes();
+    let mut hits = 0u32;
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'=' && bytes[i+1].is_ascii_hexdigit() && bytes[i+2].is_ascii_hexdigit() {
+            hits += 1;
+            if hits >= 3 { return true; }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 // --- HTML to text ---
@@ -9601,6 +10033,48 @@ fn sync_maildir_seen_flag(metadata: &serde_json::Value, db: &database::Database,
 /// Background version (called from writer thread)
 fn sync_maildir_seen_flag_bg(metadata: &serde_json::Value, db: &database::Database, msg_id: i64) {
     sync_maildir_seen_flag(metadata, db, msg_id);
+}
+
+/// Pure-filesystem half of `sync_maildir_seen_flag`: rename the file
+/// to add the `S` flag (and bubble new/ → cur/), return the updated
+/// metadata Value with `maildir_file` pointing at the new path. No
+/// DB writes — the caller can batch them.
+///
+/// Returns `None` when there's nothing to do (file missing, already
+/// flagged Seen, or rename failed). The caller treats `None` as "skip
+/// this id" without touching the DB.
+fn rename_maildir_add_seen(metadata: &serde_json::Value) -> Option<serde_json::Value> {
+    let file_path = metadata.get("maildir_file").and_then(|v| v.as_str())?;
+    let path = std::path::Path::new(file_path);
+    if !path.exists() { return None; }
+
+    let filename = path.file_name().and_then(|f| f.to_str())?;
+    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+    let parent_name = parent.file_name().and_then(|f| f.to_str()).unwrap_or("");
+
+    let new_filename = if filename.contains(":2,") {
+        if filename.contains('S') { return None; } // already Seen
+        let (base, flags) = filename.rsplit_once(":2,").unwrap();
+        let mut flag_chars: Vec<char> = flags.chars().collect();
+        flag_chars.push('S');
+        flag_chars.sort();
+        format!("{}:2,{}", base, flag_chars.into_iter().collect::<String>())
+    } else {
+        format!("{}:2,S", filename)
+    };
+
+    let new_parent = if parent_name == "new" {
+        parent.parent().unwrap_or(parent).join("cur")
+    } else {
+        parent.to_path_buf()
+    };
+
+    let new_path = new_parent.join(&new_filename);
+    if std::fs::rename(path, &new_path).is_err() { return None; }
+
+    let mut new_meta = metadata.clone();
+    new_meta["maildir_file"] = serde_json::json!(new_path.to_string_lossy().to_string());
+    Some(new_meta)
 }
 
 /// Check if a filename has an image extension

@@ -32,6 +32,15 @@ impl Poller {
                 if std::time::Instant::now() >= next_mem_log {
                     log_process_memory("poller hourly", &known_cache);
                     next_mem_log += std::time::Duration::from_secs(3600);
+                    // Reclaim up to 1024 freelist pages (~4 MB) so deletes
+                    // and expired-message purges don't grow the DB file
+                    // without bound. Only effective once the DB has been
+                    // VACUUMed with auto_vacuum=incremental at least
+                    // once; on an auto_vacuum=NONE DB this is a no-op.
+                    // Runs hourly so it stays well under the radar.
+                    let conn = db.conn.lock().unwrap();
+                    let _ = conn.execute_batch("PRAGMA incremental_vacuum(1024);");
+                    drop(conn);
                 }
                 let sources_list = db.get_sources(true);
                 let now = crate::database::now_secs();
