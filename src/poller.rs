@@ -1,4 +1,4 @@
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, Condvar};
 use std::sync::mpsc;
 use std::collections::{HashMap, HashSet};
 use crate::database::Database;
@@ -9,14 +9,16 @@ pub enum PollerEvent {
 }
 
 pub struct Poller {
-    running: Arc<AtomicBool>,
+    // (stopped flag, wakeup condvar). The condvar lets stop() wake the
+    // thread immediately instead of waiting for the next 1s sleep tick.
+    stopped: Arc<(Mutex<bool>, Condvar)>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Poller {
     pub fn start(db: Arc<Database>, tx: mpsc::Sender<PollerEvent>) -> Self {
-        let running = Arc::new(AtomicBool::new(true));
-        let running_clone = running.clone();
+        let stopped = Arc::new((Mutex::new(false), Condvar::new()));
+        let stopped_clone = stopped.clone();
 
         let thread = std::thread::spawn(move || {
             // Cache known_ids per source (loaded once, updated incrementally).
@@ -28,7 +30,7 @@ impl Poller {
             let mut next_mem_log = std::time::Instant::now()
                 + std::time::Duration::from_secs(3600);
 
-            while running_clone.load(Ordering::Relaxed) {
+            loop {
                 if std::time::Instant::now() >= next_mem_log {
                     log_process_memory("poller hourly", &known_cache);
                     next_mem_log += std::time::Duration::from_secs(3600);
@@ -100,28 +102,38 @@ impl Poller {
                     }
                 }
 
-                // Sleep 10 seconds between poll cycles (check stop flag every 1s)
-                for _ in 0..10 {
-                    if !running_clone.load(Ordering::Relaxed) { break; }
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                }
+                // Park until 10s elapse or stop is signaled. wait_timeout_while
+                // atomically drops the lock and parks on the condvar, so notify
+                // from stop() wakes us instantly with no missed-wakeup race.
+                let (lock, cvar) = &*stopped_clone;
+                let guard = lock.lock().unwrap();
+                let (guard, _) = cvar.wait_timeout_while(
+                    guard,
+                    std::time::Duration::from_secs(10),
+                    |stopped| !*stopped,
+                ).unwrap();
+                if *guard { return; }
             }
         });
 
-        Self { running, thread: Some(thread) }
+        Self { stopped, thread: Some(thread) }
     }
 
     pub fn stop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
+        let (lock, cvar) = &*self.stopped;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
         // Don't join: the thread may be mid-sync with network timeouts.
-        // It will exit on its own when the flag is checked.
+        // It will exit on its own when the condvar wake re-checks the flag.
         self.thread.take();
     }
 }
 
 impl Drop for Poller {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
+        let (lock, cvar) = &*self.stopped;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
     }
 }
 

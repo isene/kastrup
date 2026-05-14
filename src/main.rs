@@ -800,7 +800,12 @@ fn main() {
             }
         }
 
-        let key = Input::getchr(Some(2));
+        // Idle wake cadence: stay snappy while a feedback toast is on
+        // screen (so it expires on time), otherwise sleep longer. New-mail
+        // toasts and DB refreshes lag by up to this many seconds, which is
+        // fine for a background-poll inbox.
+        let timeout_secs: u64 = if app.feedback_expires.is_some() { 1 } else { 10 };
+        let key = Input::getchr(Some(timeout_secs));
         match key {
             Some(k) => app.handle_key(&k),
             None => {
