@@ -1760,6 +1760,18 @@ impl App {
             // the pane — the attachment list + image hint already rendered
             // above tell the user what's there.
             extract_mime_text(raw).unwrap_or_default()
+        } else if looks_base64(raw) {
+            // Raw base64 body (no MIME headers). Checked BEFORE the QP
+            // branch because base64 payloads end with `==\n` for
+            // 1-byte padding, which trips looks_quoted_printable's
+            // earliest `s.contains("=\n")` check and routes the body
+            // through the wrong decoder. base64 is a more specific
+            // signal (5 lines of pure base64 chars, no other tokens),
+            // so prefer it when it matches.
+            sources::maildir::base64_decode(raw.trim())
+                .and_then(|bytes| String::from_utf8(bytes).ok()
+                    .or_else(|| Some(latin1_to_utf8(&sources::maildir::base64_decode(raw.trim()).unwrap_or_default()))))
+                .unwrap_or_else(|| raw.clone())
         } else if raw.contains("Content-Transfer-Encoding: quoted-printable")
                   || looks_quoted_printable(raw) {
             // Single-part QP encoded. The first branch catches mails
@@ -1772,12 +1784,6 @@ impl App {
                 .or_else(|| raw.find("\r\n\r\n").map(|p| p + 4))
                 .unwrap_or(0);
             decode_quoted_printable(&raw[body_start..])
-        } else if looks_base64(raw) {
-            // Raw base64 body (no MIME headers)
-            sources::maildir::base64_decode(raw.trim())
-                .and_then(|bytes| String::from_utf8(bytes).ok()
-                    .or_else(|| Some(latin1_to_utf8(&sources::maildir::base64_decode(raw.trim()).unwrap_or_default()))))
-                .unwrap_or_else(|| raw.clone())
         } else {
             raw.clone()
         };
@@ -5617,6 +5623,14 @@ impl App {
             // Same attachment-only fallback as render_message_content —
             // prefer an empty body over dumping raw MIME into yank/search.
             extract_mime_text(raw).unwrap_or_default()
+        } else if looks_base64(raw) {
+            // Checked BEFORE QP because base64 payloads end with
+            // `==\n` and trip looks_quoted_printable's early
+            // `s.contains("=\n")` check. See render_message_content
+            // for the same ordering and rationale.
+            sources::maildir::base64_decode(raw.trim())
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .unwrap_or_else(|| raw.clone())
         } else if raw.contains("Content-Transfer-Encoding: quoted-printable")
                   || looks_quoted_printable(raw) {
             // Header-bearing form first, otherwise the bare-body
@@ -5627,10 +5641,6 @@ impl App {
                 .or_else(|| raw.find("\r\n\r\n").map(|p| p + 4))
                 .unwrap_or(0);
             decode_quoted_printable(&raw[body_start..])
-        } else if looks_base64(raw) {
-            sources::maildir::base64_decode(raw.trim())
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .unwrap_or_else(|| raw.clone())
         } else {
             raw.clone()
         };
