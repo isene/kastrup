@@ -8698,6 +8698,20 @@ fn best_html_for_message(msg: &Message) -> Option<String> {
     if trimmed.starts_with("<html") || trimmed.starts_with("<body") || trimmed.starts_with('<') {
         if has_real_body(&msg.content) { return Some(msg.content.clone()); }
     }
+    // Headerless base64-encoded HTML body. Some senders (e.g.
+    // DocuSign / Signant notifications) ship the entire mail as
+    // `Content-Transfer-Encoding: base64` with no multipart wrapper,
+    // so by the time we land here `msg.content` is a wall of base64.
+    // Decode + sniff for an HTML-shaped body; if it looks like one,
+    // hand the decoded HTML to scroll instead of pre-formatting the
+    // base64 source.
+    if looks_base64(&msg.content) {
+        if let Some(decoded) = sources::maildir::base64_decode(msg.content.trim())
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+        {
+            if has_real_body(&decoded) { return Some(decoded); }
+        }
+    }
     // Plain-text fallback. Wrap in a minimal HTML page so even a
     // text-only newsletter renders as something the user can read.
     if msg.content.trim().is_empty() { return None; }
