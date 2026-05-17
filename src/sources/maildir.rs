@@ -122,6 +122,7 @@ fn parse_maildir_file(path: &Path, folder: &str, filename: &str) -> Option<Messa
     let mut in_reply_to = None;
     let mut references = None;
     let mut content_type = String::new();
+    let mut content_transfer_encoding = String::new();
 
     let mut in_headers = true;
     let mut body_lines = Vec::new();
@@ -134,7 +135,7 @@ fn parse_maildir_file(path: &Path, folder: &str, filename: &str) -> Option<Messa
                 // Process last header
                 process_header(&current_header, &mut from, &mut from_name, &mut to, &mut cc,
                     &mut subject, &mut date_str, &mut message_id, &mut in_reply_to,
-                    &mut references, &mut content_type);
+                    &mut references, &mut content_type, &mut content_transfer_encoding);
                 in_headers = false;
                 continue;
             }
@@ -147,7 +148,7 @@ fn parse_maildir_file(path: &Path, folder: &str, filename: &str) -> Option<Messa
                 if !current_header.is_empty() {
                     process_header(&current_header, &mut from, &mut from_name, &mut to, &mut cc,
                         &mut subject, &mut date_str, &mut message_id, &mut in_reply_to,
-                        &mut references, &mut content_type);
+                        &mut references, &mut content_type, &mut content_transfer_encoding);
                 }
                 current_header = line.to_string();
             }
@@ -157,6 +158,31 @@ fn parse_maildir_file(path: &Path, folder: &str, filename: &str) -> Option<Messa
     }
 
     let body = body_lines.join("\n");
+
+    // Single-part text/html message: decode the body at parse time
+    // and stash it as html_content so the renderer and the
+    // open-in-scroll path get a ready-to-display document without
+    // having to undo Content-Transfer-Encoding on every render.
+    // Multipart messages are left alone — extract_mime_html /
+    // extract_mime_text handle those lazily.
+    let lower_ct = content_type.to_ascii_lowercase();
+    let html_content = if lower_ct.starts_with("text/html") && !lower_ct.contains("multipart/") {
+        let lower_cte = content_transfer_encoding.to_ascii_lowercase();
+        let bytes = if lower_cte.contains("quoted-printable") {
+            decode_qp_body_bytes(&body)
+        } else if lower_cte.contains("base64") {
+            base64_decode(body.trim()).unwrap_or_else(|| body.as_bytes().to_vec())
+        } else {
+            body.as_bytes().to_vec()
+        };
+        // Lossy UTF-8: the few stray non-UTF-8 bytes in random
+        // newsletters shouldn't block the whole render. Strict
+        // decode would drop those messages back to the plain-text
+        // fallback in best_html_for_message.
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    } else {
+        None
+    };
 
     // Parse flags from filename (format: unique:2,FLAGS)
     let flags = filename.rsplit(':').next().unwrap_or("");
@@ -193,7 +219,7 @@ fn parse_maildir_file(path: &Path, folder: &str, filename: &str) -> Option<Messa
         cc,
         subject,
         content: body,
-        html_content: None,
+        html_content,
         timestamp,
         labels: vec![folder.to_string()],
         attachments: Vec::new(),
@@ -208,7 +234,7 @@ fn process_header(header: &str, from: &mut String, from_name: &mut Option<String
     to: &mut String, cc: &mut Option<String>, subject: &mut Option<String>,
     date: &mut String, message_id: &mut Option<String>,
     in_reply_to: &mut Option<String>, references: &mut Option<String>,
-    _content_type: &mut String)
+    content_type: &mut String, content_transfer_encoding: &mut String)
 {
     if let Some(val) = header.strip_prefix("From: ").or_else(|| header.strip_prefix("from: ")) {
         let val = val.trim();
@@ -234,8 +260,45 @@ fn process_header(header: &str, from: &mut String, from_name: &mut Option<String
     } else if let Some(val) = header.strip_prefix("References: ").or_else(|| header.strip_prefix("references: ")) {
         *references = Some(val.trim().to_string());
     } else if let Some(val) = header.strip_prefix("Content-Type: ").or_else(|| header.strip_prefix("content-type: ")) {
-        *_content_type = val.trim().to_string();
+        *content_type = val.trim().to_string();
+    } else if let Some(val) = header.strip_prefix("Content-Transfer-Encoding: ").or_else(|| header.strip_prefix("content-transfer-encoding: ")) {
+        *content_transfer_encoding = val.trim().to_string();
     }
+}
+
+/// Decode a Content-Transfer-Encoding: quoted-printable BODY (not a
+/// header encoded-word). Different from `decode_qp_bytes` in two
+/// ways: `=\r\n` / `=\n` is a soft line break (consume both, emit
+/// nothing), and `_` stays a literal underscore (the header
+/// convention of mapping `_` → space does not apply to bodies).
+fn decode_qp_body_bytes(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'=' && i + 1 < b.len() {
+            if b[i + 1] == b'\n' { i += 2; continue; }
+            if b[i + 1] == b'\r' {
+                i += 2;
+                if i < b.len() && b[i] == b'\n' { i += 1; }
+                continue;
+            }
+            if i + 2 < b.len()
+                && b[i + 1].is_ascii_hexdigit()
+                && b[i + 2].is_ascii_hexdigit()
+            {
+                let pair = std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("");
+                if let Ok(byte) = u8::from_str_radix(pair, 16) {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Decode RFC 2047 encoded-words: =?charset?encoding?text?=

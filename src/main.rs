@@ -8708,6 +8708,28 @@ fn best_html_for_message(msg: &Message) -> Option<String> {
     if trimmed.starts_with("<html") || trimmed.starts_with("<body") || trimmed.starts_with('<') {
         if has_real_body(&msg.content) { return Some(msg.content.clone()); }
     }
+    // Headerless QP-encoded single-part text/html body. Older rows
+    // came in through a maildir parser that dropped Content-Type /
+    // Content-Transfer-Encoding, leaving the body raw — `=\n` soft
+    // breaks and `=3D`-style escapes intact, and starting with the
+    // greeting line ("Hi X,<p>...") rather than a `<` tag. The
+    // starts-with check above misses these. Sniff for QP + HTML
+    // tags, decode, and wrap in a minimal <html><body> if needed
+    // so scroll / ff get a complete document.
+    if looks_qp_html(&msg.content) {
+        let decoded = decode_quoted_printable(&msg.content);
+        if looks_like_html(&decoded) {
+            let wrapped = if decoded.to_ascii_lowercase().contains("<body") {
+                decoded
+            } else {
+                format!(
+                    "<html><head><meta charset=\"utf-8\"></head><body>{}</body></html>",
+                    decoded
+                )
+            };
+            return Some(wrapped);
+        }
+    }
     // Headerless base64-encoded HTML body. Some senders (e.g.
     // DocuSign / Signant notifications) ship the entire mail as
     // `Content-Transfer-Encoding: base64` with no multipart wrapper,
@@ -9133,6 +9155,54 @@ fn extract_mime_attachments(content: &str, msg_id: i64) -> Vec<serde_json::Value
         }
     }
     atts
+}
+
+/// Quick HTML sniffer: returns true if `s` contains at least two
+/// distinct opening tags from a curated common-tag list. Two-tag
+/// floor avoids false positives on stray `<foo>` typos in plain
+/// text (a single `<3` heart, `<insert name>` placeholder, etc.).
+fn looks_like_html(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    const TAGS: &[&str] = &[
+        "<p>", "<p ", "<a ", "<a\n", "<a\t", "<br", "<div", "<span",
+        "<b>", "<i>", "<u>", "<em", "<strong", "<ul", "<ol", "<li",
+        "<h1", "<h2", "<h3", "<table", "<tr", "<td", "<img", "<hr",
+        "<blockquote", "<pre", "<code",
+    ];
+    let mut hits = 0;
+    for t in TAGS {
+        if lower.contains(t) {
+            hits += 1;
+            if hits >= 2 { return true; }
+        }
+    }
+    false
+}
+
+/// True iff `s` looks like a quoted-printable-encoded body that
+/// contains HTML. Pre-decode probe used by `best_html_for_message`
+/// to recover single-part text/html messages whose headers were
+/// stripped at parse time.
+fn looks_qp_html(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut has_qp = false;
+    let mut i = 0;
+    while i + 1 < b.len() {
+        if b[i] == b'=' {
+            // `=\n` / `=\r\n` soft line break.
+            if b[i + 1] == b'\n' || b[i + 1] == b'\r' { has_qp = true; break; }
+            // `=XX` where XX are ASCII hex digits.
+            if i + 2 < b.len()
+                && b[i + 1].is_ascii_hexdigit()
+                && b[i + 2].is_ascii_hexdigit()
+            {
+                has_qp = true;
+                break;
+            }
+        }
+        i += 1;
+    }
+    has_qp && looks_like_html(s)
 }
 
 /// Check if content looks like raw base64 (no MIME headers, just base64 lines).
