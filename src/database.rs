@@ -858,15 +858,16 @@ impl Database {
         let meta_json = serde_json::to_string(&msg.metadata).unwrap_or_default();
         let recipients_json = serde_json::json!([&msg.recipients]).to_string();
         let cc_json = msg.cc.as_ref().map(|c| serde_json::json!([c]).to_string());
+        let bcc_json = msg.bcc.as_ref().map(|c| serde_json::json!([c]).to_string());
 
         let _ = conn.execute(
             "INSERT OR IGNORE INTO messages (source_id, external_id, thread_id, \
-             sender, sender_name, recipients, cc, subject, content, html_content, \
+             sender, sender_name, recipients, cc, bcc, subject, content, html_content, \
              timestamp, received_at, read, starred, labels, attachments, metadata, folder) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
             params![
                 source_id, msg.external_id, msg.thread_id,
-                msg.sender, msg.sender_name, recipients_json, cc_json,
+                msg.sender, msg.sender_name, recipients_json, cc_json, bcc_json,
                 msg.subject, msg.content, msg.html_content,
                 msg.timestamp, now,
                 labels_json, atts_json, meta_json, msg.folder,
@@ -888,15 +889,16 @@ impl Database {
                 let meta_json = serde_json::to_string(&msg.metadata).unwrap_or_default();
                 let recipients_json = serde_json::json!([&msg.recipients]).to_string();
                 let cc_json = msg.cc.as_ref().map(|c| serde_json::json!([c]).to_string());
+                let bcc_json = msg.bcc.as_ref().map(|c| serde_json::json!([c]).to_string());
                 let now = now_secs();
                 let _ = conn.execute(
                     "INSERT OR IGNORE INTO messages (source_id, external_id, thread_id, \
-                     sender, sender_name, recipients, cc, subject, content, html_content, \
+                     sender, sender_name, recipients, cc, bcc, subject, content, html_content, \
                      timestamp, received_at, read, starred, labels, attachments, metadata, folder) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
                     params![
                         source_id, msg.external_id, msg.thread_id,
-                        msg.sender, msg.sender_name, recipients_json, cc_json,
+                        msg.sender, msg.sender_name, recipients_json, cc_json, bcc_json,
                         msg.subject, msg.content, msg.html_content,
                         msg.timestamp, now,
                         labels_json, atts_json, meta_json, msg.folder,
@@ -956,6 +958,7 @@ fn row_to_message(row: &rusqlite::Row) -> Message {
         sender_name: row.get(6).ok(),
         recipients: row.get(7).unwrap_or_default(),
         cc: row.get(8).ok(),
+        bcc: row.get(9).ok(),
         subject: row.get(10).ok(),
         content: row.get(11).unwrap_or_default(),
         html_content: None,

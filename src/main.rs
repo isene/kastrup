@@ -667,6 +667,23 @@ struct App {
     right_pane_locked: bool,
 }
 
+/// Auto-register a Discord polling source the first time we see a bot
+/// token in `~/.kastrup/.env`. Idempotent: no-op once a row exists,
+/// or if the token isn't set yet.
+fn ensure_discord_source(db: &Arc<Database>) {
+    let secrets = chat_send::load_secrets();
+    if secrets.discord_bot_token.is_none() { return; }
+    let existing = db.get_sources(false);
+    if existing.iter().any(|s| s.plugin_type == "discord") { return; }
+    db.add_source(
+        "Discord",
+        "discord",
+        "{}",
+        "[\"read\",\"send\"]",
+        300, // poll every 5 min
+    );
+}
+
 fn main() {
     log::info(&format!("Kastrup v{} starting", env!("CARGO_PKG_VERSION")));
     // Parse CLI args: --compose-to EMAIL --subject SUBJECT, or mailto:URL
@@ -722,6 +739,12 @@ fn main() {
     log_phase("config load", &mut phase);
     let db = Arc::new(Database::new().expect("Failed to open heathrow database"));
     log_phase("database open + pragmas (incl. any WAL replay)", &mut phase);
+    // Auto-register a Discord source if the user has a bot token in
+    // ~/.kastrup/.env and no discord source yet. Saves a manual setup
+    // step — incoming DMs to the bot start landing in kastrup on the
+    // next poll tick.
+    ensure_discord_source(&db);
+    log_phase("ensure discord source", &mut phase);
     let source_type_map = db.get_source_type_map();
     log_phase("source type map", &mut phase);
     let views = db.get_views();
@@ -1780,10 +1803,36 @@ impl App {
             lines.push(header_row("To:", &to_display, tc.header_from));
         }
 
-        if let Some(ref cc) = msg.cc {
-            let cc_display = parse_json_recipients(cc);
-            if !cc_display.is_empty() {
-                lines.push(header_row("Cc:", &cc_display, tc.header_from));
+        let cc_display = msg.cc.as_ref()
+            .map(|c| parse_json_recipients(c))
+            .unwrap_or_default();
+        if !cc_display.is_empty() {
+            lines.push(header_row("Cc:", &cc_display, tc.header_from));
+        }
+
+        // Bcc: show only when meaningful. Either the DB row has it
+        // explicitly (rare — MTAs typically strip Bcc from received
+        // mail) OR none of the user's identity addresses appear in
+        // To/Cc, in which case we synthesise "(you, hidden)" so the
+        // user knows why the message landed in their inbox.
+        let bcc_display = msg.bcc.as_ref()
+            .map(|c| parse_json_recipients(c))
+            .unwrap_or_default();
+        if !bcc_display.is_empty() {
+            lines.push(header_row("Bcc:", &bcc_display, tc.header_from));
+        } else if msg.source_type == "email" || msg.source_type == "maildir" {
+            let mine: Vec<String> = self.config.identities.values()
+                .map(|i| i.email.to_ascii_lowercase())
+                .filter(|e| !e.is_empty())
+                .collect();
+            if !mine.is_empty() {
+                let to_lc = parse_json_recipients(&msg.recipients).to_ascii_lowercase();
+                let cc_lc = cc_display.to_ascii_lowercase();
+                let visible = format!("{} {}", to_lc, cc_lc);
+                let in_visible = mine.iter().any(|e| visible.contains(e));
+                if !in_visible {
+                    lines.push(header_row("Bcc:", "(you, hidden)", tc.header_from));
+                }
             }
         }
 
@@ -3007,6 +3056,7 @@ impl App {
                         sender_name: src.sender_name.clone(),
                         recipients: src.recipients.clone(),
                         cc: src.cc.clone(),
+                        bcc: src.bcc.clone(),
                         subject: src.subject.clone(),
                         content: String::new(),
                         html_content: None,

@@ -85,6 +85,7 @@ pub fn sync_weechat(config: &serde_json::Value, known_ids: &HashSet<String>) -> 
                 sender_name: Some(nick.clone()),
                 recipients: channel_name.clone(),
                 cc: None,
+                bcc: None,
                 subject: Some(subject_preview),
                 content: message.to_string(),
                 html_content: None,

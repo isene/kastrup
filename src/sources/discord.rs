@@ -1,0 +1,219 @@
+//! Discord DM polling source.
+//!
+//! Lists the bot's DM channels via `GET /users/@me/channels`, then for
+//! each one pulls the newest ~20 messages from
+//! `GET /channels/<id>/messages` and emits any whose Discord message
+//! id isn't already in `known_ids`. The poller layer takes care of
+//! per-tick cadence and dedup persistence.
+//!
+//! The bot must have at least one DM channel that's seen activity for
+//! Discord to surface it in `users/@me/channels`. New DMs to/from the
+//! bot create channels automatically, so the polling covers both
+//! sides without explicit subscription.
+//!
+//! Auth: reads `DISCORD_BOT_TOKEN` via `chat_send::load_secrets()`
+//! (same as the send path).
+
+use std::collections::HashSet;
+use crate::sources::MessageData;
+use crate::chat_send;
+
+/// Discord's REST API base for v10. Hardcoded to avoid a config knob.
+const API: &str = "https://discord.com/api/v10";
+
+pub fn sync_discord(_config: &serde_json::Value, known_ids: &HashSet<String>) -> Vec<MessageData> {
+    let secrets = chat_send::load_secrets();
+    let Some(token) = secrets.discord_bot_token.as_ref() else {
+        return Vec::new();
+    };
+    let auth = if token.starts_with("Bot ") || token.starts_with("Bearer ") {
+        token.to_string()
+    } else {
+        format!("Bot {}", token)
+    };
+
+    // Bot's own identity — needed to tag incoming-vs-outgoing.
+    let bot_user_id = match fetch_self_id(&auth) {
+        Some(id) => id,
+        None => return Vec::new(),
+    };
+
+    // List DM channels.
+    let channels = match list_dm_channels(&auth) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+
+    let mut out: Vec<MessageData> = Vec::new();
+    for ch in channels {
+        let cid = match ch["id"].as_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        // Build a human label for the channel (the other recipient's name).
+        let peer_label = channel_peer_label(&ch, &bot_user_id);
+
+        let msgs = match fetch_messages(&auth, cid, 20) {
+            Some(v) => v,
+            None => continue,
+        };
+        for m in msgs {
+            let mid = m["id"].as_str().unwrap_or("");
+            if mid.is_empty() { continue; }
+            if known_ids.contains(mid) { continue; }
+
+            let author_id = m["author"]["id"].as_str().unwrap_or("").to_string();
+            // Skip messages the bot itself sent — they're already
+            // visible through the kastrup compose flow; mirroring them
+            // back into the inbox would double-count outgoing traffic.
+            if author_id == bot_user_id { continue; }
+
+            let author_name = m["author"]["global_name"].as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| m["author"]["username"].as_str())
+                .unwrap_or("")
+                .to_string();
+            let content = m["content"].as_str().unwrap_or("").to_string();
+            let ts_iso = m["timestamp"].as_str().unwrap_or("");
+            let timestamp = parse_iso8601_to_unix(ts_iso).unwrap_or(0);
+
+            // attachments → JSON array of {filename, url, size}
+            let attachments: Vec<serde_json::Value> = m["attachments"].as_array()
+                .map(|arr| arr.iter().map(|a| serde_json::json!({
+                    "filename": a["filename"].as_str().unwrap_or(""),
+                    "url":      a["url"].as_str().unwrap_or(""),
+                    "size":     a["size"].as_i64().unwrap_or(0),
+                })).collect())
+                .unwrap_or_default();
+
+            // Carry channel + author IDs in metadata so the reply
+            // path can construct a `.discord` template without
+            // re-querying Discord.
+            let metadata = serde_json::json!({
+                "discord_channel_id": cid,
+                "discord_author_id":  author_id,
+                "discord_message_id": mid,
+                "source_type":        "discord",
+            });
+
+            let subject = if content.is_empty() {
+                format!("DM from {}", author_name)
+            } else {
+                // First non-empty line of body, truncated, as a faux subject
+                let line = content.lines()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty())
+                    .unwrap_or(content.as_str());
+                let mut s: String = line.chars().take(80).collect();
+                if line.chars().count() > 80 { s.push('…'); }
+                s
+            };
+
+            out.push(MessageData {
+                external_id: mid.to_string(),
+                sender: author_id.clone(),
+                sender_name: Some(if author_name.is_empty() {
+                    "Discord user".to_string()
+                } else { author_name.clone() }),
+                recipients: peer_label.clone(),
+                cc: None,
+                bcc: None,
+                subject: Some(subject),
+                content,
+                html_content: None,
+                timestamp,
+                labels: vec!["discord".to_string()],
+                attachments,
+                metadata,
+                folder: Some("Discord".to_string()),
+                thread_id: Some(cid.to_string()),
+            });
+        }
+    }
+    out
+}
+
+fn fetch_self_id(auth: &str) -> Option<String> {
+    let resp = ureq::get(&format!("{}/users/@me", API))
+        .set("Authorization", auth)
+        .set("User-Agent", "kastrup (https://github.com/isene/kastrup, 0.1)")
+        .call().ok()?
+        .into_string().ok()?;
+    let v: serde_json::Value = serde_json::from_str(&resp).ok()?;
+    v["id"].as_str().map(|s| s.to_string())
+}
+
+fn list_dm_channels(auth: &str) -> Option<Vec<serde_json::Value>> {
+    let resp = ureq::get(&format!("{}/users/@me/channels", API))
+        .set("Authorization", auth)
+        .set("User-Agent", "kastrup (https://github.com/isene/kastrup, 0.1)")
+        .call().ok()?
+        .into_string().ok()?;
+    let v: serde_json::Value = serde_json::from_str(&resp).ok()?;
+    v.as_array().cloned()
+}
+
+fn fetch_messages(auth: &str, channel_id: &str, limit: u32) -> Option<Vec<serde_json::Value>> {
+    let url = format!("{}/channels/{}/messages?limit={}", API, channel_id, limit);
+    let resp = ureq::get(&url)
+        .set("Authorization", auth)
+        .set("User-Agent", "kastrup (https://github.com/isene/kastrup, 0.1)")
+        .call().ok()?
+        .into_string().ok()?;
+    let v: serde_json::Value = serde_json::from_str(&resp).ok()?;
+    v.as_array().cloned()
+}
+
+/// Best-effort name for the "other end" of a DM channel.
+/// Group DMs aggregate names with commas; 1:1 DMs use the single
+/// non-bot recipient's display name.
+fn channel_peer_label(ch: &serde_json::Value, bot_id: &str) -> String {
+    let mut names: Vec<String> = Vec::new();
+    if let Some(arr) = ch["recipients"].as_array() {
+        for r in arr {
+            let id = r["id"].as_str().unwrap_or("");
+            if id == bot_id { continue; }
+            let name = r["global_name"].as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| r["username"].as_str())
+                .unwrap_or("")
+                .to_string();
+            if !name.is_empty() { names.push(name); }
+        }
+    }
+    if names.is_empty() {
+        ch["name"].as_str().unwrap_or("").to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
+/// Parse an RFC3339-ish ISO8601 timestamp to unix seconds.
+/// Discord stamps look like "2026-05-19T17:40:09.123000+00:00".
+fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
+    if s.is_empty() { return None; }
+    // Cheap parser: split into Y, M, D, h, m, s. We ignore subsecond.
+    // Tail can be "Z" or "+HH:MM" / "-HH:MM" — Discord uses +00:00 in
+    // practice, so treat everything as UTC.
+    let bytes = s.as_bytes();
+    if bytes.len() < 19 { return None; }
+    let y: i64 = s.get(0..4)?.parse().ok()?;
+    let mo: u32 = s.get(5..7)?.parse().ok()?;
+    let d: u32 = s.get(8..10)?.parse().ok()?;
+    let h: u32 = s.get(11..13)?.parse().ok()?;
+    let mi: u32 = s.get(14..16)?.parse().ok()?;
+    let se: u32 = s.get(17..19)?.parse().ok()?;
+    let days = ymd_to_days(y, mo, d);
+    Some(days * 86400 + (h as i64) * 3600 + (mi as i64) * 60 + (se as i64))
+}
+
+/// Howard Hinnant's days_from_civil for converting Y/M/D to unix-day.
+fn ymd_to_days(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = (y - era * 400) as u64;
+    let m_adj = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153u64 * (m_adj as u64) + 2) / 5 + (d as u64) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
+}
