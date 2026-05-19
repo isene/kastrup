@@ -1,3 +1,4 @@
+mod chat_send;
 mod config;
 mod database;
 mod log;
@@ -62,8 +63,45 @@ enum DraftSource {
     File(std::path::PathBuf),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DraftKind {
+    Email,
+    Slack,
+    Discord,
+}
+
+impl DraftKind {
+    fn tag(&self) -> &'static str {
+        match self {
+            DraftKind::Email   => "email",
+            DraftKind::Slack   => "slack",
+            DraftKind::Discord => "discord",
+        }
+    }
+
+    /// Header key whose value becomes the picker's "subject" label.
+    fn label_header(&self) -> &'static str {
+        match self {
+            DraftKind::Email   => "Subject",
+            DraftKind::Slack   => "Channel",
+            DraftKind::Discord => "Channel",
+        }
+    }
+
+    /// Resolve from file extension. Unknown extensions → Email
+    /// (back-compat with existing .eml files and old drops).
+    fn from_path(p: &std::path::Path) -> Self {
+        match p.extension().and_then(|e| e.to_str()) {
+            Some("slack")   => DraftKind::Slack,
+            Some("discord") => DraftKind::Discord,
+            _               => DraftKind::Email,
+        }
+    }
+}
+
 struct DraftCandidate {
     source: DraftSource,
+    kind: DraftKind,
     subject: String,
     body_preview: String,
     data: String,
@@ -87,8 +125,10 @@ fn pick_key_for(i: usize) -> char {
 }
 
 /// Pull a subject + first-body-line preview from a draft's raw editor data.
-/// Tolerates header keys with mixed case and missing trailing body.
-fn parse_draft_preview(data: &str) -> (String, String) {
+/// For email, "subject" is the `Subject:` header; for slack, the
+/// `Channel:` header value. Tolerates mixed-case header keys.
+fn parse_draft_preview(data: &str, kind: DraftKind) -> (String, String) {
+    let header_key = kind.label_header();
     let mut subject = String::new();
     let mut body_start = data.len();
     let mut idx = 0usize;
@@ -99,12 +139,12 @@ fn parse_draft_preview(data: &str) -> (String, String) {
             break;
         }
         if subject.is_empty() {
-            if let Some(rest) = trimmed
-                .strip_prefix("Subject:")
-                .or_else(|| trimmed.strip_prefix("subject:"))
-                .or_else(|| trimmed.strip_prefix("SUBJECT:"))
-            {
-                subject = rest.trim().to_string();
+            let lower = trimmed.to_ascii_lowercase();
+            let needle = format!("{}:", header_key.to_ascii_lowercase());
+            if let Some(rest) = lower.strip_prefix(&needle) {
+                // pull the original slice (case-preserved) at the same offset
+                let val_start = trimmed.len() - rest.len();
+                subject = trimmed[val_start..].trim().to_string();
             }
         }
         idx += line.len();
@@ -118,9 +158,40 @@ fn parse_draft_preview(data: &str) -> (String, String) {
         }
     }
     if subject.is_empty() {
-        subject = "(no subject)".to_string();
+        subject = match kind {
+            DraftKind::Email   => "(no subject)".to_string(),
+            DraftKind::Slack   => "(no channel)".to_string(),
+            DraftKind::Discord => "(no channel)".to_string(),
+        };
     }
     (subject, body_preview)
+}
+
+/// Extract the `Channel:` header value from a chat (slack/discord)
+/// draft. Returns None if missing — send paths use this to validate.
+fn parse_chat_channel(data: &str) -> Option<String> {
+    for line in data.lines() {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() { break; }
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("channel:") {
+            let val_start = trimmed.len() - rest.len();
+            let v = trimmed[val_start..].trim();
+            if !v.is_empty() { return Some(v.to_string()); }
+        }
+    }
+    None
+}
+
+/// Body of a chat draft: everything after the first blank line.
+fn parse_chat_body(data: &str) -> String {
+    if let Some(pos) = data.find("\n\n") {
+        data[pos + 2..].trim_end_matches(['\r', '\n']).to_string()
+    } else if let Some(pos) = data.find("\r\n\r\n") {
+        data[pos + 4..].trim_end_matches(['\r', '\n']).to_string()
+    } else {
+        String::new()
+    }
 }
 
 // --- Folder browser types ---
@@ -570,6 +641,10 @@ struct App {
     /// lands on the review screen (Send / Postpone / Cancel) instead
     /// of silently abandoning the draft.
     compose_force_review: bool,
+    /// What kind of message is currently being composed. The review
+    /// screen + Send / Postpone handlers dispatch on this. Defaults
+    /// to Email; the recall path sets it from the candidate's kind.
+    compose_kind: DraftKind,
     image_display: Option<glow::Display>,
 
     // Threading state
@@ -804,6 +879,7 @@ fn main() {
         pending_reply_id: None,
         compose_source_type: None,
         compose_force_review: false,
+        compose_kind: DraftKind::Email,
         image_display: None,
         show_threaded: false,
         group_by_folder: false,
@@ -5643,10 +5719,11 @@ impl App {
             if let Ok(rows) = rows {
                 for row in rows.flatten() {
                     let (id, data, ts) = row;
-                    let (subject, body_preview) = parse_draft_preview(&data);
+                    let kind = DraftKind::Email;
+                    let (subject, body_preview) = parse_draft_preview(&data, kind);
                     out.push(DraftCandidate {
                         source: DraftSource::Postponed(id),
-                        subject, body_preview, data, created_at: ts,
+                        kind, subject, body_preview, data, created_at: ts,
                     });
                 }
             }
@@ -5658,7 +5735,6 @@ impl App {
             for ent in entries.flatten() {
                 let path = ent.path();
                 if !path.is_file() { continue; }
-                // Skip dotfiles and non-.eml just to be tidy
                 let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
                 if name.starts_with('.') { continue; }
                 let data = match std::fs::read_to_string(&path) {
@@ -5670,10 +5746,11 @@ impl App {
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                let (subject, body_preview) = parse_draft_preview(&data);
+                let kind = DraftKind::from_path(&path);
+                let (subject, body_preview) = parse_draft_preview(&data, kind);
                 out.push(DraftCandidate {
                     source: DraftSource::File(path),
-                    subject, body_preview, data, created_at: ts,
+                    kind, subject, body_preview, data, created_at: ts,
                 });
             }
         }
@@ -5698,6 +5775,8 @@ impl App {
     }
 
     /// Render the draft picker into the right pane. Pure draw.
+    /// Shows the kind tag (email/slack/...) only when the list is
+    /// mixed; pure-email lists stay clean.
     fn render_draft_picker(&mut self, candidates: &[DraftCandidate]) {
         let tc = self.config.theme_colors.clone();
         let mut lines: Vec<String> = Vec::with_capacity(candidates.len() + 4);
@@ -5706,6 +5785,7 @@ impl App {
             tc.view_custom,
         )));
         lines.push(String::new());
+        let mixed = candidates.iter().any(|c| c.kind != candidates[0].kind);
         for (i, c) in candidates.iter().enumerate().take(36) {
             let key = pick_key_for(i);
             let mut preview = c.body_preview.clone();
@@ -5713,9 +5793,15 @@ impl App {
                 let cut: String = preview.chars().take(57).collect();
                 preview = format!("{}…", cut);
             }
+            let kind_tag = if mixed {
+                format!("{} ", style::fg(&format!("[{:<5}]", c.kind.tag()), tc.hint_fg))
+            } else {
+                String::new()
+            };
             lines.push(format!(
-                "  {}  {}",
+                "  {}  {}{}",
                 style::bold(&style::fg(&format!("[{}]", key), tc.unread)),
+                kind_tag,
                 c.subject,
             ));
             if !preview.is_empty() {
@@ -5743,6 +5829,7 @@ impl App {
                 DraftSource::Postponed(id) => DraftSource::Postponed(*id),
                 DraftSource::File(p) => DraftSource::File(p.clone()),
             },
+            kind: c.kind,
             subject: c.subject.clone(),
             body_preview: c.body_preview.clone(),
             data: c.data.clone(),
@@ -5834,7 +5921,7 @@ impl App {
             if let Some(i) = self.pick_draft(&candidates) {
                 let c = &candidates[i];
                 self.consume_draft(&c.source);
-                self.run_editor_compose_recalled(&c.data);
+                self.run_editor_compose_recalled(&c.data, c.kind);
                 return;
             }
             // ESC/n falls through to fresh compose
@@ -6291,14 +6378,48 @@ impl App {
         self.run_editor_compose_at_full(template, start_line, None, false);
     }
 
+    /// Send a slack-kind draft via the Slack Web API. Tokens come
+    /// from ~/.kastrup/.env (or fall back to ~/.weechat/plugins.conf).
+    /// Returns the resolved channel/DM label on success.
+    fn send_slack_draft(&self, data: &str) -> Result<String, String> {
+        let channel_raw = parse_chat_channel(data)
+            .ok_or_else(|| "missing Channel: header".to_string())?;
+        let body = parse_chat_body(data);
+        if body.is_empty() {
+            return Err("body is empty".to_string());
+        }
+        let secrets = chat_send::load_secrets();
+        let token = secrets.slack_token.as_ref()
+            .ok_or_else(|| "no SLACK_API_TOKEN in ~/.kastrup/.env".to_string())?;
+        let channel_id = chat_send::slack_resolve_channel(token, &channel_raw)?;
+        chat_send::send_slack(token, &channel_id, &body)?;
+        Ok(channel_raw)
+    }
+
+    /// Send a discord-kind draft via webhook or bot API.
+    /// Channel: targets — channel:<id>, dm:<userId>, webhook:<name>.
+    fn send_discord_draft(&self, data: &str) -> Result<String, String> {
+        let target = parse_chat_channel(data)
+            .ok_or_else(|| "missing Channel: header".to_string())?;
+        let body = parse_chat_body(data);
+        if body.is_empty() {
+            return Err("body is empty".to_string());
+        }
+        let secrets = chat_send::load_secrets();
+        chat_send::send_discord(&secrets, &target, &body)
+    }
+
     /// Recall-path entry: open a previously-saved draft. Forces the
     /// review screen even when the editor returns with no changes,
     /// because `zz` (save+quit, unmodified) on a recalled draft must
     /// not abandon it — the user already wrote it, they're confirming.
-    fn run_editor_compose_recalled(&mut self, template: &str) {
+    /// `kind` determines how the review/send path dispatches.
+    fn run_editor_compose_recalled(&mut self, template: &str, kind: DraftKind) {
         self.compose_force_review = true;
+        self.compose_kind = kind;
         self.run_editor_compose_at_full(template, None, None, false);
         self.compose_force_review = false;
+        self.compose_kind = DraftKind::Email;
     }
 
     /// Same as `run_editor_compose_at` plus column hint and "start in
@@ -6402,9 +6523,13 @@ impl App {
                         let tc = self.config.theme_colors.clone();
                         self.handle_resize(); // single redraw; render_all is inside
 
-                        // Expand addresses in the composed content
+                        // Expand addresses in the composed content (email only).
+                        // Slack drafts carry a `Channel:` pseudo-header and a body
+                        // — they have nothing for the address resolver to expand.
                         let mut final_content = content.clone();
-                        final_content = self.expand_compose_addresses(&final_content);
+                        if self.compose_kind == DraftKind::Email {
+                            final_content = self.expand_compose_addresses(&final_content);
+                        }
                         let _ = std::fs::write(&tmpfile, &final_content);
 
                         // Post-editor loop with compose plugins and attachments
@@ -6427,6 +6552,45 @@ impl App {
                                 "ENTER" => {
                                     let final_content = std::fs::read_to_string(&tmpfile)
                                         .unwrap_or_else(|_| content.clone());
+                                    match self.compose_kind {
+                                        DraftKind::Slack => {
+                                            match self.send_slack_draft(&final_content) {
+                                                Ok(channel) => {
+                                                    self.set_feedback(
+                                                        &format!("Sent to {}", channel),
+                                                        tc.feedback_ok,
+                                                    );
+                                                    break;
+                                                }
+                                                Err(msg) => {
+                                                    self.set_feedback(
+                                                        &format!("Slack send failed: {}", msg),
+                                                        tc.feedback_warn,
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        DraftKind::Discord => {
+                                            match self.send_discord_draft(&final_content) {
+                                                Ok(label) => {
+                                                    self.set_feedback(
+                                                        &format!("Sent to discord {}", label),
+                                                        tc.feedback_ok,
+                                                    );
+                                                    break;
+                                                }
+                                                Err(msg) => {
+                                                    self.set_feedback(
+                                                        &format!("Discord send failed: {}", msg),
+                                                        tc.feedback_warn,
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        DraftKind::Email => {}
+                                    }
                                     // Block sending if any recipient is a bare short
                                     // name. The user asked for a hard stop here:
                                     // silently delivering to "siv" or "phanit"
@@ -6501,12 +6665,39 @@ impl App {
                                     continue;
                                 }
                                 "p" => {
-                                    let conn = self.db.conn.lock().unwrap();
                                     let now = database::now_secs();
-                                    let _ = conn.execute("INSERT INTO postponed (data, created_at) VALUES (?, ?)",
-                                        rusqlite::params![content, now]);
-                                    drop(conn);
-                                    self.set_feedback("Message postponed", tc.feedback_ok);
+                                    match self.compose_kind {
+                                        DraftKind::Slack | DraftKind::Discord => {
+                                            // The `postponed` DB table is email-
+                                            // shaped (data → editor template).
+                                            // Slack/discord drafts round-trip
+                                            // through the drop folder so the
+                                            // kind survives.
+                                            let ext = match self.compose_kind {
+                                                DraftKind::Slack => "slack",
+                                                DraftKind::Discord => "discord",
+                                                _ => "eml",
+                                            };
+                                            let dir = drafts_drop_dir();
+                                            let _ = std::fs::create_dir_all(&dir);
+                                            let path = dir.join(format!("postponed_{}.{}", now, ext));
+                                            match std::fs::write(&path, &content) {
+                                                Ok(_) => self.set_feedback(
+                                                    &format!("{} draft postponed", ext),
+                                                    tc.feedback_ok,
+                                                ),
+                                                Err(e) => self.set_feedback(
+                                                    &format!("Postpone failed: {}", e), tc.feedback_warn),
+                                            }
+                                        }
+                                        DraftKind::Email => {
+                                            let conn = self.db.conn.lock().unwrap();
+                                            let _ = conn.execute("INSERT INTO postponed (data, created_at) VALUES (?, ?)",
+                                                rusqlite::params![content, now]);
+                                            drop(conn);
+                                            self.set_feedback("Message postponed", tc.feedback_ok);
+                                        }
+                                    }
                                     break;
                                 }
                                 "a" => {

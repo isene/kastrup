@@ -1,9 +1,9 @@
 [package]
 name = "kastrup"
-version = "0.1.99"
+version = "0.1.100"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
-description = "Unified messaging hub TUI. Feature clone of Heathrow, built on crust."
+description = "Unified messaging hub TUI, built on crust."
 license = "Unlicense"
 repository = "https://github.com/isene/kastrup"
 
