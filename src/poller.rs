@@ -79,6 +79,7 @@ impl Poller {
                         "messenger" => sources::messenger::sync_messenger(&source.config, known),
                         "instagram" => sources::instagram::sync_instagram(&source.config, known),
                         "discord" => sources::discord::sync_discord(&source.config, known),
+                        "slack" => sources::slack::sync_slack(&source.config, known),
                         _ => Vec::new(),
                     };
 

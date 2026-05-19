@@ -4,6 +4,7 @@ pub mod weechat;
 pub mod messenger;
 pub mod instagram;
 pub mod discord;
+pub mod slack;
 
 /// Data for a single message from any source plugin.
 /// Used by pollers to pass parsed messages to the database layer.
