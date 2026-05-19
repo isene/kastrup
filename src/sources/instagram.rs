@@ -116,6 +116,7 @@ pub fn sync_instagram(_config: &serde_json::Value, known_ids: &HashSet<String>) 
                 sender_name: Some(sender_name),
                 recipients: display_name.clone(),
                 cc: None,
+                bcc: None,
                 subject: Some(display_name.clone()),
                 content,
                 html_content: None,

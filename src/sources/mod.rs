@@ -3,6 +3,7 @@ pub mod rss;
 pub mod weechat;
 pub mod messenger;
 pub mod instagram;
+pub mod discord;
 
 /// Data for a single message from any source plugin.
 /// Used by pollers to pass parsed messages to the database layer.
@@ -12,6 +13,7 @@ pub struct MessageData {
     pub sender_name: Option<String>,
     pub recipients: String,
     pub cc: Option<String>,
+    pub bcc: Option<String>,
     pub subject: Option<String>,
     pub content: String,
     pub html_content: Option<String>,

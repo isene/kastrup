@@ -116,6 +116,7 @@ fn parse_maildir_file(path: &Path, folder: &str, filename: &str) -> Option<Messa
     let mut from_name = None;
     let mut to = String::new();
     let mut cc = None;
+    let mut bcc = None;
     let mut subject = None;
     let mut date_str = String::new();
     let mut message_id = None;
@@ -133,7 +134,7 @@ fn parse_maildir_file(path: &Path, folder: &str, filename: &str) -> Option<Messa
         if in_headers {
             if line.is_empty() {
                 // Process last header
-                process_header(&current_header, &mut from, &mut from_name, &mut to, &mut cc,
+                process_header(&current_header, &mut from, &mut from_name, &mut to, &mut cc, &mut bcc,
                     &mut subject, &mut date_str, &mut message_id, &mut in_reply_to,
                     &mut references, &mut content_type, &mut content_transfer_encoding);
                 in_headers = false;
@@ -146,7 +147,7 @@ fn parse_maildir_file(path: &Path, folder: &str, filename: &str) -> Option<Messa
             } else {
                 // New header, process previous
                 if !current_header.is_empty() {
-                    process_header(&current_header, &mut from, &mut from_name, &mut to, &mut cc,
+                    process_header(&current_header, &mut from, &mut from_name, &mut to, &mut cc, &mut bcc,
                         &mut subject, &mut date_str, &mut message_id, &mut in_reply_to,
                         &mut references, &mut content_type, &mut content_transfer_encoding);
                 }
@@ -217,6 +218,7 @@ fn parse_maildir_file(path: &Path, folder: &str, filename: &str) -> Option<Messa
         sender_name: from_name,
         recipients: to,
         cc,
+        bcc,
         subject,
         content: body,
         html_content,
@@ -229,39 +231,59 @@ fn parse_maildir_file(path: &Path, folder: &str, filename: &str) -> Option<Messa
     })
 }
 
+/// Case-insensitive `Header-Name:` strip. Discards the `"NAME:"` /
+/// `"NAME: "` prefix and returns the trimmed value. Mail clients are
+/// allowed to spell headers in any case (Outlook in particular sends
+/// `CC:` and `BCC:` in all-caps), so a case-sensitive `strip_prefix`
+/// silently drops valid headers and the DB row ends up with NULL.
+fn strip_header<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let colon = line.find(':')?;
+    if line[..colon].eq_ignore_ascii_case(name) {
+        // Skip the colon and any single space after it; leave the
+        // rest as-is so the existing callers can `.trim()`.
+        let mut rest = &line[colon + 1..];
+        if rest.starts_with(' ') { rest = &rest[1..]; }
+        Some(rest)
+    } else { None }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_header(header: &str, from: &mut String, from_name: &mut Option<String>,
-    to: &mut String, cc: &mut Option<String>, subject: &mut Option<String>,
+    to: &mut String, cc: &mut Option<String>, bcc: &mut Option<String>,
+    subject: &mut Option<String>,
     date: &mut String, message_id: &mut Option<String>,
     in_reply_to: &mut Option<String>, references: &mut Option<String>,
     content_type: &mut String, content_transfer_encoding: &mut String)
 {
-    if let Some(val) = header.strip_prefix("From: ").or_else(|| header.strip_prefix("from: ")) {
+    if let Some(val) = strip_header(header, "From") {
         let val = val.trim();
-        // Parse "Name <email>" format
         if let Some(lt) = val.find('<') {
             *from_name = Some(decode_rfc2047(val[..lt].trim().trim_matches('"')));
             *from = val[lt+1..].trim_end_matches('>').to_string();
         } else {
             *from = val.to_string();
         }
-    } else if let Some(val) = header.strip_prefix("To: ").or_else(|| header.strip_prefix("to: ")) {
+    } else if let Some(val) = strip_header(header, "To") {
         *to = val.trim().to_string();
-    } else if let Some(val) = header.strip_prefix("Cc: ").or_else(|| header.strip_prefix("cc: ")) {
+    } else if let Some(val) = strip_header(header, "Cc") {
         *cc = Some(val.trim().to_string());
-    } else if let Some(val) = header.strip_prefix("Subject: ").or_else(|| header.strip_prefix("subject: ")) {
+    } else if let Some(val) = strip_header(header, "Bcc") {
+        *bcc = Some(val.trim().to_string());
+    } else if let Some(val) = strip_header(header, "Subject") {
         *subject = Some(decode_rfc2047(val.trim()));
-    } else if let Some(val) = header.strip_prefix("Date: ").or_else(|| header.strip_prefix("date: ")) {
+    } else if let Some(val) = strip_header(header, "Date") {
         *date = val.trim().to_string();
-    } else if let Some(val) = header.strip_prefix("Message-ID: ").or_else(|| header.strip_prefix("Message-Id: ")).or_else(|| header.strip_prefix("message-id: ")) {
+    } else if let Some(val) = strip_header(header, "Message-ID")
+        .or_else(|| strip_header(header, "Message-Id"))
+    {
         *message_id = Some(val.trim().trim_matches(&['<', '>'][..]).to_string());
-    } else if let Some(val) = header.strip_prefix("In-Reply-To: ").or_else(|| header.strip_prefix("in-reply-to: ")) {
+    } else if let Some(val) = strip_header(header, "In-Reply-To") {
         *in_reply_to = Some(val.trim().trim_matches(&['<', '>'][..]).to_string());
-    } else if let Some(val) = header.strip_prefix("References: ").or_else(|| header.strip_prefix("references: ")) {
+    } else if let Some(val) = strip_header(header, "References") {
         *references = Some(val.trim().to_string());
-    } else if let Some(val) = header.strip_prefix("Content-Type: ").or_else(|| header.strip_prefix("content-type: ")) {
+    } else if let Some(val) = strip_header(header, "Content-Type") {
         *content_type = val.trim().to_string();
-    } else if let Some(val) = header.strip_prefix("Content-Transfer-Encoding: ").or_else(|| header.strip_prefix("content-transfer-encoding: ")) {
+    } else if let Some(val) = strip_header(header, "Content-Transfer-Encoding") {
         *content_transfer_encoding = val.trim().to_string();
     }
 }
