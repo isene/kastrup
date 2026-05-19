@@ -684,6 +684,23 @@ fn ensure_discord_source(db: &Arc<Database>) {
     );
 }
 
+/// Auto-register a Slack polling source the first time we see a user
+/// token (via `SLACK_API_TOKEN` in `~/.kastrup/.env`, or the weechat
+/// fallback). Idempotent.
+fn ensure_slack_source(db: &Arc<Database>) {
+    let secrets = chat_send::load_secrets();
+    if secrets.slack_token.is_none() { return; }
+    let existing = db.get_sources(false);
+    if existing.iter().any(|s| s.plugin_type == "slack") { return; }
+    db.add_source(
+        "Slack",
+        "slack",
+        "{}",
+        "[\"read\",\"send\"]",
+        300,
+    );
+}
+
 fn main() {
     log::info(&format!("Kastrup v{} starting", env!("CARGO_PKG_VERSION")));
     // Parse CLI args: --compose-to EMAIL --subject SUBJECT, or mailto:URL
@@ -744,7 +761,8 @@ fn main() {
     // step — incoming DMs to the bot start landing in kastrup on the
     // next poll tick.
     ensure_discord_source(&db);
-    log_phase("ensure discord source", &mut phase);
+    ensure_slack_source(&db);
+    log_phase("ensure chat sources", &mut phase);
     let source_type_map = db.get_source_type_map();
     log_phase("source type map", &mut phase);
     let views = db.get_views();
