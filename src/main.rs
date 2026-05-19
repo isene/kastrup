@@ -55,6 +55,74 @@ struct ComposeTarget {
     recent_ts: i64,
 }
 
+// --- Draft drop / recall ---
+
+enum DraftSource {
+    Postponed(i64),
+    File(std::path::PathBuf),
+}
+
+struct DraftCandidate {
+    source: DraftSource,
+    subject: String,
+    body_preview: String,
+    data: String,
+    created_at: i64,
+}
+
+fn drafts_drop_dir() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    home.join(".kastrup").join("drafts")
+}
+
+/// Map a candidate index to its picker key: 0-9, then a-z.
+fn pick_key_for(i: usize) -> char {
+    if i < 10 {
+        (b'0' + i as u8) as char
+    } else {
+        (b'a' + (i - 10) as u8) as char
+    }
+}
+
+/// Pull a subject + first-body-line preview from a draft's raw editor data.
+/// Tolerates header keys with mixed case and missing trailing body.
+fn parse_draft_preview(data: &str) -> (String, String) {
+    let mut subject = String::new();
+    let mut body_start = data.len();
+    let mut idx = 0usize;
+    for line in data.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            body_start = idx + line.len();
+            break;
+        }
+        if subject.is_empty() {
+            if let Some(rest) = trimmed
+                .strip_prefix("Subject:")
+                .or_else(|| trimmed.strip_prefix("subject:"))
+                .or_else(|| trimmed.strip_prefix("SUBJECT:"))
+            {
+                subject = rest.trim().to_string();
+            }
+        }
+        idx += line.len();
+    }
+    let mut body_preview = String::new();
+    for raw in data[body_start..].lines() {
+        let t = raw.trim();
+        if !t.is_empty() {
+            body_preview = t.to_string();
+            break;
+        }
+    }
+    if subject.is_empty() {
+        subject = "(no subject)".to_string();
+    }
+    (subject, body_preview)
+}
+
 // --- Folder browser types ---
 
 struct FolderEntry {
@@ -498,6 +566,10 @@ struct App {
     pending_forward_attachments: Vec<String>,
     pending_reply_id: Option<i64>,
     compose_source_type: Option<String>,
+    /// Set by the recall path so an unmodified editor return still
+    /// lands on the review screen (Send / Postpone / Cancel) instead
+    /// of silently abandoning the draft.
+    compose_force_review: bool,
     image_display: Option<glow::Display>,
 
     // Threading state
@@ -731,6 +803,7 @@ fn main() {
         pending_forward_attachments: Vec::new(),
         pending_reply_id: None,
         compose_source_type: None,
+        compose_force_review: false,
         image_display: None,
         show_threaded: false,
         group_by_folder: false,
@@ -5552,31 +5625,228 @@ impl App {
         self.run_editor_compose_at(&template, None);
     }
 
+    /// Gather draft candidates: rows from `postponed` table + any
+    /// .eml files dropped under `~/.kastrup/drafts/`. Newest first.
+    /// File-drop is the integration path for external tools (Claude
+    /// sessions, scripts) — see CLAUDE.md.
+    fn collect_draft_candidates(&self) -> Vec<DraftCandidate> {
+        let mut out: Vec<DraftCandidate> = Vec::new();
+        // DB-side: postponed rows
+        let conn = self.db.conn.lock().unwrap();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT id, data, created_at FROM postponed ORDER BY created_at DESC"
+        ) {
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            });
+            if let Ok(rows) = rows {
+                for row in rows.flatten() {
+                    let (id, data, ts) = row;
+                    let (subject, body_preview) = parse_draft_preview(&data);
+                    out.push(DraftCandidate {
+                        source: DraftSource::Postponed(id),
+                        subject, body_preview, data, created_at: ts,
+                    });
+                }
+            }
+        }
+        drop(conn);
+        // File-side: drop folder
+        let dir = drafts_drop_dir();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for ent in entries.flatten() {
+                let path = ent.path();
+                if !path.is_file() { continue; }
+                // Skip dotfiles and non-.eml just to be tidy
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if name.starts_with('.') { continue; }
+                let data = match std::fs::read_to_string(&path) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let ts = ent.metadata().ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let (subject, body_preview) = parse_draft_preview(&data);
+                out.push(DraftCandidate {
+                    source: DraftSource::File(path),
+                    subject, body_preview, data, created_at: ts,
+                });
+            }
+        }
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        out
+    }
+
+    /// Drop a draft from its backing store after the user loads it.
+    fn consume_draft(&self, source: &DraftSource) {
+        match source {
+            DraftSource::Postponed(id) => {
+                let conn = self.db.conn.lock().unwrap();
+                let _ = conn.execute(
+                    "DELETE FROM postponed WHERE id = ?",
+                    rusqlite::params![id],
+                );
+            }
+            DraftSource::File(path) => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// Render the draft picker into the right pane. Pure draw.
+    fn render_draft_picker(&mut self, candidates: &[DraftCandidate]) {
+        let tc = self.config.theme_colors.clone();
+        let mut lines: Vec<String> = Vec::with_capacity(candidates.len() + 4);
+        lines.push(style::bold(&style::fg(
+            &format!("{} pending draft(s)", candidates.len()),
+            tc.view_custom,
+        )));
+        lines.push(String::new());
+        for (i, c) in candidates.iter().enumerate().take(36) {
+            let key = pick_key_for(i);
+            let mut preview = c.body_preview.clone();
+            if preview.chars().count() > 60 {
+                let cut: String = preview.chars().take(57).collect();
+                preview = format!("{}…", cut);
+            }
+            lines.push(format!(
+                "  {}  {}",
+                style::bold(&style::fg(&format!("[{}]", key), tc.unread)),
+                c.subject,
+            ));
+            if !preview.is_empty() {
+                lines.push(format!("        {}", style::fg(&preview, tc.hint_fg)));
+            }
+        }
+        lines.push(String::new());
+        lines.push(style::fg(
+            "Press [letter/digit] to load, d+key to delete, n = new, ESC = cancel",
+            tc.hint_fg,
+        ));
+        self.right.set_text(&lines.join("\n"));
+        self.right.ix = 0;
+        self.right.full_refresh();
+        if self.right.border { self.right.border_refresh(); }
+    }
+
+    /// Show a numbered picker in the right pane. Returns the
+    /// selected index, or None on ESC / N (new). Supports `d<key>`
+    /// to delete a candidate (file-drop → unlink, postponed → row
+    /// DELETE), then redraws.
+    fn pick_draft(&mut self, candidates: &[DraftCandidate]) -> Option<usize> {
+        let mut list: Vec<DraftCandidate> = candidates.iter().map(|c| DraftCandidate {
+            source: match &c.source {
+                DraftSource::Postponed(id) => DraftSource::Postponed(*id),
+                DraftSource::File(p) => DraftSource::File(p.clone()),
+            },
+            subject: c.subject.clone(),
+            body_preview: c.body_preview.clone(),
+            data: c.data.clone(),
+            created_at: c.created_at,
+        }).collect();
+        self.render_draft_picker(&list);
+        loop {
+            let Some(chr) = Input::getchr(None) else { continue };
+            match chr.as_str() {
+                "ESC" | "q" => return None,
+                "n" | "N" => return None,
+                "d" | "D" => {
+                    self.set_feedback(
+                        "Delete which? (letter/digit, ESC=cancel)",
+                        self.config.theme_colors.feedback_warn,
+                    );
+                    let Some(k2) = Input::getchr(Some(5)) else {
+                        self.render_draft_picker(&list);
+                        continue;
+                    };
+                    if k2.len() != 1 {
+                        self.render_draft_picker(&list);
+                        continue;
+                    }
+                    let ch = k2.chars().next().unwrap();
+                    let idx = match ch {
+                        '0'..='9' => Some((ch as u8 - b'0') as usize),
+                        'a'..='z' => Some(10 + (ch as u8 - b'a') as usize),
+                        _ => None,
+                    };
+                    if let Some(i) = idx {
+                        if i < list.len() {
+                            self.consume_draft(&list[i].source);
+                            list.remove(i);
+                            if list.is_empty() { return None; }
+                            self.render_draft_picker(&list);
+                            continue;
+                        }
+                    }
+                    self.render_draft_picker(&list);
+                }
+                k if k.len() == 1 => {
+                    let ch = k.chars().next().unwrap();
+                    let idx = match ch {
+                        '0'..='9' => Some((ch as u8 - b'0') as usize),
+                        'a'..='z' => Some(10 + (ch as u8 - b'a') as usize),
+                        _ => None,
+                    };
+                    if let Some(i) = idx {
+                        if i < list.len() {
+                            // Mirror the chosen candidate back into the
+                            // caller's slice via index match. Since we may
+                            // have deleted entries, find the corresponding
+                            // index in the original `candidates` slice by
+                            // matching against the live `list` entry.
+                            let chosen = &list[i];
+                            for (j, c) in candidates.iter().enumerate() {
+                                let same = match (&c.source, &chosen.source) {
+                                    (DraftSource::Postponed(a), DraftSource::Postponed(b)) => a == b,
+                                    (DraftSource::File(a), DraftSource::File(b)) => a == b,
+                                    _ => false,
+                                };
+                                if same { return Some(j); }
+                            }
+                            return None;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn compose_new(&mut self) {
         if self.maybe_external_compose() { return; }
         self.pending_reply_id = None;
-        // Check for postponed messages
-        let conn = self.db.conn.lock().unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM postponed", [], |r| r.get(0)).unwrap_or(0);
-        drop(conn);
 
-        if count > 0 {
-            self.set_feedback(&format!("{} postponed draft(s). Recall? (y/n)", count), self.config.theme_colors.unread);
+        // Drafts may come from the `postponed` table (kastrup-side
+        // postpone via `p` from the review screen) or from
+        // ~/.kastrup/drafts/*.eml (external drop, e.g. a Claude
+        // session writing a draft for the user to review). Treat
+        // them uniformly.
+        let candidates = self.collect_draft_candidates();
+
+        if candidates.len() == 1 {
+            self.set_feedback(
+                &format!("1 pending draft: \"{}\". Recall? (y/n)", candidates[0].subject),
+                self.config.theme_colors.unread,
+            );
             if let Some(key) = Input::getchr(Some(5)) {
                 if key == "y" || key == "Y" {
-                    let conn = self.db.conn.lock().unwrap();
-                    let draft: Option<(i64, String)> = conn.query_row(
-                        "SELECT id, data FROM postponed ORDER BY created_at DESC LIMIT 1",
-                        [], |r| Ok((r.get(0)?, r.get(1)?))
-                    ).ok();
-                    if let Some((draft_id, data)) = draft {
-                        let _ = conn.execute("DELETE FROM postponed WHERE id = ?", rusqlite::params![draft_id]);
-                        drop(conn);
-                        self.run_editor_compose_at(&data, None);
-                        return;
-                    }
+                    let c = &candidates[0];
+                    self.consume_draft(&c.source);
+                    self.run_editor_compose_recalled(&c.data);
+                    return;
                 }
             }
+        } else if candidates.len() > 1 {
+            if let Some(i) = self.pick_draft(&candidates) {
+                let c = &candidates[i];
+                self.consume_draft(&c.source);
+                self.run_editor_compose_recalled(&c.data);
+                return;
+            }
+            // ESC/n falls through to fresh compose
         }
 
         // Set compose source type from current message context
@@ -6030,6 +6300,16 @@ impl App {
         self.run_editor_compose_at_full(template, start_line, None, false);
     }
 
+    /// Recall-path entry: open a previously-saved draft. Forces the
+    /// review screen even when the editor returns with no changes,
+    /// because `zz` (save+quit, unmodified) on a recalled draft must
+    /// not abandon it — the user already wrote it, they're confirming.
+    fn run_editor_compose_recalled(&mut self, template: &str) {
+        self.compose_force_review = true;
+        self.run_editor_compose_at_full(template, None, None, false);
+        self.compose_force_review = false;
+    }
+
     /// Same as `run_editor_compose_at` plus column hint and "start in
     /// Insert mode". Both extras are scribe-only — the column gets
     /// passed as `--col N` (1-indexed chars), insert as `--insert`.
@@ -6120,7 +6400,14 @@ impl App {
         if let Ok(s) = status {
             if s.success() {
                 if let Ok(content) = std::fs::read_to_string(&tmpfile) {
-                    if content.trim() != template.trim() {
+                    // Normally an unchanged tmpfile means "user opened
+                    // editor, typed nothing, quit" → abandon. But for a
+                    // recalled draft the user already wrote the content
+                    // earlier; `zz` with no edits must take them to the
+                    // review screen so they can Send / Postpone /
+                    // Cancel rather than silently dropping the work.
+                    let recalled = self.compose_force_review;
+                    if recalled || content.trim() != template.trim() {
                         let tc = self.config.theme_colors.clone();
                         self.handle_resize(); // single redraw; render_all is inside
 
