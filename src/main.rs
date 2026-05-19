@@ -5434,7 +5434,8 @@ impl App {
             }
         }
 
-        self.run_editor_compose_at(&template, Some(2)); // cursor on To: line
+        // Match `m` (compose_new): land after "To: " in Insert mode.
+        self.run_editor_compose_at_full(&template, Some(2), Some(5), true);
     }
 
     fn forward_tagged_inline(&mut self) {
@@ -5498,7 +5499,7 @@ impl App {
             template.push('\n');
         }
 
-        self.run_editor_compose_at(&template, Some(2));
+        self.run_editor_compose_at_full(&template, Some(2), Some(5), true);
     }
 
     fn forward_attach(&mut self) {
@@ -5552,7 +5553,7 @@ impl App {
             template.push_str(&sig);
             template.push('\n');
         }
-        self.run_editor_compose_at(&template, Some(2));
+        self.run_editor_compose_at_full(&template, Some(2), Some(5), true);
     }
 
     fn forward_tagged_attach(&mut self) {
@@ -5599,7 +5600,7 @@ impl App {
             template.push_str(&sig);
             template.push('\n');
         }
-        self.run_editor_compose_at(&template, Some(2));
+        self.run_editor_compose_at_full(&template, Some(2), Some(5), true);
     }
 
     fn compose_to(&mut self, to: &str, subject: &str) {
@@ -5826,20 +5827,10 @@ impl App {
         // them uniformly.
         let candidates = self.collect_draft_candidates();
 
-        if candidates.len() == 1 {
-            self.set_feedback(
-                &format!("1 pending draft: \"{}\". Recall? (y/n)", candidates[0].subject),
-                self.config.theme_colors.unread,
-            );
-            if let Some(key) = Input::getchr(Some(5)) {
-                if key == "y" || key == "Y" {
-                    let c = &candidates[0];
-                    self.consume_draft(&c.source);
-                    self.run_editor_compose_recalled(&c.data);
-                    return;
-                }
-            }
-        } else if candidates.len() > 1 {
+        if !candidates.is_empty() {
+            // Always show the picker — even for a single draft, the
+            // subject + body-preview context is more useful than a
+            // y/n prompt with just the subject in the status line.
             if let Some(i) = self.pick_draft(&candidates) {
                 let c = &candidates[i];
                 self.consume_draft(&c.source);
