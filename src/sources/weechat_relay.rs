@@ -614,6 +614,21 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 /// (writer) and the main App thread (future @-completion reader).
 pub type NickLists = Arc<Mutex<HashMap<String, BTreeSet<String>>>>;
 
+/// One subscribed weechat buffer the relay is tracking. Mirrored
+/// into App state by the supervisor so the Folders view can render
+/// every subscribed channel as a section, including ones with no
+/// messages yet.
+#[derive(Clone)]
+pub struct SubscribedBuffer {
+    pub full_name: String,
+    pub short_name: String,
+}
+
+/// Snapshot of the supervisor's current buffer registry. Held under
+/// a mutex; readers (rebuild_display) take a quick clone so they
+/// don't block the supervisor thread.
+pub type SubscribedBuffers = Arc<Mutex<Vec<SubscribedBuffer>>>;
+
 /// Per-buffer metadata cached on the supervisor thread. The `ptr` ←
 /// `full_name` mapping is what lets us route `_buffer_line_added`
 /// events (which only carry the buffer pointer) into the correct DB
@@ -744,6 +759,21 @@ fn line_to_message(
     })
 }
 
+/// Replace the shared subscribed-buffers list with everything in
+/// `buffers` that's not on the uninteresting skip-list. Cheap clone
+/// of full_name + short_name; the App reads this on every Folders
+/// rebuild so we want it minimal.
+fn publish_subscribed(subscribed: &SubscribedBuffers, buffers: &BTreeMap<String, BufferMeta>) {
+    let snapshot: Vec<SubscribedBuffer> = buffers.values()
+        .filter(|m| m.interesting)
+        .map(|m| SubscribedBuffer {
+            full_name: m.full_name.clone(),
+            short_name: m.short_name.clone(),
+        })
+        .collect();
+    *subscribed.lock().unwrap() = snapshot;
+}
+
 /// Apply a single nicklist hdata item to the shared map. `is_diff`
 /// switches on the `_diff` char field: `+` add, `-` remove, `*`
 /// update (no nick-set change). For non-diff (initial fetch) we just
@@ -797,6 +827,7 @@ fn run_persistent(
     source_id: i64,
     messages_dirty: &Arc<AtomicBool>,
     nick_lists: &NickLists,
+    subscribed: &SubscribedBuffers,
 ) -> Result<(), String> {
     let secrets = load_relay_secrets();
     let host = secrets.host.ok_or("WEECHAT_RELAY_HOST missing")?;
@@ -832,6 +863,11 @@ fn run_persistent(
     crate::log::info(&format!("weechat-relay: {} buffers ({} interesting)",
         buffers.len(),
         buffers.values().filter(|m| m.interesting).count()));
+
+    // Publish a snapshot of the interesting buffers to the shared
+    // `subscribed` list so the Folders view can render every
+    // subscribed channel even when it has no messages yet.
+    publish_subscribed(subscribed, &buffers);
 
     // Backfill: pull the last ~15 lines per interesting buffer to
     // close any gap left by the previous session. Dedup via the DB's
@@ -941,6 +977,7 @@ fn run_persistent(
                         buffers.insert(ptr, BufferMeta { full_name, short_name, interesting });
                     }
                 }
+                publish_subscribed(subscribed, &buffers);
             }
             "_buffer_closing" => {
                 for obj in objs {
@@ -951,6 +988,7 @@ fn run_persistent(
                         }
                     }
                 }
+                publish_subscribed(subscribed, &buffers);
             }
             "_nicklist_diff" => {
                 for obj in objs {
@@ -976,6 +1014,7 @@ pub fn spawn_supervisor(
     source_id: i64,
     messages_dirty: Arc<AtomicBool>,
     nick_lists: NickLists,
+    subscribed: SubscribedBuffers,
 ) {
     std::thread::Builder::new()
         .name("weechat-relay-supervisor".to_string())
@@ -985,7 +1024,9 @@ pub fn spawn_supervisor(
             let mut backoff = initial;
             loop {
                 let started = std::time::Instant::now();
-                let err = run_persistent(&db, source_id, &messages_dirty, &nick_lists).err();
+                let err = run_persistent(
+                    &db, source_id, &messages_dirty, &nick_lists, &subscribed,
+                ).err();
                 let ran_for = started.elapsed();
                 if ran_for > Duration::from_secs(60) {
                     backoff = initial;

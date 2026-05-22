@@ -192,6 +192,27 @@ fn parse_chat_channel(data: &str) -> Option<String> {
     None
 }
 
+/// Does `folder` pass the folder-related parts of `filters`? Used
+/// when merging the supervisor's subscribed-buffer list into the
+/// Folders view — only buffers that would have appeared as message
+/// rows under this view's filter should get an empty section.
+fn folder_matches_filter(folder: &str, filters: &Filters) -> bool {
+    if let Some(ref f) = filters.folder {
+        return folder == f;
+    }
+    if let Some(ref pat) = filters.folder_pattern {
+        for sub in pat.split('|') {
+            let sub = sub.trim();
+            if sub.is_empty() { continue; }
+            if folder.contains(sub) { return true; }
+        }
+        return false;
+    }
+    // No folder filter → match anything (e.g. view "A" with no
+    // source_id restriction).
+    true
+}
+
 /// Map a wee-slack relay folder name to a Slack Web API target
 /// string suitable for the `.slack` draft `Channel:` header. Used to
 /// route Slack replies through the API (always reaches the workspace)
@@ -700,6 +721,16 @@ struct App {
     /// Held here so future @-completion in compose can read it
     /// without re-fetching from the relay each time.
     nick_lists: sources::weechat_relay::NickLists,
+    /// Every weechat buffer the supervisor is currently subscribed
+    /// to. The Folders view merges this with message-derived
+    /// sections so empty channels still appear (weechat-buflist
+    /// parity).
+    subscribed_buffers: sources::weechat_relay::SubscribedBuffers,
+    /// Per-view list of folder names the user has hidden from the
+    /// Folders view. Persisted as `hidden_channels_<view>` in the
+    /// settings table. Applied AFTER the all-buffers merge so a
+    /// hidden channel disappears entirely.
+    current_hidden_channels: Vec<String>,
 
     // Background poller
     poller: Option<poller::Poller>,
@@ -920,9 +951,12 @@ fn main() {
     // later read by the App for @-completion (M6.3).
     let nick_lists: sources::weechat_relay::NickLists =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let subscribed_buffers: sources::weechat_relay::SubscribedBuffers =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     if let Some(sid) = weechat_relay_source_id {
         sources::weechat_relay::spawn_supervisor(
-            db.clone(), sid, messages_dirty.clone(), nick_lists.clone(),
+            db.clone(), sid, messages_dirty.clone(),
+            nick_lists.clone(), subscribed_buffers.clone(),
         );
     }
     let writer_mailfile = mailfile_cfg_main.clone();
@@ -1064,6 +1098,8 @@ fn main() {
         section_collapsed: HashMap::new(),
         current_section_order: Vec::new(),
         nick_lists: nick_lists.clone(),
+        subscribed_buffers: subscribed_buffers.clone(),
+        current_hidden_channels: Vec::new(),
         poller: None,
         poller_rx: None,
         write_tx,
@@ -1269,6 +1305,8 @@ impl App {
             "{" | "C-UP" => { self.move_section(-1); }
             "}" | "C-DOWN" => { self.move_section(1); }
             "C-HOME" => { self.reset_section_order(); }
+            "C-K" => { self.hide_current_channel(); }
+            "C-U" => { self.unhide_all_channels(); }
 
             // View switching
             "=" => { self.switch_to_view("A"); }
@@ -2542,6 +2580,7 @@ impl App {
         // Restore per-view manual section order so the Folders view
         // opens with channels in the order the user last arranged.
         self.current_section_order = self.load_section_order(key);
+        self.current_hidden_channels = self.load_hidden_channels(key);
 
         let mut filters = Filters::default();
 
@@ -3239,11 +3278,62 @@ impl App {
             self.display_messages.clear();
             return;
         }
-        let sections = if self.group_by_folder {
+        let mut sections = if self.group_by_folder {
             organizer::organize_by_folder(&self.filtered_messages, self.sort_inverted, &self.current_section_order)
         } else {
             organizer::organize_messages(&self.filtered_messages, &self.sort_order, self.sort_inverted)
         };
+
+        // Folders mode: merge in every subscribed weechat buffer that
+        // matches the current view filter, so empty channels still
+        // render as sections (weechat-buflist parity). Then drop any
+        // section the user has explicitly hidden for this view.
+        if self.group_by_folder {
+            let view_filters = self.build_current_filters();
+            let have_folder: std::collections::HashSet<String> = sections.iter()
+                .map(|s| s.name.clone()).collect();
+            let bufs = self.subscribed_buffers.lock().unwrap().clone();
+            for buf in bufs {
+                if have_folder.contains(&buf.full_name) { continue; }
+                if !folder_matches_filter(&buf.full_name, &view_filters) { continue; }
+                sections.push(organizer::Section {
+                    section_type: "channel".to_string(),
+                    display_name: organizer::pretty_folder_name_public(&buf.full_name),
+                    name: buf.full_name,
+                    source_type: "folder".to_string(),
+                    messages: Vec::new(),
+                    unread_count: 0,
+                });
+            }
+            // Re-sort: pinned channels first (in section_order), then
+            // the rest by latest message timestamp. Empty sections
+            // have no messages so they fall to the bottom of the
+            // unpinned tier.
+            let pin_rank: std::collections::HashMap<&str, usize> = self.current_section_order.iter()
+                .enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+            let filtered = &self.filtered_messages;
+            sections.sort_by(|a, b| {
+                let ra = pin_rank.get(a.name.as_str()).copied();
+                let rb = pin_rank.get(b.name.as_str()).copied();
+                match (ra, rb) {
+                    (Some(ia), Some(ib)) => ia.cmp(&ib),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => {
+                        let la = a.messages.iter().map(|&i| filtered[i].timestamp).max().unwrap_or(0);
+                        let lb = b.messages.iter().map(|&i| filtered[i].timestamp).max().unwrap_or(0);
+                        lb.cmp(&la)
+                    }
+                }
+            });
+            // Apply hide list.
+            if !self.current_hidden_channels.is_empty() {
+                let hide: std::collections::HashSet<&str> = self.current_hidden_channels.iter()
+                    .map(|s| s.as_str()).collect();
+                sections.retain(|s| !hide.contains(s.name.as_str()));
+            }
+        }
+        let sections = sections;
 
         self.display_messages.clear();
         for section in &sections {
@@ -3395,6 +3485,57 @@ impl App {
         if !msg.is_header { return; }
         let Some(name) = msg.thread_id.clone() else { return };
         self.section_collapsed.insert(name, false);
+        self.rebuild_display();
+        self.render_all();
+    }
+
+    /// Load the per-view list of channels to hide from the Folders
+    /// view. Persisted as `hidden_channels_<key>` JSON array.
+    fn load_hidden_channels(&self, view_key: &str) -> Vec<String> {
+        let setting_key = format!("hidden_channels_{}", view_key);
+        let Some(raw) = self.db.get_setting(&setting_key) else { return Vec::new() };
+        serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
+    }
+
+    fn save_hidden_channels(&self) {
+        let setting_key = format!("hidden_channels_{}", self.current_view);
+        let json = serde_json::to_string(&self.current_hidden_channels).unwrap_or_else(|_| "[]".into());
+        self.db.set_setting(&setting_key, &json);
+    }
+
+    /// Hide the section under the cursor from this view. Persists.
+    /// Bound to Ctrl+K. Use `unhide_all_channels` (Ctrl+U) to reset.
+    fn hide_current_channel(&mut self) {
+        if !self.group_by_folder { return; }
+        let Some(msg) = self.display_messages.get(self.index) else { return };
+        if !msg.is_header { return; }
+        let Some(section_name) = msg.thread_id.clone() else { return };
+        if !self.current_hidden_channels.contains(&section_name) {
+            self.current_hidden_channels.push(section_name.clone());
+            self.save_hidden_channels();
+        }
+        let label = section_name.rsplit_once('.').map(|(_, c)| c).unwrap_or(&section_name);
+        self.set_feedback(&format!("Hidden {}", label), self.config.theme_colors.feedback_ok);
+        self.rebuild_display();
+        if self.index >= self.display_messages.len() {
+            self.index = self.display_messages.len().saturating_sub(1);
+        }
+        self.render_all();
+    }
+
+    /// Restore every hidden channel for this view. Bound to Ctrl+U.
+    fn unhide_all_channels(&mut self) {
+        if !self.group_by_folder { return; }
+        if self.current_hidden_channels.is_empty() {
+            self.set_feedback("No hidden channels for this view",
+                self.config.theme_colors.feedback_info);
+            return;
+        }
+        let n = self.current_hidden_channels.len();
+        self.current_hidden_channels.clear();
+        self.save_hidden_channels();
+        self.set_feedback(&format!("Unhid {} channel(s)", n),
+            self.config.theme_colors.feedback_ok);
         self.rebuild_display();
         self.render_all();
     }

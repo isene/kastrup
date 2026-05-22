@@ -206,6 +206,13 @@ pub fn organize_by_folder(
     sections
 }
 
+/// Public re-export of `pretty_folder_name` so callers outside
+/// `organize_by_folder` (e.g. main's merge of empty subscribed
+/// buffers) can produce the same display string.
+pub fn pretty_folder_name_public(folder: &str) -> String {
+    pretty_folder_name(folder)
+}
+
 /// Strip the leading transport word (`python.`, `irc.`) from a
 /// weechat-relay folder so the section header reads `slack.dualog.&team`
 /// instead of `python.slack.dualog.&team`. We keep the workspace
