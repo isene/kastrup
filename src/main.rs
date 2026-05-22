@@ -4513,7 +4513,7 @@ impl App {
     /// Picker for a `#channel` reference. Same shape as
     /// `pick_nick_to_clipboard` but over subscribed_buffers. The copied
     /// string uses the channel's short_name (e.g. `#general` or
-    /// `#prod-changelog`), which Slack auto-resolves when posted.
+    /// `#announcements`), which Slack auto-resolves when posted.
     fn pick_channel_to_clipboard(&mut self) {
         let tc = self.config.theme_colors.clone();
         let bufs = self.subscribed_buffers.lock().unwrap().clone();
@@ -11696,10 +11696,10 @@ fn truncate_str(s: &str, max: usize) -> String {
 
 /// Per-sender ASCII avatar: a single uppercase initial in a deterministic
 /// color drawn from a curated palette. `sender` is the canonical key (so
-/// `g@isene.com` always gets the same color regardless of `sender_name`
-/// variations across messages). The initial prefers `sender_name`'s first
-/// letter when present (display name people will recognise) and falls back
-/// to the email user-part.
+/// `alice@example.com` always gets the same color regardless of
+/// `sender_name` variations across messages). The initial prefers
+/// `sender_name`'s first letter when present (display name people will
+/// recognise) and falls back to the email user-part.
 fn sender_avatar(sender: &str, sender_name: Option<&str>) -> (char, u8) {
     let initial = sender_name
         .and_then(|n| n.trim().chars().next())

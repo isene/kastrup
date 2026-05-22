@@ -1106,7 +1106,7 @@ pub fn tail(buffer_full_name: &str) -> Result<(), String> {
 
     // Find the buffer by full_name. Match exact first; fall back
     // to case-insensitive contains so the user can type
-    // "#general" or "general-oslo" without full prefixing.
+    // "#general" or part of a channel name without full prefixing.
     let buffers = c.list_buffers()?;
     let target = buffers.items.iter().find(|it| {
         matches!(it.fields.get("full_name"),
