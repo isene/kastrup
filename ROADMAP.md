@@ -1,42 +1,46 @@
 # Roadmap
 
-Snapshot as of v0.1.110. Items grouped by realistic scope. Tractable items get knocked off as time allows; "shelf" items need their own focused session each.
+Snapshot as of v0.1.115. Items grouped by realistic scope. Tractable items get knocked off as time allows; "shelf" items need their own focused session each.
 
 ## Recently shipped
 
-- **v0.1.103** — M5: long-lived push connection to the weechat relay (kernel-keepalive driven, exp backoff supervisor). Slack reply via Web API. Folders view polish (channels themed by source, dim/colored split, `[N/M]` counter, default-collapsed in Folders mode). Manual section ordering via `Ctrl+Up/Down`, reset via `Ctrl+Home`. Mark-section-read on `a`, mark-view-read on `A`.
-- **v0.1.104** — M6.1/M6.2/M6.3: joins/parts filtered via `tags_array`, `/me` action rendering, highlight badges in section headers and top bar, live nick lists per channel (data collected, consumer pending).
+- **v0.1.103** — M5: long-lived push connection to the weechat relay (kernel-keepalive supervisor, exp backoff). Slack reply via Web API. Folders view polish (source-themed dim/color split, `[N/M]` counter, default-collapsed). Manual section ordering via `Ctrl+Up/Down`, reset via `Ctrl+Home`. Mark-section-read on `a`, mark-view-read on `A`.
+- **v0.1.104** — M6.1/M6.2/M6.3: joins/parts filtered via `tags_array`, `/me` action rendering, highlight badges in section headers and top bar, live nick lists per channel.
 - **v0.1.105** — Folders view shows every subscribed buffer (even empty ones). Hide channel per view via `Ctrl+K`, restore via `Ctrl+U`.
-- **v0.1.106** — Drop workspace-root pseudo-buffer (`<workspace>` with no channel suffix) from the subscribed list.
+- **v0.1.106** — Drop wee-slack workspace-root pseudo-buffer from the subscribed list.
 - **v0.1.107** — Slack send via the same xoxc/xoxd browser-cookie auth wee-slack uses internally. No "via app" attribution badge.
-- **v0.1.108** — Architecture doc at `docs/architecture.html`. Personally-identifying examples and test fixtures replaced with generic names.
-- **v0.1.109** — Messenger/Instagram fetch-script paths are now config-driven via `fetch_script` in the source config, defaulting to `~/.kastrup/plugins/<name>.py`.
-- **v0.1.110** — Bumped `rustls-webpki` to 0.103.13 (patches three GHSA advisories). Channel-mismatch hint shown in the status line at compose time. Desktop notification (`notify-send`) on live highlight. Dead `sync_weechat_relay` polling fallback removed. README links to the architecture doc and documents the `fetch_script` key.
+- **v0.1.108** — Architecture doc at `docs/architecture.html`. Test fixtures and example comments replaced with generic names.
+- **v0.1.109** — Messenger/Instagram fetch-script paths config-driven via `fetch_script`, defaulting to `~/.kastrup/plugins/<name>.py`.
+- **v0.1.110** — `rustls-webpki` 0.103.13 (CVE patches). Channel-mismatch hint at compose time. `notify-send` on live highlight. Dead `sync_weechat_relay` polling fallback removed.
+- **v0.1.111** — M7.1–M7.5: `/` honors current view scope (cross-folder chat search inside Slack/IRC view). Inactive-view badges (`1 5 F2`). `Ctrl+N` / `Ctrl+G` nick/channel pickers → system clipboard. `.slack` drafts gain `Attach:` headers; `files.upload` on send. `O` downloads + opens the first Slack file attachment.
+- **v0.1.112** — `v` / `V` harmonised across sources (Slack file URLs now flow through the same attachment pipeline as email). OR-rules engine: views support `branches: [...]` for cross-source filters. Tighter top-bar badges (key-only, no count, excludes A/N/*).
+- **v0.1.113** — Tolerate lying charset declarations (sender says iso-8859-1, body is actually UTF-8).
+- **v0.1.114** — Killed a destructive second QP decode pass that mojibaked Norwegian bodies via accidental hex-digit pattern matching.
+- **v0.1.115** — Final cleanup of doc-comment examples that still leaked workspace/identity strings.
 
 ## Tractable next (small/medium, ~half-day each)
 
-### @-mention and #channel completion in compose
+### `O` action on Discord / Messenger / Instagram attachments
 
-Status: **data ready, consumer missing.** The supervisor maintains a shared `nick_lists: Arc<Mutex<HashMap<buffer, BTreeSet<nick>>>>` and a `subscribed_buffers: Arc<Mutex<Vec<SubscribedBuffer>>>`. Kastrup compose hands off to an external editor (`scribe`/`vim`/`$EDITOR`), so completion can't be a simple inline Tab handler. Two viable approaches:
+`O` (download attachment) currently knows how to fetch Slack file URLs with the Bearer + cookie auth. Other chat sources have their own attachment shapes (Discord CDN URLs, Marionette-scraped Instagram payloads) and need their own handlers. The `enrich_attachments_from_chat_urls` hook is the right place to extend.
 
-- **Pre-compose lookup**: an "insert reference" key (e.g. `Ctrl+@` to fuzzy-pick a nick, `Ctrl+#` for a channel) that drops the chosen handle into a yank buffer the user pastes in the editor.
-- **Editor-side hook**: scribe gains an IPC reader for kastrup's nick/channel snapshot. Larger change, touches multiple repos.
+### File send to Discord
 
-The first option is roughly a day of work; the second is a multi-day cross-repo effort.
+The pattern is the same as Slack file send (`.discord` drafts gain `Attach:` headers, post via multipart upload to the channel). Implementation: roughly the Slack code mirrored against Discord's `POST /channels/<id>/messages` with `multipart/form-data`. ~150 lines.
 
-### Cross-folder chat search
+### Compose-side editor IPC for true @-completion
 
-Current `S` (search) works against the current view's message scope. Chat-specific UX would search across all weechat-relay folders, group hits by channel, and offer a "jump to channel + scroll to date" action. Needs UI design for the result list.
+The current `Ctrl+N` / `Ctrl+G` pickers copy to clipboard for paste. A nicer flow: scribe (or whatever `$EDITOR` is) asks kastrup for a live nick/channel snapshot over a Unix socket when the user types `@<tab>` or `#<tab>`. Editor-side work, but the kastrup side is just a small reader server that exposes `nick_lists` / `subscribed_buffers`.
 
-### View-strip badge for inactive views
+### `/me` action send
 
-The top bar shows `!K` for unread highlights in the **current** view only. The user can't see at a glance that F2 has a mention waiting while F1 is focused. Implementation: one cached query (`SELECT folder, count(*) FROM messages WHERE read=0 AND json_extract(metadata, '$.highlight')=1 GROUP BY folder`) on a ~5s tick. Map each view's filter to a subset of those folders. Render F-key labels with badges.
+Currently kastrup can RENDER incoming `/me` actions but can't SEND one. A `Channel:` line plus a body starting with `/me` should route to the relay's `input` command with the action prefix preserved, and to Slack via `chat.meMessage`.
 
 ## Shelf items (multi-day, each its own session)
 
 ### glow image speedup
 
-Three phases, queued from earlier sessions. All in the [glow](https://github.com/isene/glow) repo, not kastrup.
+Three phases, all in the [glow](https://github.com/isene/glow) repo, not kastrup.
 
 - **Phase 1**: disk-persisted PNG cache so kastrup launches don't re-convert every image. Cache keyed by content hash.
 - **Phase 2**: replace external converters (`magick` / `montage`) with the Rust `image` crate. Cuts per-image fork cost and dependency.
@@ -48,28 +52,23 @@ Hybrid plan: keep the existing boa text renderer for plain HTML, layer in a Serv
 
 ### Reactions on chat messages
 
-Slack and Discord both support emoji reactions; the relay exposes them as message metadata. Kastrup currently throws this away. Work: extend MessageData to carry reaction summaries, render a compact line under the message, add a key to add/remove a reaction from the current message. Per-platform API surface.
+Slack and Discord both support emoji reactions; the relay exposes them as message metadata. Kastrup currently throws this away. Work: extend `MessageData` to carry reaction summaries, render a compact line under the message, add a key to add/remove a reaction from the current message. Per-platform API surface.
 
 ### Edit / delete sent messages
 
-`r` to edit, `Ctrl+D` to delete one's own message in Slack/Discord. Slack API: `chat.update` and `chat.delete`. Discord API: PATCH/DELETE `/channels/.../messages/<id>`. Requires UI for confirming the action and routing back through the cookie/bot auth paths.
+A key to edit, another to delete one's own message in Slack/Discord. Slack: `chat.update` / `chat.delete`. Discord: PATCH/DELETE `/channels/.../messages/<id>`. Needs confirmation UI and routing back through the cookie/bot auth paths.
 
-### File and image send & download in messages
+### File and image upload to Messenger / Instagram
 
-Across Slack, Discord, Messenger, Instagram. Two halves:
+The Marionette-driven Python plugins are the only path for these — no public API. Either extend the plugin protocol with an `upload` template, or skip until the user actually needs it.
 
-- **Download**: when a message has an attachment URL, fetch (using the right auth per platform) into `~/.kastrup/attachments/<id>/<file>`, render inline previews where possible (images via glow, others as `[attachment: file.pdf]` with `o` to open).
-- **Upload**: an `f` key in compose that prompts for a file path, uploads to the target platform's file API, and references the result in the message body.
+### Threaded conversations as nested replies
 
-Per-platform notes:
-- Slack: `files.upload` for upload; downloads are CDN URLs requiring the Bearer token.
-- Discord: multipart `application/octet-stream` POST to a channel + file.
-- Messenger / Instagram: requires the Marionette-driven Python fallback because there's no documented public API. Probably script-only.
+Slack thread parent/child support. Currently messages in a thread share the parent's folder but lose the parent→child relationship. Would require `thread_ts` capture at insert time and a tree-render mode in Folders/Threaded view.
 
-Realistic scope: each platform is a half-day to a day. Whole feature is roughly a week.
+## Out of scope (intentionally)
 
-## Definitely-out-of-scope-here
-
-- **Sound on highlight** — system-level concern; configure `notify-send` daemon to route notifications through `paplay`.
+- **Sound on highlight** — system-level concern; configure the `notify-send` daemon (e.g. `dunst`) to route notifications through `paplay`.
 - **Read receipts / typing indicators** — Slack-only, requires Socket Mode subscription. Cost outweighs benefit for a TUI inbox.
-- **Threaded conversations rendered as nested replies** — Slack thread parent/child support. Currently messages from a thread share the parent's channel folder but lose their parent-child relationship. Would require thread_ts capture and a tree-render mode.
+- **Custom theme editor** — themes live in `~/.kastrup/config.yml`; that's already as flexible as it needs to be.
+- **Multi-window / split-pane chat** — pane layout is fixed at 4 panes by design.
