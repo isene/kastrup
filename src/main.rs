@@ -7061,8 +7061,9 @@ impl App {
         let secrets = chat_send::load_secrets();
         let token = secrets.slack_token.as_ref()
             .ok_or_else(|| "no SLACK_API_TOKEN in ~/.kastrup/.env".to_string())?;
-        let channel_id = chat_send::slack_resolve_channel(token, &channel_raw)?;
-        chat_send::send_slack(token, &channel_id, &body)?;
+        let cookie = secrets.slack_cookie.as_deref();
+        let channel_id = chat_send::slack_resolve_channel(token, cookie, &channel_raw)?;
+        chat_send::send_slack(token, cookie, &channel_id, &body)?;
         Ok(channel_raw)
     }
 
