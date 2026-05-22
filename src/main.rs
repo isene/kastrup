@@ -10217,19 +10217,19 @@ fn extract_mime_text_depth(raw: &str, depth: usize) -> Option<String> {
             if lower.contains("text/plain") {
                 let decoded = if is_qp {
                     let bytes = decode_qp_bytes_body(body);
-                    if is_latin1 { latin1_to_utf8(&bytes) } else { String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()) }
+                    decode_body_bytes(&bytes, is_latin1)
                 } else if is_b64 {
                     let bytes = sources::maildir::base64_decode(body.trim()).unwrap_or_default();
-                    if is_latin1 { latin1_to_utf8(&bytes) } else { String::from_utf8(bytes).unwrap_or_default() }
+                    decode_body_bytes(&bytes, is_latin1)
                 } else { body.to_string() };
                 if !decoded.trim().is_empty() { text_part = Some(decoded); }
             } else if lower.contains("text/html") {
                 let decoded = if is_qp {
                     let bytes = decode_qp_bytes_body(body);
-                    if is_latin1 { latin1_to_utf8(&bytes) } else { String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()) }
+                    decode_body_bytes(&bytes, is_latin1)
                 } else if is_b64 {
                     let bytes = sources::maildir::base64_decode(body.trim()).unwrap_or_default();
-                    if is_latin1 { latin1_to_utf8(&bytes) } else { String::from_utf8(bytes).unwrap_or_default() }
+                    decode_body_bytes(&bytes, is_latin1)
                 } else { body.to_string() };
                 html_part = Some(decoded);
             } else if lower.contains("text/calendar") && cal_part.is_none() {
@@ -10421,10 +10421,10 @@ fn extract_mime_html_depth(raw: &str, depth: usize) -> Option<String> {
 
             let decoded = if is_qp {
                 let bytes = decode_qp_bytes_body(body);
-                if is_latin1 { latin1_to_utf8(&bytes) } else { String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()) }
+                decode_body_bytes(&bytes, is_latin1)
             } else if is_b64 {
                 let bytes = sources::maildir::base64_decode(body.trim()).unwrap_or_default();
-                if is_latin1 { latin1_to_utf8(&bytes) } else { String::from_utf8(bytes).unwrap_or_default() }
+                decode_body_bytes(&bytes, is_latin1)
             } else { body.to_string() };
 
             if lower.contains("text/html") {
@@ -10847,6 +10847,31 @@ fn looks_base64(s: &str) -> bool {
 /// Convert ISO-8859-1 / Windows-1252 bytes to UTF-8 string.
 fn latin1_to_utf8(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| b as char).collect()
+}
+
+/// Decode a body byte buffer using the declared MIME charset, but
+/// don't blindly trust the declaration. Many senders mark UTF-8
+/// content as `charset=iso-8859-1` or `windows-1252` (this is
+/// rampant on transactional mail). Strategy:
+///
+/// 1. If `declared_latin1` is false (charset says UTF-8 or wasn't
+///    set), interpret as UTF-8, lossy-decode on error.
+/// 2. If `declared_latin1` is true, FIRST try strict UTF-8. If
+///    the bytes happen to be valid UTF-8 that's almost certainly
+///    what they really are — Norwegian "påminnelse" (UTF-8
+///    `0xC3 0xA5`) would otherwise come through as the mojibake
+///    `pÃ¥minnelse` after a literal latin1→utf-8 lift.
+/// 3. Only fall through to `latin1_to_utf8` when strict UTF-8
+///    fails, i.e. the bytes are genuinely 8-bit Latin-1.
+fn decode_body_bytes(bytes: &[u8], declared_latin1: bool) -> String {
+    if declared_latin1 {
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            return s.to_string();
+        }
+        return latin1_to_utf8(bytes);
+    }
+    String::from_utf8(bytes.to_vec())
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// Decode quoted-printable to raw bytes (for charset-aware conversion).
