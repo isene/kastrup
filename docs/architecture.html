@@ -1,0 +1,528 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Kastrup — architecture (v0.1.107)</title>
+<style>
+  :root {
+    --bg: #0e1014;
+    --fg: #d8dee9;
+    --muted: #7d8590;
+    --accent: #7aa2f7;
+    --warn: #e0af68;
+    --good: #9ece6a;
+    --bad: #f7768e;
+    --code-bg: #14171d;
+    --border: #2a2f3a;
+    --link: #8ab4f8;
+  }
+  html { background: var(--bg); color: var(--fg); }
+  body {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 2.5em 1.5em 4em;
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
+    line-height: 1.55;
+    font-size: 15.5px;
+  }
+  h1 { font-size: 1.9em; margin: 0 0 .2em; }
+  h2 { font-size: 1.45em; margin: 2.2em 0 .5em; border-bottom: 1px solid var(--border); padding-bottom: .25em; }
+  h3 { font-size: 1.15em; margin: 1.6em 0 .35em; color: var(--accent); }
+  p  { margin: .55em 0 .8em; }
+  ul, ol { margin: .35em 0 .9em; padding-left: 1.5em; }
+  li { margin: .15em 0; }
+  a { color: var(--link); }
+  .subtitle { color: var(--muted); margin: 0 0 1.6em; }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1em 1.1em;
+    overflow-x: auto;
+    font-family: "JetBrains Mono", "Fira Code", "Menlo", ui-monospace, monospace;
+    font-size: 12.8px;
+    line-height: 1.35;
+    color: #cdd6f4;
+  }
+  code {
+    font-family: "JetBrains Mono", "Fira Code", "Menlo", ui-monospace, monospace;
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: .92em;
+  }
+  pre code { background: none; padding: 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: .5em 0 1.2em;
+    font-size: 14px;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: .55em .75em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th {
+    background: var(--code-bg);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  tr:nth-child(even) td { background: rgba(255,255,255,.015); }
+  .tag {
+    display: inline-block;
+    font-size: 11.5px;
+    padding: 1px 7px;
+    border-radius: 9px;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    margin: 0 4px 0 0;
+    vertical-align: middle;
+  }
+  .tag.good { color: var(--good); border-color: rgba(158,206,106,.4); }
+  .tag.warn { color: var(--warn); border-color: rgba(224,175,104,.4); }
+  .tag.bad  { color: var(--bad);  border-color: rgba(247,118,142,.4); }
+  .note {
+    background: rgba(122,162,247,.08);
+    border-left: 3px solid var(--accent);
+    padding: .7em 1em;
+    margin: .9em 0;
+    border-radius: 0 4px 4px 0;
+  }
+  .toc {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: .8em 1.2em .5em;
+    margin: 1.2em 0 2em;
+  }
+  .toc ol { margin: .25em 0 .35em; padding-left: 1.4em; }
+  .toc li { margin: .12em 0; }
+  .toc a { text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  footer {
+    margin-top: 4em;
+    border-top: 1px solid var(--border);
+    padding-top: 1em;
+    color: var(--muted);
+    font-size: 13px;
+  }
+</style>
+</head>
+<body>
+
+<h1>Kastrup — architecture</h1>
+<p class="subtitle">Unified messaging hub TUI. As of <code>v0.1.107</code>. Built on <code>crust</code> + <code>rusqlite</code> + <code>ureq</code>.</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#overview">High-level overview</a></li>
+    <li><a href="#sources">Source inventory</a></li>
+    <li><a href="#receive">Receive flow</a></li>
+    <li><a href="#send">Send flow</a></li>
+    <li><a href="#auth">Auth &amp; secrets matrix</a></li>
+    <li><a href="#files">Local files</a></li>
+    <li><a href="#threads">Threads &amp; shared state</a></li>
+    <li><a href="#views">Views, sorting, ordering</a></li>
+    <li><a href="#dedup">Dedup &amp; the weechat-relay hash</a></li>
+    <li><a href="#design">Design principles</a></li>
+  </ol>
+</div>
+
+<h2 id="overview">1. High-level overview</h2>
+<p>
+  Kastrup is a single Rust binary that aggregates messages from many transports (email, Slack, IRC, Discord, RSS, etc.) into one unified inbox stored in a local SQLite database. The TUI reads from that database; background threads write to it.
+</p>
+<p>
+  The hot path for chat is the <strong>weechat-relay supervisor</strong>: a long-lived TCP connection to a remote <code>weechat</code> process on remote relay host that proxies Slack, IRC, Discord-bridge, Matrix, etc. Kernel TCP keepalives detect drops; userspace is parked on <code>read()</code> when idle, so the cost when no traffic is flowing is essentially zero.
+</p>
+<p>
+  Everything else (email/maildir, RSS, Slack-via-API polling, Discord-via-bot polling) runs through a single shared <strong>poller thread</strong> on per-source intervals.
+</p>
+
+<h2 id="sources">2. Source inventory</h2>
+<table>
+<thead><tr><th>Source type</th><th>Transport</th><th>Cadence</th><th>Send?</th></tr></thead>
+<tbody>
+  <tr><td><code>maildir</code></td><td>local filesystem (<code>~/Maildir</code>)</td><td>poller, 60s</td><td>via msmtp</td></tr>
+  <tr><td><code>rss</code></td><td>HTTPS GET feeds</td><td>poller, 1h</td><td>—</td></tr>
+  <tr><td><code>weechat-relay</code> <span class="tag good">push</span></td><td>plain TCP relay protocol</td><td>long-lived, real-time</td><td>relay <code>input</code> (IRC, Discord-bridge)</td></tr>
+  <tr><td><code>weechat</code> (legacy)</td><td>log-tail of weechat logs</td><td>disabled in v0.1.103+</td><td>—</td></tr>
+  <tr><td><code>slack</code></td><td>Slack Web API</td><td>poller, 5m</td><td>chat.postMessage</td></tr>
+  <tr><td><code>discord</code></td><td>Discord Bot API + webhooks</td><td>poller, 5m</td><td>bot + webhook</td></tr>
+  <tr><td><code>messenger</code></td><td>FB messenger bridge</td><td>poller</td><td>—</td></tr>
+  <tr><td><code>instagram</code></td><td>IG bridge</td><td>poller</td><td>—</td></tr>
+  <tr><td><code>workspace</code></td><td>external private sidecar (out-of-tree)</td><td>maildir bridge</td><td>sidecar stdin</td></tr>
+</tbody>
+</table>
+
+<h2 id="receive">3. Receive flow</h2>
+<p>External services land messages in kastrup via three mechanisms:</p>
+<ol>
+  <li><strong>Push</strong> — the weechat-relay supervisor maintains a long-lived TCP socket; updates arrive as binary protocol events.</li>
+  <li><strong>Poll</strong> — the poller thread wakes on intervals and calls source-specific <code>sync_*</code> functions.</li>
+  <li><strong>Bridge</strong> — external programs (<code>gmail-idle</code>, <code>ws-bridge</code>) write to <code>~/Maildir</code>; the maildir poller picks them up on its next tick.</li>
+</ol>
+
+<pre>┌──────────────────────────────────────────────────────────────────────────────┐
+│                          EXTERNAL SERVICES / SOURCES                         │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  GMail/IMAP       Slack         IRC      Discord     RSS feeds    SMTP server
+     │             │  ▲           │   ▲      │   ▲         │             ▲
+     │             │  └─────────┐ │   │      │   │         │             │
+     │             ▼            │ ▼   │      ▼   │         │             │
+   ┌─────┐      ┌─────────────────────────┐    ┌──────────────┐          │
+   │gmail│      │   weechat (remote relay host)   │    │ discord bot  │          │
+   │-idle│      │  port 8001 relay plain  │    │  /webhooks   │          │
+   │     │      │  • wee-slack plugin     │    └──────┬───────┘          │
+   │IMAP │      │  • irc.* networks       │           │ HTTPS            │
+   │IDLE │      │  • irc.discord-bridge   │           │                  │
+   └──┬──┘      └────────────┬────────────┘           │                  │
+      │                      │ relay binary protocol  │                  │
+      │ writes               │ (push, kernel keepalive)                  │
+      ▼ to maildir           │                        │                  │
+   ┌────────────┐            │                        │                  │
+   │ maildir/   │            │                        │                  │
+   │ cur/  new/ │            │                        │                  │
+   └────┬───────┘            │                        │                  │
+        │                    │                        │                  │
+        │ sync_maildir()     │ run_persistent()       │ sync_discord()   │
+        │ (poller, 60s tick) │ (long-lived thread)    │ (poller, 5m tick)│
+        │                    │                        │                  │
+        ▼                    ▼                        ▼                  │
+  ╔═══════════════════════════════════════════════════════════════════╗  │
+  ║                       KASTRUP PROCESS                             ║  │
+  ║                                                                   ║  │
+  ║  ┌──────────────┐    ┌─────────────────────┐                      ║  │
+  ║  │ Poller thread│    │ weechat-relay super-│                      ║  │
+  ║  │ (10s park,   │    │ visor thread        │                      ║  │
+  ║  │  per-source  │    │ • TCP keepalive     │                      ║  │
+  ║  │  interval)   │    │   30/15/4           │                      ║  │
+  ║  │              │    │ • exp backoff 1s→5m │                      ║  │
+  ║  │ • maildir    │    │ • on reconnect:     │                      ║  │
+  ║  │ • rss        │    │   list_buffers +    │                      ║  │
+  ║  │ • discord    │    │   last_lines(15)    │                      ║  │
+  ║  │ • slack      │    │   per channel       │                      ║  │
+  ║  │ • messenger  │    │ • _buffer_line_added│                      ║  │
+  ║  │ • instagram  │    │ • _buffer_opened/   │                      ║  │
+  ║  │              │    │   _closing → buffer │                      ║  │
+  ║  │ (weechat &   │    │   registry          │                      ║  │
+  ║  │  weechat-    │    │ • _nicklist_diff →  │                      ║  │
+  ║  │  relay are   │    │   nick_lists map    │                      ║  │
+  ║  │  NO-OPs here │    │ • highlight flag    │                      ║  │
+  ║  │  now)        │    │ • tags_array filter │                      ║  │
+  ║  └──────┬───────┘    │   joins/parts/quits │                      ║  │
+  ║         │            └─────┬───────────────┘                      ║  │
+  ║         │  Vec&lt;MessageData&gt;│                                      ║  │
+  ║         │                  │ insert_messages_batch                ║  │
+  ║         │                  │ (own DB lock; messages_dirty=true)   ║  │
+  ║         ▼                  ▼                                      ║  │
+  ║  ┌─────────────────────────────────────────────────┐              ║  │
+  ║  │  SQLite at ~/.heathrow/heathrow.db              │              ║  │
+  ║  │  tables: sources, messages, views, settings,    │              ║  │
+  ║  │          postponed, tags                        │              ║  │
+  ║  │  dedup: external_id UNIQUE (per source)         │              ║  │
+  ║  │  weechat-relay hash = md5(folder│ts│msg-head)   │              ║  │
+  ║  │  + backward-compat check against legacy         │              ║  │
+  ║  │    (folder│ts│nick│msg-head) hash               │              ║  │
+  ║  └─────────┬───────────────────────────────────────┘              ║  │
+  ║            │ ↑                                                    ║  │
+  ║            │ │ get_messages(filters, 500)                         ║  │
+  ║            │ │                                                    ║  │
+  ║            │ │  (5s tick if messages_dirty.swap(false))           ║  │
+  ║            ▼ │                                                    ║  │
+  ║  ┌──────────────────────────────────────┐                         ║  │
+  ║  │  App (main thread, crust TUI)        │                         ║  │
+  ║  │  • filtered_messages (cap 500)       │                         ║  │
+  ║  │  • view filters: folder | folder_    │                         ║  │
+  ║  │    pattern | source_id | source_type │                         ║  │
+  ║  │  • Folders mode merges with          │                         ║  │
+  ║  │    subscribed_buffers snapshot       │                         ║  │
+  ║  │    so empty channels still appear    │                         ║  │
+  ║  │  • per-view: section_order,          │                         ║  │
+  ║  │    hidden_channels, thread_mode      │                         ║  │
+  ║  └─────────────┬────────────────────────┘                         ║  │
+  ║                │                                                  ║  │
+  ╚════════════════│══════════════════════════════════════════════════╝  │
+                   │                                                     │
+                   ▼                                                     │
+              [render to glass / kitty / wezterm]                        │
+                                                                         │
+                                                       SEND uses ─────►──┘
+</pre>
+
+<div class="note">
+  <strong>Why the weechat-relay path is special:</strong> chat traffic is bursty and continuous. A 2-minute poll either misses messages or runs constantly. The push connection wakes the thread <em>only</em> when bytes arrive on the socket; an idle remote relay host generates ~zero kastrup wakeups. Kernel TCP keepalives (every 30s, 4 retries × 15s ≈ 90s death detection) live entirely in the kernel — they never wake userspace unless the peer is actually dead.
+</div>
+
+<h2 id="send">4. Send flow</h2>
+<p>
+  Replies and new compose paths dispatch by <code>DraftKind</code>, which is decided at compose-time from the selected message's <code>source_type</code> and folder shape.
+</p>
+
+<pre>  user composes / replies in TUI
+            │
+            │  reply() / compose_new() picks DraftKind from
+            │  selected message's source_type + folder shape
+            │
+   ┌────────┴──────────┬──────────────┬──────────────┬──────────────────┐
+   │                   │              │              │                  │
+   ▼                   ▼              ▼              ▼                  ▼
+ DraftKind         DraftKind     DraftKind       DraftKind          DraftKind
+   Email            Slack         Discord        Weechat           (Workspace)
+   .eml             .slack        .discord       .weechat           via ws-bridge
+   template         template      template       template           pipe/stdin
+   │                │             │              │                   │
+   │ editor (scribe/vim) ──────────────────────►  review screen      │
+   │                                                  │              │
+   │ on accept:                                       ▼              │
+   │                                              dispatch by kind   │
+   │                                                  │              │
+   ▼                                                  │              │
+ msmtp ┐                                              │              │
+       │ DraftKind::Email                             │              │
+       │                                              │              │
+       │     ┌────────────────────────────────────────┘              │
+       │     │                                                       │
+       │     ├─► DraftKind::Slack ─► chat_send::send_slack_draft     │
+       │     │                       │                               │
+       │     │                       ├─ parse Channel: header        │
+       │     │                       ├─ slack_resolve_channel:       │
+       │     │                       │    #chan → conversations.list │
+       │     │                       │    @user → users.list → DM    │
+       │     │                       │    &chan → treat as #chan     │
+       │     │                       │    mpdm:a,b,c → resolve all → │
+       │     │                       │      conversations.open       │
+       │     │                       │      (multi-party DM)         │
+       │     │                       ├─ apply_slack_auth:            │
+       │     │                       │    Authorization: Bearer …    │
+       │     │                       │    Cookie: d=xoxd-… (if any)  │
+       │     │                       └─ POST chat.postMessage        │
+       │     │                                                       │
+       │     ├─► DraftKind::Discord ─► chat_send::send_discord       │
+       │     │                         │                             │
+       │     │                         ├─ webhook:name  →            │
+       │     │                         │   POST DISCORD_WEBHOOK_&lt;n&gt;  │
+       │     │                         ├─ channel:id  →              │
+       │     │                         │   bot API + bot token       │
+       │     │                         └─ dm:userId  →               │
+       │     │                             create DM + post          │
+       │     │                                                       │
+       │     └─► DraftKind::Weechat ─► send_weechat_draft            │
+       │                               │                             │
+       │                               ├─ connect (no keepalive,     │
+       │                               │  one-shot)                  │
+       │                               ├─ handshake + init           │
+       │                               └─ `input &lt;full_name&gt; &lt;body&gt;` │
+       │                                  (IRC / Discord-bridge /    │
+       │                                  Matrix only — Slack is     │
+       │                                  rerouted to API above)     │
+       │                                                             │
+       ▼                                                             │
+   external server ◄────────────────────────────────────────────────►│
+</pre>
+
+<div class="note">
+  <strong>Slack split:</strong> when replying to a message whose folder starts with <code>python.slack.</code>, kastrup builds a <code>.slack</code> draft and routes through the Slack Web API instead of the relay's <code>input</code> command. Reason: wee-slack auto-closes inactive DM buffers, and the relay silently drops <code>input</code> targeted at non-existent buffers. The Web API works against the workspace regardless of which buffers are open.
+</div>
+
+<div class="note">
+  <strong>Why Slack send avoids "via wee-slack" badge:</strong> with the xoxc/xoxd cookie pair (the same auth wee-slack itself uses internally), Slack treats the post exactly like a web-typed message. No app attribution. The legacy xoxp- fallback still works but Slack tags every message "via wee-slack" because the token belongs to the wee-slack public Slack app.
+</div>
+
+<h2 id="auth">5. Auth &amp; secrets matrix</h2>
+<table>
+<thead>
+<tr><th>Transport</th><th>Receive auth</th><th>Send auth</th><th>Lives in</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td>Gmail / IMAP</td>
+  <td>OAuth via external <code>gmail-idle</code></td>
+  <td><code>msmtp</code> config (system)</td>
+  <td>msmtp + keyring</td>
+</tr>
+<tr>
+  <td>Maildir</td>
+  <td>none (filesystem)</td>
+  <td>msmtp</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td>Slack (chat read + chat send)</td>
+  <td>
+    via weechat-relay (no Slack token used by kastrup for reads —
+    wee-slack on remote relay host does the read)
+  </td>
+  <td>
+    ① <span class="tag good">preferred</span>
+    <code>xoxc-…</code> Bearer + <code>Cookie: d=xoxd-…</code>
+    → no app badge<br>
+    ② <span class="tag warn">fallback</span>
+    <code>xoxp-…</code> Bearer only
+    → "via wee-slack" badge
+  </td>
+  <td>
+    wee-slack stored in <code>plugins.conf</code><br>
+    or <code>~/.kastrup/.env</code>
+  </td>
+</tr>
+<tr>
+  <td>Slack source plugin (poll)</td>
+  <td><code>xoxp-</code> Bearer (sync_slack in poller, 5min)</td>
+  <td>(uses send path above)</td>
+  <td><code>~/.kastrup/.env</code></td>
+</tr>
+<tr>
+  <td>IRC (libera, oftc, …)</td>
+  <td>via weechat-relay protocol (push events)</td>
+  <td>relay <code>input</code> command</td>
+  <td>wee-relay password in <code>.env</code></td>
+</tr>
+<tr>
+  <td>Discord</td>
+  <td>
+    ① poll: bot token (DMs + channel.history)<br>
+    ② via <code>irc.discord-bridge</code> (server-side bridge bot)
+  </td>
+  <td>
+    webhook URL OR bot token + channel ID OR DM open
+  </td>
+  <td><code>~/.kastrup/.env</code></td>
+</tr>
+<tr>
+  <td>Weechat relay</td>
+  <td>host:port + plaintext password</td>
+  <td>same connection (for IRC/bridge)</td>
+  <td><code>~/.kastrup/.env</code></td>
+</tr>
+<tr>
+  <td>Workspace (private)</td>
+  <td>external sidecar process writes to maildir</td>
+  <td>external sidecar stdin</td>
+  <td>private out-of-tree</td>
+</tr>
+<tr>
+  <td>RSS</td>
+  <td>HTTPS GET (no auth)</td>
+  <td>N/A</td>
+  <td>—</td>
+</tr>
+</tbody>
+</table>
+
+<h2 id="files">6. Local files</h2>
+<pre>~/.kastrup/
+  ├── .env                 chmod 600, secrets
+  │     SLACK_API_TOKEN, SLACK_API_COOKIE
+  │     DISCORD_BOT_TOKEN, DISCORD_WEBHOOK_&lt;name&gt;
+  │     WEECHAT_RELAY_HOST/PORT/PASSWORD
+  ├── kastruprc            theme, identities, sources config
+  ├── kastrup.log          append-only
+  ├── drafts/              postponed/queued send: .eml .slack .discord .weechat
+  └── image_cache/
+
+~/.weechat/
+  └── plugins.conf         fallback secret source for Slack
+                           (xoxc-:xoxd-,xoxp-)
+
+~/.heathrow/
+  └── heathrow.db          SQLite — all messages, views, settings, tags
+</pre>
+
+<div class="note">
+  <strong>Token loading order for Slack send:</strong>
+  <ol>
+    <li>If <code>SLACK_API_TOKEN</code> is set in <code>~/.kastrup/.env</code>, use it (plus <code>SLACK_API_COOKIE</code> if also set).</li>
+    <li>Else, parse <code>~/.weechat/plugins.conf</code> for the comma-separated <code>python.slack.slack_api_token</code> list.</li>
+    <li>From that list: prefer the <code>xoxc-…:xoxd-…</code> pair if present (sets both bearer and cookie).</li>
+    <li>Otherwise fall back to the first <code>xoxp-…</code> entry (bearer only).</li>
+  </ol>
+</div>
+
+<h2 id="threads">7. Threads &amp; shared state</h2>
+<pre>main thread ──────► render TUI, dispatch keys
+   │
+   ├─► messages_dirty: Arc&lt;AtomicBool&gt;     flipped by writers, read by 5s tick
+   ├─► nick_lists: Arc&lt;Mutex&lt;HashMap&lt;&gt;&gt;&gt;   per-buffer nicks (supervisor writes)
+   ├─► subscribed_buffers: Arc&lt;Mutex&lt;Vec&gt;&gt; open weechat buffers (supervisor writes)
+   ├─► write_tx: mpsc::Sender&lt;DbWriteOp&gt;   serialized writes to DB writer thread
+   │
+   ├──► Poller thread (start_poller)       2-min/5-min ticks per source
+   │      └─► db.insert_messages_batch + db.update_source_sync_time
+   │
+   ├──► DB writer thread                   owns one rusqlite Connection
+   │      └─► drains write_rx: MarkRead, ToggleStar, DeleteMessages,
+   │            UpdateFolder, UpdateMetadata, MarkAllReadBulk, …
+   │
+   └──► weechat-relay supervisor           one supervised long-lived TCP socket
+          └─► db.insert_message / insert_messages_batch on each _buffer_line_added
+          └─► nick_lists / subscribed_buffers updates
+</pre>
+
+<h3>Why a dedicated DB writer thread?</h3>
+<p>
+  Rusqlite is serial — only one writer at a time. With multiple threads doing mutations (mark-read, toggle-star, batch insert from poller, batch insert from supervisor), we'd contend on the connection mutex. Funneling all writes through a single thread + mpsc channel keeps each writer thread non-blocking, lets the main thread fire-and-forget user mutations, and means the connection's transaction handling is owned by one place.
+</p>
+
+<h2 id="views">8. Views, sorting, ordering</h2>
+<p>
+  Views are filter recipes stored in the <code>views</code> table. Each view has a <code>filters</code> JSON blob with a <code>rules</code> array of <code>{field, op, value}</code>. The rule parser honors <code>op = "="</code> (exact match) and <code>op = "like"</code> (pipe-OR <code>LIKE %v%</code>).
+</p>
+<table>
+<thead><tr><th>Per-view setting</th><th>Storage key</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td>Thread mode</td><td><code>thread_mode_&lt;key&gt;</code></td><td>flat / threaded / folders</td></tr>
+<tr><td>Pinned section order</td><td><code>section_order_&lt;key&gt;</code></td><td>JSON array, channels listed here rank above unpinned</td></tr>
+<tr><td>Hidden channels</td><td><code>hidden_channels_&lt;key&gt;</code></td><td>JSON array, channel folders excluded from Folders view</td></tr>
+</tbody>
+</table>
+<p>Default channel sort (Folders mode) is by latest message timestamp, descending. Pinned channels rank above unpinned in <code>section_order</code> order; unpinned channels stay newest-first below.</p>
+
+<h3>Folders-view merge (v0.1.105+)</h3>
+<p>
+  The Folders mode shows every <em>subscribed</em> weechat buffer that matches the current view's folder filter, even if it has no messages in the loaded 500-message window. The supervisor publishes its current buffer registry to a shared <code>SubscribedBuffers</code> snapshot; rebuild_display unions that with message-derived sections.
+</p>
+<p>This means a quiet channel like <code>#cab</code> with all messages older than the load-limit window still appears as a section (<code>[0]</code> count). The user can mark it read or hide it (<code>Ctrl+K</code>) just like any other.</p>
+
+<h2 id="dedup">9. Dedup &amp; the weechat-relay hash</h2>
+<p>
+  Messages dedupe on <code>(source_id, external_id)</code> UNIQUE. For most sources the external_id is provided by the transport (Slack message timestamp, RSS GUID, maildir filename, etc.). For weechat-relay there's no stable line ID across weechat restarts, so kastrup synthesizes one:
+</p>
+<pre>weechat-relay_&lt;md5(folder│timestamp│message-head[0..80])&gt;</pre>
+<p>
+  This was changed from a previous formula that included the nick in the hash. Some DB rows from before the change still carry old-format external_ids; to avoid a reconnect re-inserting them under the new hash, the supervisor checks <strong>both</strong> the new hash AND the legacy <code>(folder│ts│nick│msg-head)</code> hash against <code>known_ids</code> before inserting. New rows get the new hash; legacy rows match on either.
+</p>
+
+<h2 id="design">10. Design principles</h2>
+<p>The three rules, in priority order:</p>
+<ol>
+  <li>
+    <strong>No wasted CPU cycles.</strong> Every feature is gated. Compare desired state to last-applied state before doing X11/syscall/network work. The supervisor's <code>read()</code> is kernel-parked — zero userspace cycles when no chat is happening.
+  </li>
+  <li>
+    <strong>Lightning fast.</strong> No interpreters in helper scripts. Cache anything stable. The 5s message-refresh tick is gated on a <code>messages_dirty</code> atomic so idle kastrup doesn't run <code>get_messages()</code> for no reason.
+  </li>
+  <li>
+    <strong>More battery life.</strong> A consequence of the first two. The previous 6-min idle reconnect (read timeout) used to wake up every 6 min for the entire chat-quiet workday — removed in v0.1.103 in favor of kernel keepalives only.
+  </li>
+</ol>
+
+<h3>Other rules</h3>
+<ul>
+  <li><strong>No secrets in tracked source files.</strong> Real tokens live in <code>~/.kastrup/.env</code> (chmod 600). Patterns in code use only prefixes like <code>"xoxp-"</code>, never literal token bytes. Pre-commit sweep before every push.</li>
+  <li><strong>Backward-compat on hash changes.</strong> Never re-duplicate existing DB rows just because a derivation formula changed.</li>
+  <li><strong>Send paths are transport-specific.</strong> One generic "send anything" abstraction would be vague and brittle. Slack/Discord/Weechat each have their own <code>send_*_draft</code> function with explicit auth handling.</li>
+  <li><strong>The TUI is just a reader.</strong> All mutation (insert, mark-read, delete) goes through the DB writer thread. The main thread never blocks on a DB write.</li>
+</ul>
+
+<footer>
+  <p>Generated for <code>kastrup</code> at <code>v0.1.107</code>. Source: <a href="https://github.com/isene/kastrup">github.com/isene/kastrup</a>. Part of the Fe₂O₃ Rust terminal suite.</p>
+</footer>
+
+</body>
+</html>

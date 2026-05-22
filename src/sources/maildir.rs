@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn basename_extracted_when_folder_has_underscores() {
-        let s = "maildir_PassionFruits.Archive_1715407823.M123P12.host:2,S";
+        let s = "maildir_Project.Archive_1715407823.M123P12.host:2,S";
         assert_eq!(extract_maildir_basename(s), Some("1715407823.M123P12.host"));
         let s = "maildir_some_dotted_folder_1715407823.M123P12.host";
         assert_eq!(extract_maildir_basename(s), Some("1715407823.M123P12.host"));

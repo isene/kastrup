@@ -161,11 +161,11 @@ mod tests {
     #[test]
     fn scan_scalar_basic() {
         let t = r#"
-$mailfile   = "/home/geir/.mail"
-$safedir    = "/home/.safe/mail"
+$mailfile   = "/tmp/example.mail"
+$safedir    = "/tmp/example.safe"
 "#;
-        assert_eq!(scan_scalar(t, "mailfile"), Some("/home/geir/.mail".into()));
-        assert_eq!(scan_scalar(t, "safedir"),  Some("/home/.safe/mail".into()));
+        assert_eq!(scan_scalar(t, "mailfile"), Some("/tmp/example.mail".into()));
+        assert_eq!(scan_scalar(t, "safedir"),  Some("/tmp/example.safe".into()));
         assert_eq!(scan_scalar(t, "missing"),  None);
     }
 
@@ -173,16 +173,16 @@ $safedir    = "/home/.safe/mail"
     fn scan_mailboxes_multiline() {
         let t = r#"
 $mailboxes = [
-    [ "G:", "Geir"                ],
-    [ "D:", "AA.Customers.Dualog" ],
-    [ "P:", "PassionFruits"       ]
+    [ "P:", "Personal" ],
+    [ "W:", "Work"     ],
+    [ "L:", "Lists"    ]
 ]
 "#;
         let mb = scan_mailboxes(t).expect("parsed");
         assert_eq!(mb.len(), 3);
-        assert_eq!(mb[0], ("G:".into(), "Geir".into()));
-        assert_eq!(mb[1], ("D:".into(), "AA.Customers.Dualog".into()));
-        assert_eq!(mb[2], ("P:".into(), "PassionFruits".into()));
+        assert_eq!(mb[0], ("P:".into(), "Personal".into()));
+        assert_eq!(mb[1], ("W:".into(), "Work".into()));
+        assert_eq!(mb[2], ("L:".into(), "Lists".into()));
     }
 
     #[test]
@@ -190,18 +190,18 @@ $mailboxes = [
         let cfg = MailfileConfig {
             path: "/tmp/_kastrup_test_mail".into(),
             mailboxes: vec![
-                ("G:".into(), "Geir".into()),
-                ("D:".into(), "AA.Customers.Dualog".into()),
+                ("P:".into(), "Personal".into()),
+                ("W:".into(), "Work".into()),
             ],
         };
         let mut counts = std::collections::HashMap::new();
-        counts.insert("Geir".to_string(), (10i64, 3i64));
-        counts.insert("AA.Customers.Dualog".to_string(), (50i64, 7i64));
+        counts.insert("Personal".to_string(), (10i64, 3i64));
+        counts.insert("Work".to_string(),     (50i64, 7i64));
         write_count_file(&cfg, &counts);
         let body = std::fs::read_to_string(&cfg.path).unwrap();
-        assert_eq!(body, "G:3\nD:7\n");
+        assert_eq!(body, "P:3\nW:7\n");
         let body2 = std::fs::read_to_string(format!("{}2", cfg.path)).unwrap();
-        assert_eq!(body2, "G:3\nD:7\n");
+        assert_eq!(body2, "P:3\nW:7\n");
         let _ = std::fs::remove_file(&cfg.path);
         let _ = std::fs::remove_file(format!("{}2", cfg.path));
     }

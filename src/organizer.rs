@@ -214,10 +214,10 @@ pub fn pretty_folder_name_public(folder: &str) -> String {
 }
 
 /// Strip the leading transport word (`python.`, `irc.`) from a
-/// weechat-relay folder so the section header reads `slack.dualog.&team`
-/// instead of `python.slack.dualog.&team`. We keep the workspace
-/// segment so the renderer can dim it; the DB folder stays untouched
-/// so view filters still match.
+/// weechat-relay folder so the section header reads
+/// `slack.example.&team` instead of `python.slack.example.&team`.
+/// We keep the workspace segment so the renderer can dim it; the
+/// DB folder stays untouched so view filters still match.
 fn pretty_folder_name(folder: &str) -> String {
     for prefix in ["python.", "irc.server.", "irc."] {
         if let Some(rest) = folder.strip_prefix(prefix) {
