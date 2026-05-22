@@ -473,132 +473,6 @@ impl Connection {
     }
 }
 
-// ---------------------------------------------------------------------------
-// M3 — sync_weechat_relay() as a kastrup source plugin
-// ---------------------------------------------------------------------------
-
-use std::collections::HashSet;
-use crate::sources::MessageData;
-
-/// Poll-based sync: connect, fetch last N lines from every "real"
-/// buffer (Slack channels + DMs, IRC channels, Matrix rooms, …),
-/// disconnect. Each buffer becomes a `folder` in the kastrup DB so
-/// the user can pick it from the view list like any maildir folder.
-///
-/// M5 swaps this implementation for a long-lived background
-/// connection. M3 is intentionally simple: per-tick fetch, no
-/// shared state.
-pub fn sync_weechat_relay(_config: &serde_json::Value, known_ids: &HashSet<String>) -> Vec<MessageData> {
-    let secrets = load_relay_secrets();
-    let (Some(host), Some(port), Some(pass)) =
-        (secrets.host, secrets.port, secrets.password) else { return Vec::new(); };
-
-    let mut conn = match Connection::connect(&host, port) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    if conn.handshake().is_err() { return Vec::new(); }
-    if conn.init_plain(&pass).is_err() { return Vec::new(); }
-    let buffers = match conn.list_buffers() {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
-    };
-
-    // Per-buffer line budget: last 30 lines on the first fetch
-    // (when known_ids is small), 10 thereafter. That's the
-    // difference between "first launch of the day shows useful
-    // backlog" and "subsequent ticks only pick up new traffic".
-    let backlog = if known_ids.len() < 50 { 30 } else { 10 };
-
-    let mut out: Vec<MessageData> = Vec::new();
-    for buf in &buffers.items {
-        let full_name = match buf.fields.get("full_name") {
-            Some(Object::Str(Some(s))) => s.clone(),
-            _ => continue,
-        };
-        if is_uninteresting_buffer(&full_name) { continue; }
-        let buf_ptr = match buf.ptrs.first() {
-            Some(p) if p != "0" => p.clone(),
-            _ => continue,
-        };
-        let short_name = match buf.fields.get("short_name") {
-            Some(Object::Str(Some(s))) if !s.is_empty() => s.clone(),
-            _ => full_name.split('.').next_back().unwrap_or(&full_name).to_string(),
-        };
-        let lines = match conn.last_lines(&buf_ptr, backlog) {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-        let (platform, label) = classify_buffer(&full_name);
-        for line in &lines.items {
-            let date = match line.fields.get("date") {
-                Some(Object::Time(t)) if *t > 0 => *t,
-                _ => continue,
-            };
-            let prefix_raw = match line.fields.get("prefix") {
-                Some(Object::Str(Some(s))) => s.as_str(), _ => "",
-            };
-            let message_raw = match line.fields.get("message") {
-                Some(Object::Str(Some(s))) => s.as_str(), _ => "",
-            };
-            // `displayed=0` means weechat's filter plugin is hiding
-            // the line from the user's terminal (typically smart-
-            // filter for joins/parts on busy IRC channels). Mirror
-            // that decision into kastrup so the inbox tracks what
-            // the user actually sees on the weechat side.
-            let displayed = matches!(line.fields.get("displayed"), Some(Object::Char(1)));
-            if !displayed { continue; }
-            // Defensive: also reject explicit `-->` / `<--` etc.
-            // prefixes in case the filter plugin isn't loaded for
-            // a given buffer.
-            if is_system_prefix(prefix_raw) { continue; }
-
-            let nick = strip_codes(prefix_raw);
-            let nick = nick.trim().to_string();
-            if nick.is_empty() && message_raw.is_empty() { continue; }
-            let message = strip_codes(message_raw);
-
-            // Dedup by stable (buffer, date, nick, message-head) hash
-            // — line pointers reset on weechat restart, so a content-
-            // based external_id keeps the DB consistent across
-            // server bounces.
-            let hash_input = format!("{}\t{}\t{}\t{}",
-                full_name, date, nick,
-                &message.get(..message.len().min(80)).unwrap_or(""));
-            let ext_id = format!("weechat-relay_{}", md5_hex(&hash_input));
-            if known_ids.contains(&ext_id) { continue; }
-
-            let subject = {
-                let line0 = message.lines().next().unwrap_or(&message).trim();
-                let s: String = line0.chars().take(80).collect();
-                if line0.chars().count() > 80 { format!("{}…", s) } else { s }
-            };
-
-            out.push(MessageData {
-                external_id: ext_id,
-                sender: nick.clone(),
-                sender_name: Some(if nick.is_empty() { "system".into() } else { nick.clone() }),
-                recipients: short_name.clone(),
-                cc: None,
-                bcc: None,
-                subject: Some(subject),
-                content: message,
-                html_content: None,
-                timestamp: date,
-                labels: vec![label.to_string()],
-                attachments: Vec::new(),
-                metadata: serde_json::json!({
-                    "buffer":   full_name,
-                    "platform": platform,
-                    "source_type": "weechat-relay",
-                }),
-                folder: Some(full_name.clone()),
-                thread_id: None,
-            });
-        }
-    }
-    out
-}
 
 // ---------------------------------------------------------------------------
 // M5 — persistent push connection with supervisor + backoff
@@ -607,6 +481,7 @@ pub fn sync_weechat_relay(_config: &serde_json::Value, known_ids: &HashSet<Strin
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use crate::sources::MessageData;
 
 /// Per-buffer nick set, keyed by buffer `full_name`. Built up from
 /// the initial `nicklist` response and kept current by
@@ -757,6 +632,27 @@ fn line_to_message(
         folder: Some(meta.full_name.clone()),
         thread_id: None,
     })
+}
+
+/// Fire a desktop notification for a single highlight/mention.
+/// Best-effort: silently swallows any spawn failure (notify-send
+/// missing, headless session, etc.) so the supervisor never
+/// crashes because the notification daemon isn't available.
+fn notify_highlight(msg: &MessageData) {
+    let channel = msg.folder.as_deref().unwrap_or("?");
+    let pretty_channel = channel.rsplit_once('.').map(|(_, c)| c).unwrap_or(channel);
+    let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
+    let title = format!("{} in {}", sender, pretty_channel);
+    let body: String = msg.content.chars().take(140).collect();
+    let _ = std::process::Command::new("notify-send")
+        .arg("-a").arg("kastrup")
+        .arg("-u").arg("normal")
+        .arg("-i").arg("dialog-information")
+        .arg(&title)
+        .arg(&body)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 /// Replace the shared subscribed-buffers list with everything in
@@ -951,6 +847,17 @@ fn run_persistent(
                     }
                 }
                 if !pending.is_empty() {
+                    // Desktop-notify before insert so a long DB lock
+                    // (rare) doesn't delay the ping. Only fire on
+                    // live highlights — backfill at startup
+                    // intentionally bypasses this branch.
+                    for msg in &pending {
+                        if msg.metadata.get("highlight")
+                            .and_then(|v| v.as_bool()) == Some(true)
+                        {
+                            notify_highlight(msg);
+                        }
+                    }
                     db.insert_messages_batch(source_id, &pending);
                     messages_dirty.store(true, Ordering::Relaxed);
                 }

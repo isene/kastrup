@@ -138,6 +138,20 @@ Config file: `~/.heathrow/config.yml`
 
 On first run, Kastrup creates the database and guides you through initial setup (default email, editor, SMTP command).
 
+### External fetch scripts (messenger / instagram)
+
+Both `messenger` and `instagram` source types shell out to a Python script that drives a Marionette-controlled Firefox. The default location is `~/.kastrup/plugins/<name>.py`. Override per-source with:
+
+```yaml
+fetch_script: ~/path/to/messenger_fetch.py
+```
+
+`~/` and `$HOME` are expanded.
+
+## Architecture
+
+A detailed walk-through of the receive flows, send flows, auth matrix, threads and shared state, and the dedup scheme lives in [`docs/architecture.html`](docs/architecture.html). Open it locally for the rendered diagrams.
+
 ## Dependencies
 
 Runtime: SQLite (bundled). Optional: `notmuch` (search), `montage` (multi-image compositing), `curl` (RSS feeds).

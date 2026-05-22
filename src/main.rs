@@ -5978,12 +5978,24 @@ impl App {
         if msg.source_type == "weechat-relay" {
             if let Some(folder) = msg.folder.clone() {
                 if let Some(slack_target) = slack_target_from_weechat_folder(&folder) {
+                    // Surface the resolved target so a glance at the
+                    // status line confirms "reply to #it-ops" before
+                    // the editor opens — easy to spot if you actually
+                    // wanted to reply to a different message.
+                    self.set_feedback(
+                        &format!("Reply target: {} (Slack API)", slack_target),
+                        self.config.theme_colors.feedback_info,
+                    );
                     self.compose_kind = DraftKind::Slack;
                     let template = format!("Channel: {}\n\n", slack_target);
                     self.run_editor_compose_at_full(&template, Some(3), Some(1), true);
                     self.compose_kind = DraftKind::Email;
                     return;
                 }
+                self.set_feedback(
+                    &format!("Reply target: {} (relay)", folder),
+                    self.config.theme_colors.feedback_info,
+                );
                 self.compose_kind = DraftKind::Weechat;
                 let template = format!("Channel: {}\n\n", folder);
                 self.run_editor_compose_at_full(&template, Some(3), Some(1), true);
