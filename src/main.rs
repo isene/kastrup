@@ -71,7 +71,7 @@ enum DraftKind {
     /// Any channel/room reachable through the weechat relay: IRC
     /// channels, Slack-via-weechat, Matrix rooms, Discord-bridge
     /// mirrors, etc. `Channel:` header carries the buffer's
-    /// `full_name` (e.g. `python.slack.dualog.#general`).
+    /// `full_name` (e.g. `python.slack.<workspace>.#general`).
     Weechat,
 }
 
@@ -1731,7 +1731,7 @@ impl App {
         };
 
         // Pick a chat-source theme colour from the display name (so a
-        // `slack.dualog.&team` header lights up in Slack colour, IRC
+        // `slack.<ws>.&team` header lights up in Slack colour, IRC
         // channels in the IRC colour, etc.). For a non-chat folder we
         // fall through to tc.thread.
         let chat_source = chat_source_type_for_display(subject);
@@ -8031,7 +8031,7 @@ impl App {
 
         // External-sender path: if the attachment carries a file_id AND the
         // source has an open_attachment template configured, dispatch to it.
-        // Covers non-maildir sources like Dualog Workspace that resolve
+        // Covers non-maildir sources (e.g. workspace bridges) that resolve
         // attachments by server-side id.
         let file_id = att.get("file_id").and_then(|v| v.as_str()).map(|s| s.to_string());
         let plugin_type = self.filtered_messages.get(self.index)
@@ -10986,7 +10986,7 @@ fn is_invisible_format_char(c: char) -> bool {
 /// Heuristic: given a section's display name (after pretty_folder_name
 /// stripping), return the matching chat source_type so the renderer
 /// can theme it. Returns None for folders that don't look like chat
-/// transports — e.g. mail folders like `Geir.Personal`.
+/// transports — e.g. mail folders like `Personal` or `Work.Archive`.
 fn chat_source_type_for_display(display: &str) -> Option<&'static str> {
     if display.starts_with("slack.") { return Some("slack"); }
     if display.starts_with("discord-bridge.") { return Some("discord"); }

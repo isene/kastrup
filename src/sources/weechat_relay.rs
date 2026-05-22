@@ -454,7 +454,7 @@ impl Connection {
 
     /// Type `text` into a buffer addressed by `full_name` (the same
     /// dotted name kastrup uses as the folder, e.g.
-    /// `python.slack.dualog.#general` or `irc.libera.#weechat`).
+    /// `python.slack.<workspace>.#general` or `irc.<net>.#channel`).
     ///
     /// `input` is weechat's "as if you typed it at the prompt"
     /// command — newlines in `text` become separate posts; that's
@@ -680,7 +680,7 @@ fn line_to_message(
     // (`` `-> ``), which wee-slack uses for multi-line bot posts and
     // thread replies under the same author. `nick_*` tag values get
     // a `_<color>` prefix from wee-slack's colour palette — strip that
-    // so `_16isene` shows as `isene`.
+    // so `_16alice` shows as `alice`.
     let nick_from_prefix = strip_codes(prefix_raw).trim().to_string();
     let nick = if !nick_from_prefix.is_empty() && !is_continuation_marker(&nick_from_prefix) {
         nick_from_prefix
@@ -1124,8 +1124,8 @@ fn nick_from_tags(field: Option<&Object>) -> Option<String> {
 }
 
 /// Wee-slack prefixes `nick_*` tag values with `_<NN>` where NN is the
-/// 2-digit palette colour for that user (e.g. `nick__16isene` →
-/// `isene`). Real Slack usernames never start with `_<digits>`, so
+/// 2-digit palette colour for that user (e.g. `nick__16alice` →
+/// `alice`). Real Slack usernames never start with `_<digits>`, so
 /// stripping is safe. If the input doesn't match the pattern, return
 /// it unchanged.
 fn strip_weeslack_color_prefix(nick: &str) -> String {
