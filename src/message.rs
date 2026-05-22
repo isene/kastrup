@@ -28,6 +28,10 @@ pub struct Message {
     pub source_type: String,
     pub is_header: bool,
     pub full_loaded: bool,
+    /// 0 for top-level messages, +1 per reply nesting level. Set by
+    /// `rebuild_display` for messages in email/maildir thread sections;
+    /// stays 0 otherwise. Render side uses this to indent replies.
+    pub thread_depth: u8,
 }
 
 impl Message {
@@ -45,6 +49,7 @@ impl Message {
             metadata: serde_json::Value::Null, folder: None,
             replied: false, source_type: String::new(),
             is_header: true, full_loaded: true,
+            thread_depth: 0,
         }
     }
 }
@@ -78,6 +83,7 @@ impl Default for Message {
             source_type: String::new(),
             is_header: false,
             full_loaded: false,
+            thread_depth: 0,
         }
     }
 }
