@@ -243,6 +243,75 @@ fn slack_target_from_weechat_folder(folder: &str) -> Option<String> {
     Some(format!("@{}", chan))
 }
 
+/// Pull every Slack file CDN URL out of a message body. Wee-slack
+/// formats attachments as bare `https://files.slack.com/files-pri/...`
+/// URLs or wrapped `<URL|displayed-name>` mrkdwn links. Both shapes
+/// are normalised to the plain URL.
+fn extract_slack_file_urls(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for cap in body.split_whitespace() {
+        let trimmed = cap.trim_matches(|c: char| !c.is_ascii_graphic());
+        // Strip mrkdwn brackets if any: `<url|name>` → `url`.
+        let url = if let Some(rest) = trimmed.strip_prefix('<') {
+            let rest = rest.trim_end_matches('>');
+            rest.split_once('|').map(|(u, _)| u).unwrap_or(rest)
+        } else {
+            trimmed.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '"', '\''])
+        };
+        if url.starts_with("https://files.slack.com/files-pri/")
+            || url.starts_with("https://files.slack.com/files-tmb/")
+        {
+            if seen.insert(url.to_string()) {
+                out.push(url.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Pull `(file_id, filename)` out of a Slack CDN URL like
+/// `https://files.slack.com/files-pri/T0XXX-FYYY/foo.png`.
+/// The file_id is the last path segment before the filename.
+fn parse_slack_file_url(url: &str) -> Option<(String, String)> {
+    let path = url.split("files.slack.com/").nth(1)?;
+    // Strip query string if any.
+    let path = path.split('?').next().unwrap_or(path);
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() < 3 { return None; }
+    let filename = segments.last().copied()?.to_string();
+    let id_seg = segments[segments.len() - 2];
+    // id_seg looks like `T0XYZ-FABC123` — extract the F-id half if present.
+    let file_id = id_seg.rsplit_once('-')
+        .map(|(_, f)| f.to_string())
+        .unwrap_or_else(|| id_seg.to_string());
+    Some((file_id, filename))
+}
+
+/// Extract `Attach:` headers (one per line, before the blank-line
+/// separator) from a chat draft. Values are file paths with `~/`
+/// and `$HOME/` expansion. Used by `.slack` and `.weechat` drafts
+/// to attach files alongside the message body.
+fn parse_chat_attachments(data: &str) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let home = std::env::var("HOME").unwrap_or_default();
+    for line in data.lines() {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() { break; }
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("attach:") {
+            let val_start = trimmed.len() - rest.len();
+            let v = trimmed[val_start..].trim();
+            if v.is_empty() { continue; }
+            let expanded = if let Some(r) = v.strip_prefix("~/") { format!("{}/{}", home, r) }
+                else if let Some(r) = v.strip_prefix("$HOME/") { format!("{}/{}", home, r) }
+                else { v.to_string() };
+            out.push(std::path::PathBuf::from(expanded));
+        }
+    }
+    out
+}
+
 /// Body of a chat draft: everything after the first blank line.
 fn parse_chat_body(data: &str) -> String {
     if let Some(pos) = data.find("\n\n") {
@@ -726,6 +795,11 @@ struct App {
     /// sections so empty channels still appear (weechat-buflist
     /// parity).
     subscribed_buffers: sources::weechat_relay::SubscribedBuffers,
+    /// Cache of `folder → unread-highlight count`, refreshed on the
+    /// same 5s tick as the message list. Drives the inactive-view
+    /// badges in the top bar.
+    highlight_cache: std::collections::HashMap<String, i64>,
+    last_highlight_refresh: std::time::Instant,
     /// Per-view list of folder names the user has hidden from the
     /// Folders view. Persisted as `hidden_channels_<view>` in the
     /// settings table. Applied AFTER the all-buffers merge so a
@@ -1099,6 +1173,8 @@ fn main() {
         current_section_order: Vec::new(),
         nick_lists: nick_lists.clone(),
         subscribed_buffers: subscribed_buffers.clone(),
+        highlight_cache: std::collections::HashMap::new(),
+        last_highlight_refresh: std::time::Instant::now() - std::time::Duration::from_secs(60),
         current_hidden_channels: Vec::new(),
         poller: None,
         poller_rx: None,
@@ -1199,6 +1275,15 @@ fn main() {
                     if app.messages_dirty.swap(false, Ordering::Relaxed) {
                         app.refresh_current_view();
                     }
+                }
+                // Refresh the inactive-view highlight cache on the same
+                // cadence — independent of messages_dirty because a
+                // background relay-fired notify-send for an OTHER view
+                // doesn't always trip the dirty flag.
+                if app.last_highlight_refresh.elapsed().as_secs() >= 5 {
+                    app.last_highlight_refresh = std::time::Instant::now();
+                    app.highlight_cache = app.db.unread_highlights_by_folder();
+                    app.render_top_bar();
                 }
             }
         }
@@ -1307,6 +1392,9 @@ impl App {
             "C-HOME" => { self.reset_section_order(); }
             "C-K" => { self.hide_current_channel(); }
             "C-U" => { self.unhide_all_channels(); }
+            "C-N" => { self.pick_nick_to_clipboard(); }
+            "C-G" => { self.pick_channel_to_clipboard(); }
+            "O" => { self.open_slack_attachment(); }
 
             // View switching
             "=" => { self.switch_to_view("A"); }
@@ -1635,14 +1723,70 @@ impl App {
             style::fg(" [0/0]", tc.info_fg)
         };
 
-        let right_info = if highlights > 0 {
-            format!(
-                "{}  {}",
-                style::fg(&format!("!{}", highlights), tc.unread),
-                style::fg(&format!("{} unread / {} msgs", unread, total), tc.info_fg),
-            )
+        // Inactive-view badges: walk every custom view, sum unread
+        // highlights from `highlight_cache` for the folders matching
+        // that view's filter, and render `K1:!N K2:!N` for any view
+        // other than the current one. Lets the user notice a ping in
+        // F2 without leaving F1.
+        let mut other_view_badges: Vec<String> = Vec::new();
+        if !self.highlight_cache.is_empty() {
+            // Pre-snapshot since iterating self.views borrows immutably
+            // while build_view_filters needs &self too.
+            let view_keys_and_filters: Vec<(String, Filters)> = self.views.iter()
+                .filter_map(|v| {
+                    let key = v.key_binding.clone()?;
+                    if key == self.current_view { return None; }
+                    let f = serde_json::from_str::<serde_json::Value>(&v.filters).ok()?;
+                    let mut filters = Filters::default();
+                    if let Some(rules) = f["rules"].as_array() {
+                        for rule in rules {
+                            let field = rule["field"].as_str().unwrap_or("");
+                            let op    = rule["op"].as_str().unwrap_or("=");
+                            let value = &rule["value"];
+                            match field {
+                                "folder" => {
+                                    if op == "like" {
+                                        filters.folder_pattern = value.as_str().map(|s| s.to_string());
+                                    } else {
+                                        filters.folder = value.as_str().map(|s| s.to_string());
+                                    }
+                                }
+                                "source_id" => { filters.source_id = value.as_i64(); }
+                                "source_type" => { filters.source_type = value.as_str().map(|s| s.to_string()); }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Some((key, filters))
+                })
+                .collect();
+            for (key, filters) in view_keys_and_filters {
+                let count: i64 = self.highlight_cache.iter()
+                    .filter(|(folder, _)| folder_matches_filter(folder, &filters))
+                    .map(|(_, n)| *n)
+                    .sum();
+                if count > 0 {
+                    other_view_badges.push(
+                        style::fg(&format!("{}:!{}", key, count), tc.unread)
+                    );
+                }
+            }
+        }
+
+        let badges_str = if other_view_badges.is_empty() {
+            String::new()
         } else {
-            style::fg(&format!("{} unread / {} msgs", unread, total), tc.info_fg)
+            format!("{}  ", other_view_badges.join(" "))
+        };
+
+        let counts_str = style::fg(&format!("{} unread / {} msgs", unread, total), tc.info_fg);
+        let right_info = if highlights > 0 {
+            format!("{}{}  {}",
+                badges_str,
+                style::fg(&format!("!{}", highlights), tc.unread),
+                counts_str)
+        } else {
+            format!("{}{}", badges_str, counts_str)
         };
 
         // Build top bar: " Kastrup - [key] ViewName [Sort] [Mode] [pos] ... N unread / T msgs"
@@ -4243,6 +4387,201 @@ impl App {
         self.render_all();
     }
 
+    /// Find and download the first Slack file URL in the current
+    /// message, then `xdg-open` the result. Bound to `O`. Saves to
+    /// `~/.kastrup/attachments/<file-id>_<filename>`; repeat downloads
+    /// of the same file reuse the cached copy.
+    fn open_slack_attachment(&mut self) {
+        let tc = self.config.theme_colors.clone();
+        self.ensure_full_content();
+        let msg = match self.filtered_messages.get(self.index) {
+            Some(m) => m, None => return,
+        };
+        let urls: Vec<String> = extract_slack_file_urls(&msg.content);
+        if urls.is_empty() {
+            self.set_feedback("No Slack file attachment in this message",
+                tc.feedback_warn);
+            return;
+        }
+        let url = urls[0].clone();
+        let secrets = chat_send::load_secrets();
+        let token = match secrets.slack_token.as_ref() {
+            Some(t) => t.clone(),
+            None => {
+                self.set_feedback("No Slack token configured", tc.feedback_warn);
+                return;
+            }
+        };
+        let cookie = secrets.slack_cookie.clone();
+
+        let home = std::env::var("HOME").unwrap_or_default();
+        let dir = std::path::PathBuf::from(home).join(".kastrup").join("attachments");
+        let _ = std::fs::create_dir_all(&dir);
+        // Derive a filename from the URL's last path segment, with the
+        // file-id prefix from the second-to-last segment so duplicate
+        // names from different files don't collide.
+        let (file_id, filename) = parse_slack_file_url(&url)
+            .unwrap_or_else(|| ("unknown".into(), "attachment".into()));
+        let safe_name = filename.chars()
+            .map(|c| if c.is_alphanumeric() || ".-_".contains(c) { c } else { '_' })
+            .collect::<String>();
+        let dest = dir.join(format!("{}_{}", file_id, safe_name));
+
+        if !dest.exists() {
+            self.set_feedback(&format!("Downloading {}…", safe_name), tc.feedback_info);
+            self.render_bottom_bar();
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let mut req = ureq::get(&url)
+                .set("Authorization", &format!("Bearer {}", token));
+            if let Some(c) = cookie.as_deref() {
+                req = req.set("Cookie", &format!("d={}", c));
+            }
+            match req.call() {
+                Ok(resp) => {
+                    let mut buf: Vec<u8> = Vec::new();
+                    if let Err(e) = std::io::copy(&mut resp.into_reader(), &mut buf) {
+                        self.set_feedback(&format!("Download failed: {}", e), tc.feedback_warn);
+                        return;
+                    }
+                    if let Err(e) = std::fs::write(&dest, &buf) {
+                        self.set_feedback(&format!("Write failed: {}", e), tc.feedback_warn);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    self.set_feedback(&format!("HTTP error: {}", e), tc.feedback_warn);
+                    return;
+                }
+            }
+        }
+
+        let _ = std::process::Command::new("xdg-open").arg(&dest)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        self.set_feedback(
+            &format!("Opened {} ({} more)", safe_name, urls.len().saturating_sub(1)),
+            tc.feedback_ok,
+        );
+    }
+
+    /// Picker for an `@nick` reference. Opens a prompt; user types a
+    /// substring; the first matching nick (case-insensitive, prefix
+    /// match preferred) is copied to the clipboard as `@<nick>` so
+    /// they can paste into the compose editor with Shift+Insert.
+    /// When the cursor sits on a chat message, that channel's nick
+    /// list is searched first.
+    fn pick_nick_to_clipboard(&mut self) {
+        let tc = self.config.theme_colors.clone();
+        // Build candidate list: current channel's nicks first, then
+        // every other channel's nicks, deduped.
+        let current_folder = self.filtered_messages.get(self.index)
+            .and_then(|m| m.folder.clone());
+        let lists = self.nick_lists.lock().unwrap().clone();
+        if lists.is_empty() {
+            self.set_feedback("No nicks captured yet — supervisor still seeding",
+                tc.feedback_warn);
+            return;
+        }
+        let mut ordered: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(ref f) = current_folder {
+            if let Some(set) = lists.get(f) {
+                for n in set { if seen.insert(n.clone()) { ordered.push(n.clone()); } }
+            }
+        }
+        for (_, set) in &lists {
+            for n in set { if seen.insert(n.clone()) { ordered.push(n.clone()); } }
+        }
+
+        let hint = ordered.iter().take(8).cloned().collect::<Vec<_>>().join(" ");
+        self.bottom.say(&style::fg(&format!("Nicks: {} …", hint), tc.hint_fg));
+        let query = self.prompt("@", "");
+        self.render_bottom_bar();
+        let q = query.trim();
+        if q.is_empty() { return; }
+        let q_lower = q.to_ascii_lowercase();
+
+        let m = ordered.iter()
+            .find(|n| n.to_ascii_lowercase() == q_lower)
+            .or_else(|| ordered.iter().find(|n| n.to_ascii_lowercase().starts_with(&q_lower)))
+            .or_else(|| ordered.iter().find(|n| n.to_ascii_lowercase().contains(&q_lower)));
+
+        match m {
+            Some(nick) => {
+                let out = format!("@{}", nick);
+                crust::clipboard_copy(&out, "clipboard");
+                self.set_feedback(
+                    &format!("Copied {} — paste with Shift+Insert", out),
+                    tc.feedback_ok,
+                );
+            }
+            None => {
+                // No match — fall back to user's literal input so
+                // even a typo gets pasted (lets them invent a nick
+                // for someone the supervisor hasn't observed yet).
+                let out = format!("@{}", q);
+                crust::clipboard_copy(&out, "clipboard");
+                self.set_feedback(
+                    &format!("No match — copied literal {}", out),
+                    tc.feedback_info,
+                );
+            }
+        }
+    }
+
+    /// Picker for a `#channel` reference. Same shape as
+    /// `pick_nick_to_clipboard` but over subscribed_buffers. The copied
+    /// string uses the channel's short_name (e.g. `#general` or
+    /// `#prod-changelog`), which Slack auto-resolves when posted.
+    fn pick_channel_to_clipboard(&mut self) {
+        let tc = self.config.theme_colors.clone();
+        let bufs = self.subscribed_buffers.lock().unwrap().clone();
+        if bufs.is_empty() {
+            self.set_feedback("No channels captured yet — supervisor still seeding",
+                tc.feedback_warn);
+            return;
+        }
+        // Display name = short_name (e.g. `#general`, `&postgresql`,
+        // `mikael,okv`). Slack/IRC both render `#name` style refs in
+        // posted text correctly.
+        let names: Vec<String> = bufs.iter().map(|b| b.short_name.clone()).collect();
+
+        let hint = names.iter().take(8).cloned().collect::<Vec<_>>().join(" ");
+        self.bottom.say(&style::fg(&format!("Channels: {} …", hint), tc.hint_fg));
+        let query = self.prompt("#", "");
+        self.render_bottom_bar();
+        let q = query.trim().trim_start_matches('#');
+        if q.is_empty() { return; }
+        let q_lower = q.to_ascii_lowercase();
+
+        let m = names.iter()
+            .find(|n| n.trim_start_matches(['#','&']).to_ascii_lowercase() == q_lower)
+            .or_else(|| names.iter().find(|n| n.trim_start_matches(['#','&'])
+                .to_ascii_lowercase().starts_with(&q_lower)))
+            .or_else(|| names.iter().find(|n| n.to_ascii_lowercase().contains(&q_lower)));
+
+        let raw = m.cloned().unwrap_or_else(|| format!("#{}", q));
+        // Force `#` prefix for Slack/IRC channels even if buffer
+        // short_name uses `&` (wee-slack's private-channel marker).
+        let normalized = if raw.starts_with('#') {
+            raw
+        } else if raw.starts_with('&') {
+            format!("#{}", raw.trim_start_matches('&'))
+        } else if !raw.is_empty() {
+            // bare name (DM) — leave as-is, user can wrap @ if they
+            // really want a DM reference.
+            raw
+        } else {
+            format!("#{}", q)
+        };
+        crust::clipboard_copy(&normalized, "clipboard");
+        self.set_feedback(
+            &format!("Copied {} — paste with Shift+Insert", normalized),
+            tc.feedback_ok,
+        );
+    }
+
     fn copy_message_id(&mut self) {
         if let Some(msg) = self.filtered_messages.get(self.index) {
             let id_str = format!("heathrow:{}", msg.id);
@@ -4769,7 +5108,17 @@ impl App {
         self.render_bottom_bar();
         if query.is_empty() { return; }
 
-        let mut filters = Filters::default();
+        // Seed with the current view's scope (source_type / source_id /
+        // folder / folder_pattern) so `/` in F1 stays inside Slack, `/`
+        // in F2 stays inside IRC, etc. The user expects search to
+        // respect the view they're looking at. View "A" (all) is the
+        // only one with no scope — that gives the old global behaviour.
+        let mut filters = self.build_current_filters();
+        // The view filter may carry `is_read` or `is_starred` from a
+        // view definition. Those constrain who-shows-up, not what-to-
+        // search-for, so we drop them for the search itself.
+        filters.is_read = None;
+        filters.is_starred = None;
         filters.content_pattern = Some(format!("%{}%", query));
         self.filtered_messages = self.db.get_messages(&filters, 500, 0);
         for msg in &mut self.filtered_messages {
@@ -4779,15 +5128,20 @@ impl App {
         }
         self.index = 0;
         let n = self.filtered_messages.len();
-        self.active_search_label = format!("/{}", query);
+        let scope = if filters.folder.is_some() || filters.folder_pattern.is_some()
+                       || filters.source_type.is_some() || filters.source_id.is_some()
+        { format!("/{} in [{}]", query, self.current_view) }
+        else { format!("/{}", query) };
+        self.active_search_label = scope.clone();
         self.active_search_filter = Some(filters);
         if n > 0 {
             self.set_feedback(
-                &format!("/ → {} match{}  (Esc clears)",
-                    n, if n == 1 { "" } else { "es" }),
+                &format!("{} → {} match{}  (Esc clears)",
+                    scope, n, if n == 1 { "" } else { "es" }),
                 self.config.theme_colors.feedback_ok);
         } else {
-            self.set_feedback("No matches found", self.config.theme_colors.feedback_warn);
+            self.set_feedback(&format!("{} → no matches", scope),
+                self.config.theme_colors.feedback_warn);
         }
         self.render_all();
     }
@@ -7076,6 +7430,22 @@ impl App {
         let cookie = secrets.slack_cookie.as_deref();
         let channel_id = chat_send::slack_resolve_channel(token, cookie, &channel_raw)?;
         chat_send::send_slack(token, cookie, &channel_id, &body)?;
+        // Attachments: one Slack `files.upload` per `Attach:` header.
+        // Posted after the main message so they appear visually below
+        // it. Each upload uses the same Bearer/Cookie auth as the
+        // main send. Errors per-file are logged but don't abort the
+        // overall send — partial delivery is better than zero.
+        for path in parse_chat_attachments(data) {
+            if !path.exists() {
+                log::info(&format!("slack: skipping attach (not found): {}", path.display()));
+                continue;
+            }
+            if let Err(e) = chat_send::slack_upload_file(
+                token, cookie, &channel_id, &path, "",
+            ) {
+                log::info(&format!("slack: files.upload {}: {}", path.display(), e));
+            }
+        }
         Ok(channel_raw)
     }
 

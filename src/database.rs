@@ -742,6 +742,36 @@ impl Database {
         ).unwrap_or((0, 0, 0))
     }
 
+    /// Folder → count of unread messages with `metadata.highlight = true`.
+    /// Used by the top-bar view-strip badges so the user sees at a
+    /// glance which other views have a mention waiting. One query, no
+    /// per-view loop on the call site.
+    pub fn unread_highlights_by_folder(&self) -> std::collections::HashMap<String, i64> {
+        let conn = self.conn.lock().unwrap();
+        let mut out = std::collections::HashMap::new();
+        let mut stmt = match conn.prepare(
+            "SELECT folder, COUNT(*) FROM messages \
+             WHERE read = 0 \
+               AND folder IS NOT NULL \
+               AND json_extract(metadata, '$.highlight') = 1 \
+             GROUP BY folder"
+        ) {
+            Ok(s) => s,
+            Err(_) => return out,
+        };
+        let rows = stmt.query_map([], |r| {
+            let folder: String = r.get(0)?;
+            let count: i64    = r.get(1)?;
+            Ok((folder, count))
+        });
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                out.insert(row.0, row.1);
+            }
+        }
+        out
+    }
+
     /// Get a setting value
     pub fn get_setting(&self, key: &str) -> Option<String> {
         let conn = self.conn.lock().unwrap();
