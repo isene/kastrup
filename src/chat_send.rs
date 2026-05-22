@@ -15,6 +15,11 @@ use std::path::PathBuf;
 #[derive(Default, Clone)]
 pub struct Secrets {
     pub slack_token: Option<String>,
+    /// When `slack_token` is an `xoxc-…` browser/client token, this
+    /// holds the matching `xoxd-…` session cookie value. Together they
+    /// auth like the Slack web client — no app attribution badge. None
+    /// when only a legacy `xoxp-…` user token is available.
+    pub slack_cookie: Option<String>,
     pub discord_bot_token: Option<String>,
     /// Lowercase webhook name → URL.
     pub discord_webhooks: HashMap<String, String>,
@@ -52,7 +57,8 @@ pub fn load_secrets() -> Secrets {
                 val = val[1..val.len() - 1].to_string();
             }
             match key {
-                "SLACK_API_TOKEN" => s.slack_token = Some(val),
+                "SLACK_API_TOKEN"  => s.slack_token = Some(val),
+                "SLACK_API_COOKIE" => s.slack_cookie = Some(val),
                 "DISCORD_BOT_TOKEN" => s.discord_bot_token = Some(val),
                 k if k.starts_with("DISCORD_WEBHOOK_") => {
                     let name = k.trim_start_matches("DISCORD_WEBHOOK_")
@@ -63,13 +69,49 @@ pub fn load_secrets() -> Secrets {
             }
         }
     }
-    // Fallback: extract xoxp from weechat config if .env didn't set it.
+    // Fallback chain when .env didn't set SLACK_API_TOKEN: first try
+    // the browser-cookie pair (xoxc-/xoxd-) that wee-slack itself
+    // uses, since it posts without an app-attribution badge — exactly
+    // the "as me, not as a bot" behaviour the user sees in weechat.
+    // If that's missing (older wee-slack auth), fall back to the
+    // legacy `xoxp-…` user token, which posts as the user too but
+    // shows "via wee-slack" alongside every message.
     if s.slack_token.is_none() {
-        if let Some(tok) = slack_token_from_weechat() {
+        if let Some((bearer, cookie)) = slack_cookie_pair_from_weechat() {
+            s.slack_token = Some(bearer);
+            s.slack_cookie = Some(cookie);
+        } else if let Some(tok) = slack_token_from_weechat() {
             s.slack_token = Some(tok);
         }
     }
     s
+}
+
+/// Pull the `xoxc-…:xoxd-…` browser/cookie pair from a weechat
+/// plugins.conf line. Returns `(bearer_token, cookie_value)` where
+/// `cookie_value` is the bare xoxd- (caller wraps as `d=...` in the
+/// Cookie header). Modern wee-slack stores this as the first entry
+/// in the comma-separated `slack_api_token` list.
+fn slack_cookie_pair_from_weechat() -> Option<(String, String)> {
+    let text = std::fs::read_to_string(weechat_plugins_path()).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with("python.slack.slack_api_token") { continue; }
+        let eq = line.find('=')?;
+        let mut val = line[eq + 1..].trim().to_string();
+        if val.starts_with('"') && val.ends_with('"') {
+            val = val[1..val.len() - 1].to_string();
+        }
+        for part in val.split(',') {
+            let p = part.trim();
+            if let Some((bearer, cookie)) = p.split_once(':') {
+                if bearer.starts_with("xoxc-") && cookie.starts_with("xoxd-") {
+                    return Some((bearer.to_string(), cookie.to_string()));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Pull the legacy `xoxp-…` user token from a weechat plugins.conf
@@ -106,7 +148,7 @@ fn slack_token_from_weechat() -> Option<String> {
 ///   - `mpdm:a,b,c`          → opened as a multi-party DM (each handle
 ///                             resolved, then `conversations.open` with
 ///                             the comma-separated user IDs)
-pub fn slack_resolve_channel(token: &str, raw: &str) -> Result<String, String> {
+pub fn slack_resolve_channel(token: &str, cookie: Option<&str>, raw: &str) -> Result<String, String> {
     let raw = raw.trim();
     if raw.is_empty() { return Err("empty channel".into()); }
     if let Some(rest) = raw.strip_prefix("mpdm:") {
@@ -114,22 +156,20 @@ pub fn slack_resolve_channel(token: &str, raw: &str) -> Result<String, String> {
         for handle in rest.split(',') {
             let handle = handle.trim();
             if handle.is_empty() { continue; }
-            // Allow `U…` IDs verbatim, otherwise look up by handle.
             let id = if handle.starts_with('U') && handle.len() >= 9
                 && handle[1..].chars().all(|c| c.is_ascii_alphanumeric())
             {
                 handle.to_string()
             } else {
-                slack_lookup_user_by_handle(token, handle.trim_start_matches('@'))?
+                slack_lookup_user_by_handle(token, cookie, handle.trim_start_matches('@'))?
             };
             user_ids.push(id);
         }
         if user_ids.is_empty() {
             return Err("mpdm: no users in target".into());
         }
-        return slack_open_dm(token, &user_ids.join(","));
+        return slack_open_dm(token, cookie, &user_ids.join(","));
     }
-    // Already an ID?
     if let Some(c0) = raw.chars().next() {
         if (c0 == 'C' || c0 == 'G' || c0 == 'D') && raw.len() >= 9
             && raw[1..].chars().all(|c| c.is_ascii_alphanumeric())
@@ -139,21 +179,31 @@ pub fn slack_resolve_channel(token: &str, raw: &str) -> Result<String, String> {
         if c0 == 'U' && raw.len() >= 9
             && raw[1..].chars().all(|c| c.is_ascii_alphanumeric())
         {
-            return slack_open_dm(token, raw);
+            return slack_open_dm(token, cookie, raw);
         }
     }
     if let Some(name) = raw.strip_prefix('#') {
-        return slack_lookup_channel_by_name(token, name);
+        return slack_lookup_channel_by_name(token, cookie, name);
     }
     if let Some(handle) = raw.strip_prefix('@') {
-        let uid = slack_lookup_user_by_handle(token, handle)?;
-        return slack_open_dm(token, &uid);
+        let uid = slack_lookup_user_by_handle(token, cookie, handle)?;
+        return slack_open_dm(token, cookie, &uid);
     }
-    // Bare alphanumeric: assume it's a channel name without the `#`.
-    slack_lookup_channel_by_name(token, raw)
+    slack_lookup_channel_by_name(token, cookie, raw)
 }
 
-fn slack_lookup_channel_by_name(token: &str, name: &str) -> Result<String, String> {
+/// Attach Authorization (Bearer) + optional Cookie (d=...) to a
+/// ureq request. Used for every Slack API call so the cookie pair
+/// (when present) carries through.
+fn apply_slack_auth(mut req: ureq::Request, token: &str, cookie: Option<&str>) -> ureq::Request {
+    req = req.set("Authorization", &format!("Bearer {}", token));
+    if let Some(c) = cookie {
+        req = req.set("Cookie", &format!("d={}", c));
+    }
+    req
+}
+
+fn slack_lookup_channel_by_name(token: &str, cookie: Option<&str>, name: &str) -> Result<String, String> {
     let target = name.trim_start_matches('#').to_ascii_lowercase();
     let mut cursor: Option<String> = None;
     for _ in 0..10 {
@@ -164,8 +214,7 @@ fn slack_lookup_channel_by_name(token: &str, name: &str) -> Result<String, Strin
             url.push_str("&cursor=");
             url.push_str(c);
         }
-        let resp = ureq::get(&url)
-            .set("Authorization", &format!("Bearer {}", token))
+        let resp = apply_slack_auth(ureq::get(&url), token, cookie)
             .call()
             .map_err(|e| format!("conversations.list: {}", e))?
             .into_string()
@@ -194,7 +243,7 @@ fn slack_lookup_channel_by_name(token: &str, name: &str) -> Result<String, Strin
     Err(format!("channel not found: #{}", target))
 }
 
-fn slack_lookup_user_by_handle(token: &str, handle: &str) -> Result<String, String> {
+fn slack_lookup_user_by_handle(token: &str, cookie: Option<&str>, handle: &str) -> Result<String, String> {
     let target = handle.trim_start_matches('@').to_ascii_lowercase();
     let mut cursor: Option<String> = None;
     for _ in 0..10 {
@@ -203,8 +252,7 @@ fn slack_lookup_user_by_handle(token: &str, handle: &str) -> Result<String, Stri
             url.push_str("&cursor=");
             url.push_str(c);
         }
-        let resp = ureq::get(&url)
-            .set("Authorization", &format!("Bearer {}", token))
+        let resp = apply_slack_auth(ureq::get(&url), token, cookie)
             .call()
             .map_err(|e| format!("users.list: {}", e))?
             .into_string()
@@ -231,10 +279,12 @@ fn slack_lookup_user_by_handle(token: &str, handle: &str) -> Result<String, Stri
     Err(format!("user not found: @{}", target))
 }
 
-fn slack_open_dm(token: &str, user_id: &str) -> Result<String, String> {
+fn slack_open_dm(token: &str, cookie: Option<&str>, user_id: &str) -> Result<String, String> {
     let body = serde_json::json!({ "users": user_id });
-    let resp = ureq::post("https://slack.com/api/conversations.open")
-        .set("Authorization", &format!("Bearer {}", token))
+    let resp = apply_slack_auth(
+        ureq::post("https://slack.com/api/conversations.open"),
+        token, cookie,
+    )
         .set("Content-Type", "application/json; charset=utf-8")
         .send_string(&body.to_string())
         .map_err(|e| format!("conversations.open: {}", e))?
@@ -249,13 +299,20 @@ fn slack_open_dm(token: &str, user_id: &str) -> Result<String, String> {
 
 /// Post a message to a slack channel/DM. `channel` should already be
 /// an ID — use `slack_resolve_channel` first if the user typed a name.
-pub fn send_slack(token: &str, channel: &str, text: &str) -> Result<(), String> {
+/// When `cookie` is `Some`, auth is the wee-slack browser/client
+/// flow (`xoxc-…` bearer + `d=xoxd-…` cookie) and Slack shows the
+/// message exactly like a web-typed one — no "via wee-slack"
+/// attribution. With `cookie = None`, falls back to plain Bearer
+/// (legacy xoxp- user token, which DOES carry the app badge).
+pub fn send_slack(token: &str, cookie: Option<&str>, channel: &str, text: &str) -> Result<(), String> {
     let body = serde_json::json!({
         "channel": channel,
         "text": text,
     });
-    let resp = ureq::post("https://slack.com/api/chat.postMessage")
-        .set("Authorization", &format!("Bearer {}", token))
+    let resp = apply_slack_auth(
+        ureq::post("https://slack.com/api/chat.postMessage"),
+        token, cookie,
+    )
         .set("Content-Type", "application/json; charset=utf-8")
         .send_string(&body.to_string())
         .map_err(|e| format!("chat.postMessage: {}", e))?
