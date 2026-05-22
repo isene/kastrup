@@ -1064,6 +1064,7 @@ fn row_to_message(row: &rusqlite::Row) -> Message {
         source_type: String::new(),
         is_header: false,
         full_loaded: false,
+        thread_depth: 0,
     }
 }
 

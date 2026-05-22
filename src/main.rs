@@ -192,6 +192,68 @@ fn parse_chat_channel(data: &str) -> Option<String> {
     None
 }
 
+/// Build a (message_index, depth) ordering for an email thread
+/// section. Walks the In-Reply-To tree depth-first so a reply appears
+/// directly under its parent at one extra indent level. Falls back to
+/// chronological order for messages whose parent isn't in this section
+/// (orphans become extra roots at depth 0).
+///
+/// Lookup chain:
+/// * `msg.thread_id` carries the RFC822 Message-Id (maildir source
+///   convention; set on insert).
+/// * `msg.metadata.in_reply_to` carries the parent's Message-Id when
+///   the mail has the header.
+fn build_thread_order(messages: &[Message], section_indices: &[usize]) -> Vec<(usize, u8)> {
+    use std::collections::HashMap;
+    // message_id → position in section_indices (so we can resolve a
+    // parent's index quickly).
+    let mut by_id: HashMap<String, usize> = HashMap::new();
+    for &i in section_indices {
+        if let Some(ref mid) = messages[i].thread_id {
+            if !mid.is_empty() { by_id.insert(mid.clone(), i); }
+        }
+    }
+    // Children per parent index; roots are messages whose
+    // `in_reply_to` doesn't resolve to anything in this section.
+    let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+    for &i in section_indices {
+        let parent_mid = messages[i].metadata
+            .get("in_reply_to")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().trim_matches(['<', '>']).to_string());
+        match parent_mid.and_then(|pid| by_id.get(&pid).copied()) {
+            Some(parent_idx) if parent_idx != i => {
+                children.entry(parent_idx).or_default().push(i);
+            }
+            _ => roots.push(i),
+        }
+    }
+    // Sort children chronologically (oldest reply first under the
+    // parent — natural reading order).
+    for kids in children.values_mut() {
+        kids.sort_by(|&a, &b| messages[a].timestamp.cmp(&messages[b].timestamp));
+    }
+    // Sort roots newest-first to match the existing section ordering.
+    roots.sort_by(|&a, &b| messages[b].timestamp.cmp(&messages[a].timestamp));
+
+    // Iterative DFS to avoid recursion-depth panics on degenerate
+    // chains (mailing-list threads can be hundreds of replies long).
+    let mut out: Vec<(usize, u8)> = Vec::with_capacity(section_indices.len());
+    let mut stack: Vec<(usize, u8)> = roots.into_iter().map(|i| (i, 0u8)).collect();
+    stack.reverse(); // pop from end → process roots in declared order
+    while let Some((idx, depth)) = stack.pop() {
+        out.push((idx, depth));
+        if let Some(kids) = children.get(&idx) {
+            let next_depth = depth.saturating_add(1);
+            for &kid in kids.iter().rev() {
+                stack.push((kid, next_depth));
+            }
+        }
+    }
+    out
+}
+
 /// Does `folder` pass the folder-related parts of `filters`? Used
 /// when merging the supervisor's subscribed-buffer list into the
 /// Folders view — only buffers that would have appeared as message
@@ -2019,9 +2081,23 @@ impl App {
         // Sender column: 12 chars, plus a 1-char per-sender avatar in front
         // (own deterministic color). 12 + 1 (gap) + 1 (avatar) + 1 (gap) =
         // same 15-cell budget as the previous bare-sender layout.
+        // For email replies (`thread_depth > 0`), the sender column is
+        // shortened by the indent amount and the missing prefix appears
+        // as a tree-drawing rail (└─) so the reply nests visually under
+        // its parent. Depth caps at 4 to avoid eating the entire column.
+        let depth_indent = (msg.thread_depth as usize).min(4);
+        let (depth_prefix, sender_cap) = if depth_indent == 0 {
+            (String::new(), 12usize)
+        } else {
+            let mut s = String::new();
+            for _ in 0..depth_indent.saturating_sub(1) { s.push_str("  "); }
+            s.push_str("└ ");
+            (style::fg(&s, self.config.theme_colors.hint_fg),
+             12usize.saturating_sub(depth_indent * 2))
+        };
         let sender_display = msg.sender_name.as_deref().unwrap_or(&msg.sender);
-        let sender_truncated = truncate_str(sender_display, 12);
-        let sender_padded = format!("{:<12} ", sender_truncated);
+        let sender_truncated = truncate_str(sender_display, sender_cap);
+        let sender_padded = format!("{}{:<width$} ", depth_prefix, sender_truncated, width = sender_cap);
 
         // Subject fills remaining width (decode RFC 2047 encoded-words)
         let raw_subject = msg.subject.as_deref().unwrap_or("");
@@ -3532,13 +3608,19 @@ impl App {
             self.display_messages.push(header);
 
             if !is_collapsed {
-                for &idx in &section.messages {
-                    // Build the display entry directly instead of cloning the
-                    // full Message and then blanking the heavy fields — that
-                    // churns alloc/dealloc for content/html_content/metadata
-                    // on every rebuild. We still clone the light String fields
-                    // so downstream mutation of display_messages (mark read,
-                    // etc.) doesn't have to reach back into filtered_messages.
+                // For email/maildir thread sections, replace the flat
+                // chronological ordering with a DFS over the
+                // In-Reply-To tree so replies appear indented under
+                // the parent they answered. Other section types stay
+                // flat — chat sources don't carry reliable parent
+                // metadata in the current relay protocol.
+                let ordered: Vec<(usize, u8)> = if section.section_type == "thread" {
+                    build_thread_order(&self.filtered_messages, &section.messages)
+                } else {
+                    section.messages.iter().map(|&i| (i, 0u8)).collect()
+                };
+
+                for (idx, depth) in ordered {
                     let src = &self.filtered_messages[idx];
                     self.display_messages.push(Message {
                         id: src.id,
@@ -3567,6 +3649,7 @@ impl App {
                         source_type: src.source_type.clone(),
                         is_header: false,
                         full_loaded: false,
+                        thread_depth: depth,
                     });
                 }
             }
