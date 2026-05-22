@@ -7,7 +7,15 @@ use rusqlite::{params, Connection};
 use crate::message::Message;
 use crate::source::Source;
 
-/// Filter criteria for querying messages
+/// Filter criteria for querying messages.
+///
+/// A single Filters describes one AND-group: all set fields must
+/// match. To express OR across heterogeneous criteria — e.g. a
+/// "Project Foo" view that wants `(folder = X) OR (folder LIKE %foo%)
+/// OR (sender LIKE %foo%)` — set `branches` to a list of sub-Filters.
+/// When `branches` is `Some`, the rest of THIS Filters is ignored and
+/// the query is built as `WHERE (b1) OR (b2) OR …`. A single-branch
+/// list is equivalent to the un-branched Filters.
 #[derive(Default, Clone)]
 pub struct Filters {
     pub source_id: Option<i64>,
@@ -23,6 +31,10 @@ pub struct Filters {
     pub sender_pattern: Option<String>,
     pub source_type: Option<String>,
     pub content_pattern: Option<String>,
+    /// Optional OR-of-Filters. When present, takes precedence over
+    /// the other fields of this struct — each branch is rendered as
+    /// its own AND-group and combined with `OR`.
+    pub branches: Option<Vec<Filters>>,
 }
 
 /// A user-defined view from the database
@@ -40,6 +52,75 @@ pub struct View {
 /// Thread-safe wrapper around the SQLite database
 pub struct Database {
     pub conn: Mutex<Connection>,
+}
+
+/// Build a single AND-group's WHERE fragment from a Filters (ignoring
+/// `branches`) plus its parameter list. Returns `(sql, params)` where
+/// `sql` is concatenated to a `WHERE ` prefix by the caller and the
+/// params line up positionally with the `?` placeholders.
+///
+/// Empty fragment (no field set) means "match everything" — caller
+/// handles that as a short-circuit.
+fn build_branch_where(filters: &Filters) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut parts: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    if let Some(sid) = filters.source_id {
+        parts.push("source_id = ?".into());
+        params.push(Box::new(sid));
+    }
+    if let Some(ref ids) = filters.source_ids {
+        if !ids.is_empty() {
+            let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
+            parts.push(format!("source_id IN ({})", placeholders.join(",")));
+            for id in ids { params.push(Box::new(*id)); }
+        }
+    }
+    if let Some(is_read) = filters.is_read {
+        parts.push("read = ?".into());
+        params.push(Box::new(if is_read { 1i64 } else { 0i64 }));
+    }
+    if let Some(is_starred) = filters.is_starred {
+        parts.push("starred = ?".into());
+        params.push(Box::new(if is_starred { 1i64 } else { 0i64 }));
+    }
+    if let Some(ref folder) = filters.folder {
+        parts.push("folder = ?".into());
+        params.push(Box::new(folder.clone()));
+    }
+    if let Some(ref pattern) = filters.folder_pattern {
+        let parts_p: Vec<&str> = pattern.split('|').collect();
+        let conditions: Vec<String> = parts_p.iter()
+            .map(|_| "folder LIKE ?".to_string()).collect();
+        parts.push(format!("({})", conditions.join(" OR ")));
+        for p in &parts_p {
+            params.push(Box::new(format!("%{}%", p.trim())));
+        }
+    }
+    if let Some(ref pattern) = filters.sender_pattern {
+        let parts_p: Vec<&str> = pattern.split('|').collect();
+        let conditions: Vec<String> = parts_p.iter().map(|_|
+            "(sender LIKE ? OR sender_name LIKE ?)".to_string()
+        ).collect();
+        parts.push(format!("({})", conditions.join(" OR ")));
+        for p in &parts_p {
+            let like = format!("%{}%", p.trim());
+            params.push(Box::new(like.clone()));
+            params.push(Box::new(like));
+        }
+    }
+    if let Some(ref stype) = filters.source_type {
+        parts.push("source_id IN (SELECT id FROM sources WHERE plugin_type = ?)".into());
+        params.push(Box::new(stype.clone()));
+    }
+    if let Some(ref pattern) = filters.content_pattern {
+        parts.push("(content LIKE ? OR subject LIKE ? OR sender LIKE ?)".into());
+        let like = format!("%{}%", pattern);
+        params.push(Box::new(like.clone()));
+        params.push(Box::new(like.clone()));
+        params.push(Box::new(like));
+    }
+    (parts.join(" AND "), params)
 }
 
 pub fn now_secs() -> i64 {
@@ -360,77 +441,36 @@ impl Database {
         // Exclude archived by default
         sql.push_str(" AND (archived = 0 OR archived IS NULL)");
 
-        if let Some(sid) = filters.source_id {
-            sql.push_str(" AND source_id = ?");
-            param_values.push(Box::new(sid));
-        }
-
-        if let Some(ref ids) = filters.source_ids {
-            if !ids.is_empty() {
-                let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
-                sql.push_str(&format!(" AND source_id IN ({})", placeholders.join(",")));
-                for id in ids {
-                    param_values.push(Box::new(*id));
+        // OR-of-AND-groups: when `branches` is set, render each branch's
+        // single-AND WHERE fragment in parens, joined by `OR`. The
+        // unwrapped top-level Filters fields are ignored in this case —
+        // the rule parser places everything into `branches` instead.
+        if let Some(branches) = &filters.branches {
+            if branches.is_empty() {
+                return Vec::new();
+            }
+            let mut parts: Vec<String> = Vec::with_capacity(branches.len());
+            for b in branches {
+                let (frag, params) = build_branch_where(b);
+                if frag.is_empty() {
+                    // Empty branch matches everything — short-circuit
+                    // the whole OR.
+                    parts.clear();
+                    break;
                 }
+                parts.push(format!("({})", frag));
+                for p in params { param_values.push(p); }
             }
-        }
-
-        if let Some(is_read) = filters.is_read {
-            sql.push_str(" AND read = ?");
-            param_values.push(Box::new(if is_read { 1i64 } else { 0i64 }));
-        }
-
-        if let Some(is_starred) = filters.is_starred {
-            sql.push_str(" AND starred = ?");
-            param_values.push(Box::new(if is_starred { 1i64 } else { 0i64 }));
-        }
-
-        if let Some(ref folder) = filters.folder {
-            sql.push_str(" AND folder = ?");
-            param_values.push(Box::new(folder.clone()));
-        }
-
-        if let Some(ref pattern) = filters.folder_pattern {
-            // `|`-separated alternatives → OR of LIKE. Mirrors
-            // sender_pattern. Each part is wrapped in `%…%` so the
-            // view config can say `python.slack.` and match every
-            // Slack channel buffer.
-            let parts: Vec<&str> = pattern.split('|').collect();
-            let conditions: Vec<String> = parts.iter()
-                .map(|_| "folder LIKE ?".to_string())
-                .collect();
-            sql.push_str(&format!(" AND ({})", conditions.join(" OR ")));
-            for p in &parts {
-                param_values.push(Box::new(format!("%{}%", p.trim())));
+            if !parts.is_empty() {
+                sql.push_str(&format!(" AND ({})", parts.join(" OR ")));
             }
-        }
-
-        if let Some(ref pattern) = filters.sender_pattern {
-            let parts: Vec<&str> = pattern.split('|').collect();
-            let conditions: Vec<String> = parts.iter().map(|_|
-                "(sender LIKE ? OR sender_name LIKE ?)".to_string()
-            ).collect();
-            sql.push_str(&format!(" AND ({})", conditions.join(" OR ")));
-            for p in &parts {
-                let like = format!("%{}%", p.trim());
-                param_values.push(Box::new(like.clone()));
-                param_values.push(Box::new(like));
+        } else {
+            let (frag, params) = build_branch_where(filters);
+            if !frag.is_empty() {
+                sql.push_str(" AND ");
+                sql.push_str(&frag);
+                for p in params { param_values.push(p); }
             }
-        }
-
-        if let Some(ref stype) = filters.source_type {
-            sql.push_str(
-                " AND source_id IN (SELECT id FROM sources WHERE plugin_type = ?)"
-            );
-            param_values.push(Box::new(stype.clone()));
-        }
-
-        if let Some(ref pattern) = filters.content_pattern {
-            sql.push_str(" AND (content LIKE ? OR subject LIKE ? OR sender LIKE ?)");
-            let like = format!("%{}%", pattern);
-            param_values.push(Box::new(like.clone()));
-            param_values.push(Box::new(like.clone()));
-            param_values.push(Box::new(like));
         }
 
         sql.push_str(" ORDER BY timestamp DESC LIMIT ? OFFSET ?");
@@ -742,18 +782,17 @@ impl Database {
         ).unwrap_or((0, 0, 0))
     }
 
-    /// Folder → count of unread messages with `metadata.highlight = true`.
-    /// Used by the top-bar view-strip badges so the user sees at a
-    /// glance which other views have a mention waiting. One query, no
-    /// per-view loop on the call site.
-    pub fn unread_highlights_by_folder(&self) -> std::collections::HashMap<String, i64> {
+    /// Folder → count of unread messages. Used by the top-bar
+    /// view-strip badges to flag views (other than the current one)
+    /// where new messages have arrived. One query, no per-view loop
+    /// on the call site.
+    pub fn unread_count_by_folder(&self) -> std::collections::HashMap<String, i64> {
         let conn = self.conn.lock().unwrap();
         let mut out = std::collections::HashMap::new();
         let mut stmt = match conn.prepare(
             "SELECT folder, COUNT(*) FROM messages \
              WHERE read = 0 \
                AND folder IS NOT NULL \
-               AND json_extract(metadata, '$.highlight') = 1 \
              GROUP BY folder"
         ) {
             Ok(s) => s,

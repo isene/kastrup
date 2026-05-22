@@ -148,6 +148,32 @@ fetch_script: ~/path/to/messenger_fetch.py
 
 `~/` and `$HOME` are expanded.
 
+### Views
+
+Views are user-defined filter recipes stored in the `views` table. Each row's `filters` is a JSON blob with a `rules` array of `{field, op, value}` triples:
+
+```json
+{"rules": [{"field":"folder","op":"like","value":"python.slack.|irc.libera."}]}
+```
+
+To express OR across heterogeneous criteria — e.g. one view for "everything related to project Foo, across email AND Slack AND IRC" — use `branches` instead of (or together with) `rules`. Each branch is an independent rule set; results are unioned:
+
+```json
+{
+  "name": "Foo",
+  "branches": [
+    {"rules": [{"field":"folder","op":"=","value":"AA.Customers.Foo"}]},
+    {"rules": [{"field":"folder","op":"like","value":"python.slack.workspace.#foo"}]},
+    {"rules": [{"field":"sender","op":"like","value":"foo"}]}
+  ],
+  "top_bg": "24"
+}
+```
+
+There's nothing source-specific about which view-key gets a "chat" badge or layout — any view (numbered or F-key) can mix mail folders, chat channels, and sender / content patterns however the user wants.
+
+Supported rule fields: `read`, `starred`, `folder`, `source_id`, `source_type`, `sender`. Supported `op` values: `=` (exact) and `like` (SQL `LIKE %value%`, pipe-separated value gives OR-of-LIKE within the field).
+
 ## Architecture
 
 A detailed walk-through of the receive flows, send flows, auth matrix, threads and shared state, and the dedup scheme lives in [`docs/architecture.html`](docs/architecture.html). Open it locally for the rendered diagrams.

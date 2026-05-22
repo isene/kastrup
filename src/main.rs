@@ -197,6 +197,11 @@ fn parse_chat_channel(data: &str) -> Option<String> {
 /// Folders view — only buffers that would have appeared as message
 /// rows under this view's filter should get an empty section.
 fn folder_matches_filter(folder: &str, filters: &Filters) -> bool {
+    // OR-of-AND-groups: any branch matching means the whole filter
+    // matches. Mirrors the SQL `(b1) OR (b2) OR …` shape.
+    if let Some(branches) = &filters.branches {
+        return branches.iter().any(|b| folder_matches_filter(folder, b));
+    }
     if let Some(ref f) = filters.folder {
         return folder == f;
     }
@@ -211,6 +216,61 @@ fn folder_matches_filter(folder: &str, filters: &Filters) -> bool {
     // No folder filter → match anything (e.g. view "A" with no
     // source_id restriction).
     true
+}
+
+/// Apply a JSON `rules` array onto a Filters. Each rule is
+/// `{field, op, value}`. Unknown fields are silently ignored.
+fn apply_view_rules(rules: &[serde_json::Value], filters: &mut Filters) {
+    for rule in rules {
+        let field = rule["field"].as_str().unwrap_or("");
+        let op    = rule["op"].as_str().unwrap_or("=");
+        let value = &rule["value"];
+        match field {
+            "read" => { filters.is_read = Some(!value.as_bool().unwrap_or(true)); }
+            "starred" => { filters.is_starred = value.as_bool(); }
+            "folder" => {
+                if op == "like" {
+                    filters.folder_pattern = value.as_str().map(|s| s.to_string());
+                } else {
+                    filters.folder = value.as_str().map(|s| s.to_string());
+                }
+            }
+            "source_id" => { filters.source_id = value.as_i64(); }
+            "sender" => { filters.sender_pattern = value.as_str().map(|s| s.to_string()); }
+            "source_type" => { filters.source_type = value.as_str().map(|s| s.to_string()); }
+            _ => {}
+        }
+    }
+}
+
+/// Parse a view's `filters` JSON into a Filters value. Honors both:
+///
+/// * The legacy single-AND-group shape `{ "rules": [...] }`.
+/// * The OR-of-AND-groups shape `{ "branches": [ {"rules": [...]},
+///   {"rules": [...]}, ... ] }`. Each branch is an independent
+///   Filters; results are unioned. Lets a view express a true cross-
+///   source / cross-folder query — e.g. "mail in Customers.X" UNION
+///   "Slack messages in #foo" UNION "anything from sender ~ ACME".
+///
+/// When both `branches` and `rules` are present, `branches` wins.
+fn parse_view_filters_json(f: &serde_json::Value) -> Filters {
+    let mut filters = Filters::default();
+    if let Some(branches) = f["branches"].as_array() {
+        let mut bs: Vec<Filters> = Vec::new();
+        for b in branches {
+            let mut sub = Filters::default();
+            if let Some(rules) = b["rules"].as_array() {
+                apply_view_rules(rules, &mut sub);
+            }
+            bs.push(sub);
+        }
+        if !bs.is_empty() {
+            filters.branches = Some(bs);
+        }
+    } else if let Some(rules) = f["rules"].as_array() {
+        apply_view_rules(rules, &mut filters);
+    }
+    filters
 }
 
 /// Map a wee-slack relay folder name to a Slack Web API target
@@ -795,10 +855,12 @@ struct App {
     /// sections so empty channels still appear (weechat-buflist
     /// parity).
     subscribed_buffers: sources::weechat_relay::SubscribedBuffers,
-    /// Cache of `folder → unread-highlight count`, refreshed on the
+    /// Cache of `folder → unread-message count`, refreshed on the
     /// same 5s tick as the message list. Drives the inactive-view
-    /// badges in the top bar.
-    highlight_cache: std::collections::HashMap<String, i64>,
+    /// badges in the top bar: any custom view whose filter matches
+    /// at least one folder with unread messages gets a key-only
+    /// badge (e.g. `1 5 F2`).
+    unread_cache: std::collections::HashMap<String, i64>,
     last_highlight_refresh: std::time::Instant,
     /// Per-view list of folder names the user has hidden from the
     /// Folders view. Persisted as `hidden_channels_<view>` in the
@@ -1173,7 +1235,7 @@ fn main() {
         current_section_order: Vec::new(),
         nick_lists: nick_lists.clone(),
         subscribed_buffers: subscribed_buffers.clone(),
-        highlight_cache: std::collections::HashMap::new(),
+        unread_cache: std::collections::HashMap::new(),
         last_highlight_refresh: std::time::Instant::now() - std::time::Duration::from_secs(60),
         current_hidden_channels: Vec::new(),
         poller: None,
@@ -1282,7 +1344,7 @@ fn main() {
                 // doesn't always trip the dirty flag.
                 if app.last_highlight_refresh.elapsed().as_secs() >= 5 {
                     app.last_highlight_refresh = std::time::Instant::now();
-                    app.highlight_cache = app.db.unread_highlights_by_folder();
+                    app.unread_cache = app.db.unread_count_by_folder();
                     app.render_top_bar();
                 }
             }
@@ -1394,7 +1456,6 @@ impl App {
             "C-U" => { self.unhide_all_channels(); }
             "C-N" => { self.pick_nick_to_clipboard(); }
             "C-G" => { self.pick_channel_to_clipboard(); }
-            "O" => { self.open_slack_attachment(); }
 
             // View switching
             "=" => { self.switch_to_view("A"); }
@@ -1723,19 +1784,19 @@ impl App {
             style::fg(" [0/0]", tc.info_fg)
         };
 
-        // Inactive-view badges: walk every custom view, sum unread
-        // highlights from `highlight_cache` for the folders matching
-        // that view's filter, and render `K1:!N K2:!N` for any view
-        // other than the current one. Lets the user notice a ping in
-        // F2 without leaving F1.
+        // Inactive-view badges: list (just the key, no count) every
+        // custom view OTHER than the current one whose filter matches
+        // at least one folder with unread messages. Excludes the
+        // built-in `A`/`N`/`*` derived views — they overlap with
+        // everything and would always be lit. The display is just the
+        // view's key glyph: e.g. `1 5 F2`, in the unread colour.
         let mut other_view_badges: Vec<String> = Vec::new();
-        if !self.highlight_cache.is_empty() {
-            // Pre-snapshot since iterating self.views borrows immutably
-            // while build_view_filters needs &self too.
+        if !self.unread_cache.is_empty() {
             let view_keys_and_filters: Vec<(String, Filters)> = self.views.iter()
                 .filter_map(|v| {
                     let key = v.key_binding.clone()?;
                     if key == self.current_view { return None; }
+                    if matches!(key.as_str(), "A" | "N" | "*") { return None; }
                     let f = serde_json::from_str::<serde_json::Value>(&v.filters).ok()?;
                     let mut filters = Filters::default();
                     if let Some(rules) = f["rules"].as_array() {
@@ -1761,14 +1822,10 @@ impl App {
                 })
                 .collect();
             for (key, filters) in view_keys_and_filters {
-                let count: i64 = self.highlight_cache.iter()
-                    .filter(|(folder, _)| folder_matches_filter(folder, &filters))
-                    .map(|(_, n)| *n)
-                    .sum();
-                if count > 0 {
-                    other_view_badges.push(
-                        style::fg(&format!("{}:!{}", key, count), tc.unread)
-                    );
+                let any_unread = self.unread_cache.iter()
+                    .any(|(folder, n)| *n > 0 && folder_matches_filter(folder, &filters));
+                if any_unread {
+                    other_view_badges.push(style::fg(&key, tc.unread));
                 }
             }
         }
@@ -2745,42 +2802,10 @@ impl App {
                 // Check custom views from DB
                 if let Some(view) = self.views.iter().find(|v| v.key_binding.as_deref() == Some(key)) {
                     if let Ok(f) = serde_json::from_str::<serde_json::Value>(&view.filters) {
-                        if let Some(rules) = f["rules"].as_array() {
-                            for rule in rules {
-                                let field = rule["field"].as_str().unwrap_or("");
-                                let op    = rule["op"].as_str().unwrap_or("=");
-                                let value = &rule["value"];
-                                match field {
-                                    "read" => {
-                                        filters.is_read = Some(!value.as_bool().unwrap_or(true));
-                                    }
-                                    "starred" => {
-                                        filters.is_starred = value.as_bool();
-                                    }
-                                    "folder" => {
-                                        // `op=like` → LIKE %v%, possibly
-                                        // pipe-OR. Default (`=`) → exact.
-                                        if op == "like" {
-                                            filters.folder_pattern =
-                                                value.as_str().map(|s| s.to_string());
-                                        } else {
-                                            filters.folder =
-                                                value.as_str().map(|s| s.to_string());
-                                        }
-                                    }
-                                    "source_id" => {
-                                        filters.source_id = value.as_i64();
-                                    }
-                                    "sender" => {
-                                        filters.sender_pattern = value.as_str().map(|s| s.to_string());
-                                    }
-                                    "source_type" => {
-                                        filters.source_type = value.as_str().map(|s| s.to_string());
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
+                        // Honors both `rules: [...]` (single AND
+                        // group) and `branches: [{rules}, ...]` (OR
+                        // across independent groups).
+                        filters = parse_view_filters_json(&f);
                         // Per-view sort settings
                         if let Some(so) = f["view_sort_order"].as_str() {
                             self.sort_order = so.to_string();
@@ -2879,28 +2904,7 @@ impl App {
             _ => {
                 if let Some(view) = self.views.iter().find(|v| v.key_binding.as_deref() == Some(&key)) {
                     if let Ok(f) = serde_json::from_str::<serde_json::Value>(&view.filters) {
-                        if let Some(rules) = f["rules"].as_array() {
-                            for rule in rules {
-                                let field = rule["field"].as_str().unwrap_or("");
-                                let op    = rule["op"].as_str().unwrap_or("=");
-                                let value = &rule["value"];
-                                match field {
-                                    "read" => { filters.is_read = Some(!value.as_bool().unwrap_or(true)); }
-                                    "starred" => { filters.is_starred = value.as_bool(); }
-                                    "folder" => {
-                                        if op == "like" {
-                                            filters.folder_pattern = value.as_str().map(|s| s.to_string());
-                                        } else {
-                                            filters.folder = value.as_str().map(|s| s.to_string());
-                                        }
-                                    }
-                                    "source_id" => { filters.source_id = value.as_i64(); }
-                                    "sender" => { filters.sender_pattern = value.as_str().map(|s| s.to_string()); }
-                                    "source_type" => { filters.source_type = value.as_str().map(|s| s.to_string()); }
-                                    _ => {}
-                                }
-                            }
-                        }
+                        filters = parse_view_filters_json(&f);
                     }
                 }
             }
@@ -4387,82 +4391,49 @@ impl App {
         self.render_all();
     }
 
-    /// Find and download the first Slack file URL in the current
-    /// message, then `xdg-open` the result. Bound to `O`. Saves to
-    /// `~/.kastrup/attachments/<file-id>_<filename>`; repeat downloads
-    /// of the same file reuse the cached copy.
-    fn open_slack_attachment(&mut self) {
-        let tc = self.config.theme_colors.clone();
-        self.ensure_full_content();
+    /// Scan the current message body for chat-source file URLs (Slack
+    /// today; same hook can extend to Discord / etc.) and inject them
+    /// as synthetic attachment entries on the message. `v` and `V`
+    /// then operate on chat attachments through the same code path
+    /// they already use for email attachments — one set of keys, all
+    /// message types.
+    ///
+    /// Skips when the message already has attachments populated. URLs
+    /// are tagged with a `kastrup_remote: true` marker so the open /
+    /// save handlers know to fetch-on-demand instead of extracting
+    /// from a maildir file.
+    fn enrich_attachments_from_chat_urls(&mut self) {
         let msg = match self.filtered_messages.get(self.index) {
             Some(m) => m, None => return,
         };
-        let urls: Vec<String> = extract_slack_file_urls(&msg.content);
-        if urls.is_empty() {
-            self.set_feedback("No Slack file attachment in this message",
-                tc.feedback_warn);
-            return;
+        if !msg.attachments.is_empty() { return; }
+        let urls = extract_slack_file_urls(&msg.content);
+        if urls.is_empty() { return; }
+        let mut synth: Vec<serde_json::Value> = Vec::new();
+        for url in urls {
+            let (file_id, filename) = parse_slack_file_url(&url)
+                .unwrap_or_else(|| ("unknown".into(), "attachment".into()));
+            let ext = filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+            let content_type = match ext.as_str() {
+                "png"  => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "gif"  => "image/gif",
+                "webp" => "image/webp",
+                "svg"  => "image/svg+xml",
+                "pdf"  => "application/pdf",
+                _      => "application/octet-stream",
+            };
+            synth.push(serde_json::json!({
+                "name": filename,
+                "url":  url,
+                "content_type": content_type,
+                "file_id": file_id,
+                "kastrup_remote": true,
+            }));
         }
-        let url = urls[0].clone();
-        let secrets = chat_send::load_secrets();
-        let token = match secrets.slack_token.as_ref() {
-            Some(t) => t.clone(),
-            None => {
-                self.set_feedback("No Slack token configured", tc.feedback_warn);
-                return;
-            }
-        };
-        let cookie = secrets.slack_cookie.clone();
-
-        let home = std::env::var("HOME").unwrap_or_default();
-        let dir = std::path::PathBuf::from(home).join(".kastrup").join("attachments");
-        let _ = std::fs::create_dir_all(&dir);
-        // Derive a filename from the URL's last path segment, with the
-        // file-id prefix from the second-to-last segment so duplicate
-        // names from different files don't collide.
-        let (file_id, filename) = parse_slack_file_url(&url)
-            .unwrap_or_else(|| ("unknown".into(), "attachment".into()));
-        let safe_name = filename.chars()
-            .map(|c| if c.is_alphanumeric() || ".-_".contains(c) { c } else { '_' })
-            .collect::<String>();
-        let dest = dir.join(format!("{}_{}", file_id, safe_name));
-
-        if !dest.exists() {
-            self.set_feedback(&format!("Downloading {}…", safe_name), tc.feedback_info);
-            self.render_bottom_bar();
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-            let mut req = ureq::get(&url)
-                .set("Authorization", &format!("Bearer {}", token));
-            if let Some(c) = cookie.as_deref() {
-                req = req.set("Cookie", &format!("d={}", c));
-            }
-            match req.call() {
-                Ok(resp) => {
-                    let mut buf: Vec<u8> = Vec::new();
-                    if let Err(e) = std::io::copy(&mut resp.into_reader(), &mut buf) {
-                        self.set_feedback(&format!("Download failed: {}", e), tc.feedback_warn);
-                        return;
-                    }
-                    if let Err(e) = std::fs::write(&dest, &buf) {
-                        self.set_feedback(&format!("Write failed: {}", e), tc.feedback_warn);
-                        return;
-                    }
-                }
-                Err(e) => {
-                    self.set_feedback(&format!("HTTP error: {}", e), tc.feedback_warn);
-                    return;
-                }
-            }
+        if !synth.is_empty() {
+            self.filtered_messages[self.index].attachments = synth;
         }
-
-        let _ = std::process::Command::new("xdg-open").arg(&dest)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        self.set_feedback(
-            &format!("Opened {} ({} more)", safe_name, urls.len().saturating_sub(1)),
-            tc.feedback_ok,
-        );
     }
 
     /// Picker for an `@nick` reference. Opens a prompt; user types a
@@ -5034,28 +5005,7 @@ impl App {
             key => {
                 if let Some(view) = self.views.iter().find(|v| v.key_binding.as_deref() == Some(key)) {
                     if let Ok(f) = serde_json::from_str::<serde_json::Value>(&view.filters) {
-                        if let Some(rules) = f["rules"].as_array() {
-                            for rule in rules {
-                                let field = rule["field"].as_str().unwrap_or("");
-                                let op    = rule["op"].as_str().unwrap_or("=");
-                                let value = &rule["value"];
-                                match field {
-                                    "read" => { filters.is_read = Some(!value.as_bool().unwrap_or(true)); }
-                                    "starred" => { filters.is_starred = value.as_bool(); }
-                                    "folder" => {
-                                        if op == "like" {
-                                            filters.folder_pattern = value.as_str().map(|s| s.to_string());
-                                        } else {
-                                            filters.folder = value.as_str().map(|s| s.to_string());
-                                        }
-                                    }
-                                    "source_id" => { filters.source_id = value.as_i64(); }
-                                    "sender" => { filters.sender_pattern = value.as_str().map(|s| s.to_string()); }
-                                    "source_type" => { filters.source_type = value.as_str().map(|s| s.to_string()); }
-                                    _ => {}
-                                }
-                            }
-                        }
+                        filters = parse_view_filters_json(&f);
                     }
                 }
             }
@@ -8223,6 +8173,9 @@ impl App {
                 }
             }
         }
+        // Chat message URL → synthetic attachments. Lets `v` work
+        // uniformly for email AND chat (Slack files etc.).
+        self.enrich_attachments_from_chat_urls();
         let msg = &self.filtered_messages[self.index];
         if msg.attachments.is_empty() {
             self.set_feedback("No attachments", self.config.theme_colors.feedback_warn);
@@ -8410,6 +8363,74 @@ impl App {
             .and_then(|v| v.as_str())
             .unwrap_or("unnamed");
         let dest = format!("/tmp/kastrup_att_{}", name);
+
+        // Remote-URL path: synthetic attachments injected by
+        // `enrich_attachments_from_chat_urls` carry a `url` plus
+        // `kastrup_remote: true`. Fetch with the per-source auth and
+        // either open or stash. Cached under
+        // `~/.kastrup/attachments/<file-id>_<name>` so repeated opens
+        // skip the round-trip.
+        if att.get("kastrup_remote").and_then(|v| v.as_bool()) == Some(true) {
+            if let Some(url) = att.get("url").and_then(|v| v.as_str()) {
+                let file_id = att.get("file_id").and_then(|v| v.as_str()).unwrap_or("rem");
+                let home = std::env::var("HOME").unwrap_or_default();
+                let dir = std::path::PathBuf::from(home).join(".kastrup").join("attachments");
+                let _ = std::fs::create_dir_all(&dir);
+                let safe_name: String = name.chars()
+                    .map(|c| if c.is_alphanumeric() || ".-_".contains(c) { c } else { '_' })
+                    .collect();
+                let cached = dir.join(format!("{}_{}", file_id, safe_name));
+
+                if !cached.exists() {
+                    self.set_feedback(&format!("Downloading {}…", name),
+                        self.config.theme_colors.feedback_info);
+                    let secrets = chat_send::load_secrets();
+                    let mut req = ureq::get(url);
+                    if let Some(t) = secrets.slack_token.as_deref() {
+                        req = req.set("Authorization", &format!("Bearer {}", t));
+                    }
+                    if let Some(c) = secrets.slack_cookie.as_deref() {
+                        req = req.set("Cookie", &format!("d={}", c));
+                    }
+                    match req.call() {
+                        Ok(resp) => {
+                            let mut buf: Vec<u8> = Vec::new();
+                            if std::io::copy(&mut resp.into_reader(), &mut buf).is_err()
+                                || std::fs::write(&cached, &buf).is_err()
+                            {
+                                self.set_feedback("Download write failed",
+                                    self.config.theme_colors.feedback_warn);
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            self.set_feedback(&format!("HTTP error: {}", e),
+                                self.config.theme_colors.feedback_warn);
+                            return;
+                        }
+                    }
+                }
+
+                if open {
+                    let _ = std::process::Command::new("xdg-open").arg(&cached)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                    self.set_feedback(&format!("Opened {}", name),
+                        self.config.theme_colors.feedback_ok);
+                } else {
+                    // Save → copy cached file to user-chosen dest above.
+                    if let Err(e) = std::fs::copy(&cached, &dest) {
+                        self.set_feedback(&format!("Copy failed: {}", e),
+                            self.config.theme_colors.feedback_warn);
+                    } else {
+                        self.set_feedback(&format!("Saved to {}", dest),
+                            self.config.theme_colors.feedback_ok);
+                    }
+                }
+                return;
+            }
+        }
 
         // External-sender path: if the attachment carries a file_id AND the
         // source has an open_attachment template configured, dispatch to it.
@@ -8622,6 +8643,10 @@ impl App {
                 self.filtered_messages[self.index].full_loaded = true;
             }
         }
+        // Same chat-URL → synthetic-attachment enrichment as `v`, so
+        // a Slack image attachment is rendered inline by `V` exactly
+        // like an email's image attachment.
+        self.enrich_attachments_from_chat_urls();
         let msg = &self.filtered_messages[self.index];
 
         // Collect image URLs
