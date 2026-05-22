@@ -2430,10 +2430,19 @@ impl App {
         } else {
             raw.clone()
         };
-        // Decode any remaining QP soft line breaks (=\n) in the extracted text
-        let extracted = if extracted.contains("=\n") || extracted.contains("=\r\n") {
-            decode_quoted_printable(&extracted)
-        } else { extracted };
+        // (Previously: a second `decode_quoted_printable` pass that
+        // re-ran on already-decoded text "to catch missed soft line
+        // breaks". Removed because it's actively destructive on
+        // bodies containing literal `=XY` sequences where X/Y happen
+        // to be ASCII hex digits — e.g. URL query-strings, the
+        // `============` markdown heading underline followed by a
+        // newline, etc. The second pass mis-decodes them into raw
+        // non-ASCII bytes that invalidate the UTF-8 stream, and the
+        // function's last-resort `latin1_to_utf8` fallback then
+        // mojibakes every Norwegian char (UTF-8 `å` shows as `Ã¥`).
+        // QP decoding is done in `extract_mime_text` / the
+        // single-part branch above; this guard added nothing
+        // legitimate.)
         let is_html_fallback = {
             let lc = extracted.to_lowercase();
             extracted.trim().is_empty() || lc.contains("html messages are not support")
