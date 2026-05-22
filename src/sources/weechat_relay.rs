@@ -1052,7 +1052,7 @@ pub fn spawn_supervisor(
 /// see those in weechat itself; mirroring them into kastrup just
 /// clutters the folder list.
 fn is_uninteresting_buffer(full_name: &str) -> bool {
-    full_name == "core.weechat"
+    if full_name == "core.weechat"
         || full_name == "relay.relay.list"
         || full_name.starts_with("perl.")
         || full_name.starts_with("python.script.")
@@ -1060,6 +1060,19 @@ fn is_uninteresting_buffer(full_name: &str) -> bool {
         || full_name.starts_with("fset.")
         || full_name.starts_with("irc.server.")
         || full_name == "irc.bitlbee.&bitlbee"
+    {
+        return true;
+    }
+    // `python.slack.<workspace>` with no further `.<channel>` suffix
+    // is wee-slack's per-workspace root buffer — a placeholder for
+    // the workspace itself, not a chat channel. Same idea for
+    // `matrix.<server>` (matrix plugin's server-root buffer).
+    for transport in ["python.slack.", "matrix."] {
+        if let Some(rest) = full_name.strip_prefix(transport) {
+            if !rest.contains('.') { return true; }
+        }
+    }
+    false
 }
 
 /// Classify a buffer's `full_name` into a (platform, label) pair.
