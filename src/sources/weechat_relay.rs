@@ -444,6 +444,14 @@ impl Connection {
         self.send_cmd(&format!("desync {}", buffer_ptr))
     }
 
+    /// Fetch nick lists for every buffer in one shot. Response arrives
+    /// as a single hdata message with id `"nicks"`. M6: feeds the
+    /// supervisor's shared `nick_lists` map so future @-completion has
+    /// data to work with.
+    pub fn nicklist_all(&mut self) -> Result<(), String> {
+        self.send_cmd("(nicks) nicklist")
+    }
+
     /// Type `text` into a buffer addressed by `full_name` (the same
     /// dotted name kastrup uses as the folder, e.g.
     /// `python.slack.dualog.#general` or `irc.libera.#weechat`).
@@ -596,9 +604,15 @@ pub fn sync_weechat_relay(_config: &serde_json::Value, known_ids: &HashSet<Strin
 // M5 — persistent push connection with supervisor + backoff
 // ---------------------------------------------------------------------------
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+/// Per-buffer nick set, keyed by buffer `full_name`. Built up from
+/// the initial `nicklist` response and kept current by
+/// `_nicklist_diff` events. Shared between the supervisor thread
+/// (writer) and the main App thread (future @-completion reader).
+pub type NickLists = Arc<Mutex<HashMap<String, BTreeSet<String>>>>;
 
 /// Per-buffer metadata cached on the supervisor thread. The `ptr` ←
 /// `full_name` mapping is what lets us route `_buffer_line_added`
@@ -631,6 +645,17 @@ fn line_to_message(
     };
     let displayed = matches!(line.fields.get("displayed"), Some(Object::Char(1)));
     if !displayed { return None; }
+    // Drop join/part/quit/nick-change lines via weechat's own tag
+    // metadata — more reliable than glyph-matching the prefix
+    // column. We keep `is_system_prefix` as a fallback for plugins
+    // that don't tag these (rare).
+    if tags_contain_any(line.fields.get("tags_array"),
+        &["irc_join", "irc_part", "irc_quit", "irc_nick",
+          "irc_mode", "irc_topic", "irc_kick", "irc_invite",
+          "slack_join", "slack_leave"])
+    {
+        return None;
+    }
     if is_system_prefix(prefix_raw) { return None; }
 
     // Prefer the stripped prefix — wee-slack normally puts the human-
@@ -650,7 +675,17 @@ fn line_to_message(
             .unwrap_or_default()
     };
     if nick.is_empty() && message_raw.is_empty() { return None; }
-    let message = strip_codes(message_raw);
+    let mut message = strip_codes(message_raw);
+
+    // `/me` actions: weechat tags these `irc_action` / `slack_action`.
+    // The relay prefix column already shows `* nick`, but the
+    // continuation-marker branch may have lost the nick. Normalise so
+    // the message body itself reads `* nick text` and the sender
+    // column stays informative.
+    let tags = line.fields.get("tags_array");
+    if tags_has(tags, "irc_action") || tags_has(tags, "slack_action") {
+        message = format!("* {} {}", nick, message);
+    }
 
     // Dedup hash: (folder, date, message-head). Deliberately NO nick —
     // a future tweak to nick-recovery shouldn't re-insert old lines as
@@ -680,6 +715,11 @@ fn line_to_message(
     };
     let (platform, label) = classify_buffer(&meta.full_name);
 
+    // `highlight=1` means weechat flagged the line as a mention/ping
+    // for the user. Captured in metadata so the renderer can light
+    // up the section header / top bar with a `!` badge.
+    let highlight = matches!(line.fields.get("highlight"), Some(Object::Char(1)));
+
     Some(MessageData {
         external_id: ext_id,
         sender: nick.clone(),
@@ -694,13 +734,58 @@ fn line_to_message(
         labels: vec![label.to_string()],
         attachments: Vec::new(),
         metadata: serde_json::json!({
-            "buffer":   meta.full_name,
-            "platform": platform,
+            "buffer":    meta.full_name,
+            "platform":  platform,
             "source_type": "weechat-relay",
+            "highlight": highlight,
         }),
         folder: Some(meta.full_name.clone()),
         thread_id: None,
     })
+}
+
+/// Apply a single nicklist hdata item to the shared map. `is_diff`
+/// switches on the `_diff` char field: `+` add, `-` remove, `*`
+/// update (no nick-set change). For non-diff (initial fetch) we just
+/// add. Returns the ptr→full_name resolution so the caller can skip
+/// items whose buffer isn't in our registry.
+fn apply_nicklist_item(
+    lists: &NickLists,
+    buffers: &BTreeMap<String, BufferMeta>,
+    item: &HdataItem,
+    is_diff: bool,
+) {
+    // ptrs[0] is the buffer pointer, ptrs[1] is the nicklist_item pointer.
+    let buf_ptr = match item.ptrs.first() {
+        Some(p) if p != "0" => p,
+        _ => return,
+    };
+    let Some(meta) = buffers.get(buf_ptr) else { return };
+    let name = match item.fields.get("name") {
+        Some(Object::Str(Some(s))) if !s.is_empty() => s.clone(),
+        _ => return,
+    };
+    let group = matches!(item.fields.get("group"), Some(Object::Char(1)));
+    // `group=1` items are nicklist headers (Ops / Voices / Members),
+    // not actual nicks. Skip them.
+    if group { return; }
+    let visible = matches!(item.fields.get("visible"), Some(Object::Char(1)));
+    if !visible { return; }
+    let mut map = lists.lock().unwrap();
+    let entry = map.entry(meta.full_name.clone()).or_default();
+    if is_diff {
+        let diff = match item.fields.get("_diff") {
+            Some(Object::Char(c)) => *c as char,
+            _ => '+',
+        };
+        match diff {
+            '-' => { entry.remove(&name); }
+            // '+' add, '*' update — either way ensure presence.
+            _   => { entry.insert(name); }
+        }
+    } else {
+        entry.insert(name);
+    }
 }
 
 /// One supervised session. Connects, handshakes, lists buffers,
@@ -711,6 +796,7 @@ fn run_persistent(
     db: &Arc<crate::database::Database>,
     source_id: i64,
     messages_dirty: &Arc<AtomicBool>,
+    nick_lists: &NickLists,
 ) -> Result<(), String> {
     let secrets = load_relay_secrets();
     let host = secrets.host.ok_or("WEECHAT_RELAY_HOST missing")?;
@@ -778,6 +864,30 @@ fn run_persistent(
     }
     db.update_source_sync_time(source_id);
 
+    // Seed nick lists. One round-trip pulls every visible nick across
+    // every buffer; `_nicklist_diff` push events keep it current after
+    // that. Wipe the shared map first so a reconnect doesn't leave
+    // stale nicks for closed buffers.
+    {
+        let mut map = nick_lists.lock().unwrap();
+        map.clear();
+    }
+    if conn.nicklist_all().is_ok() {
+        if let Ok((id, objs)) = conn.read_message() {
+            if id == "nicks" {
+                for obj in objs {
+                    if let Object::Hdata(h) = obj {
+                        for it in &h.items {
+                            apply_nicklist_item(nick_lists, &buffers, it, false);
+                        }
+                    }
+                }
+                let total: usize = nick_lists.lock().unwrap().values().map(|s| s.len()).sum();
+                crate::log::info(&format!("weechat-relay: nicklist seeded ({} nicks)", total));
+            }
+        }
+    }
+
     // Subscribe to all live buffers. From here on the server pushes
     // `_buffer_line_added`, `_buffer_opened`, `_buffer_closing`,
     // `_nicklist_diff`, etc. read_message() blocks until something
@@ -842,8 +952,16 @@ fn run_persistent(
                     }
                 }
             }
-            // _buffer_renamed, _buffer_moved, _nicklist_diff, etc. —
-            // ignore for now (M6 polish).
+            "_nicklist_diff" => {
+                for obj in objs {
+                    if let Object::Hdata(h) = obj {
+                        for it in &h.items {
+                            apply_nicklist_item(nick_lists, &buffers, it, true);
+                        }
+                    }
+                }
+            }
+            // _buffer_renamed, _buffer_moved, etc. — ignore for now.
             _ => {}
         }
     }
@@ -857,6 +975,7 @@ pub fn spawn_supervisor(
     db: Arc<crate::database::Database>,
     source_id: i64,
     messages_dirty: Arc<AtomicBool>,
+    nick_lists: NickLists,
 ) {
     std::thread::Builder::new()
         .name("weechat-relay-supervisor".to_string())
@@ -866,7 +985,7 @@ pub fn spawn_supervisor(
             let mut backoff = initial;
             loop {
                 let started = std::time::Instant::now();
-                let err = run_persistent(&db, source_id, &messages_dirty).err();
+                let err = run_persistent(&db, source_id, &messages_dirty, &nick_lists).err();
                 let ran_for = started.elapsed();
                 if ran_for > Duration::from_secs(60) {
                     backoff = initial;
@@ -912,6 +1031,26 @@ fn classify_buffer(full_name: &str) -> (&'static str, &'static str) {
     else if full_name.starts_with("irc.")       { ("irc",     "IRC")     }
     else if full_name.starts_with("python.whatsapp.") { ("whatsapp", "WhatsApp") }
     else                                        { ("other",   "Weechat") }
+}
+
+/// True if `tags_array` contains any of `needles`. Used to filter
+/// out structural lines (joins/parts/topics) before they hit the DB.
+fn tags_contain_any(field: Option<&Object>, needles: &[&str]) -> bool {
+    let Some(Object::Array(items)) = field else { return false };
+    for it in items {
+        let Object::Str(Some(s)) = it else { continue };
+        if needles.iter().any(|n| s == n) { return true; }
+    }
+    false
+}
+
+/// True if `tags_array` contains any tag in `needles`. For use when
+/// we care about specific tags by name (action types, etc.). Same
+/// signature as `tags_contain_any` but kept separate so the call
+/// sites read clearly.
+fn tags_has(field: Option<&Object>, tag: &str) -> bool {
+    let Some(Object::Array(items)) = field else { return false };
+    items.iter().any(|it| matches!(it, Object::Str(Some(s)) if s == tag))
 }
 
 /// Extract the canonical author nick from a `tags_array` field. Weechat
