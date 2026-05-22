@@ -15,6 +15,11 @@ pub struct Filters {
     pub is_read: Option<bool>,
     pub is_starred: Option<bool>,
     pub folder: Option<String>,
+    /// `folder LIKE %pattern%` (with `%` wildcards added around the
+    /// value). Pipe-separated for OR-of-LIKE matching — same shape
+    /// as `sender_pattern`. Set when a view rule has
+    /// `field=folder, op=like`.
+    pub folder_pattern: Option<String>,
     pub sender_pattern: Option<String>,
     pub source_type: Option<String>,
     pub content_pattern: Option<String>,
@@ -383,6 +388,21 @@ impl Database {
         if let Some(ref folder) = filters.folder {
             sql.push_str(" AND folder = ?");
             param_values.push(Box::new(folder.clone()));
+        }
+
+        if let Some(ref pattern) = filters.folder_pattern {
+            // `|`-separated alternatives → OR of LIKE. Mirrors
+            // sender_pattern. Each part is wrapped in `%…%` so the
+            // view config can say `python.slack.` and match every
+            // Slack channel buffer.
+            let parts: Vec<&str> = pattern.split('|').collect();
+            let conditions: Vec<String> = parts.iter()
+                .map(|_| "folder LIKE ?".to_string())
+                .collect();
+            sql.push_str(&format!(" AND ({})", conditions.join(" OR ")));
+            for p in &parts {
+                param_values.push(Box::new(format!("%{}%", p.trim())));
+            }
         }
 
         if let Some(ref pattern) = filters.sender_pattern {
