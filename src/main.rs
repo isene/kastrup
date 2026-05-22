@@ -696,6 +696,10 @@ struct App {
     /// latest-message). Persisted per-view as `section_order_<key>`
     /// in the settings table. Reloaded on view switch.
     current_section_order: Vec<String>,
+    /// Per-buffer nick set populated by the weechat-relay supervisor.
+    /// Held here so future @-completion in compose can read it
+    /// without re-fetching from the relay each time.
+    nick_lists: sources::weechat_relay::NickLists,
 
     // Background poller
     poller: Option<poller::Poller>,
@@ -912,9 +916,13 @@ fn main() {
     // M5: long-lived push connection to the weechat relay. Replaces
     // the 2-min poll path with kernel-parked blocking reads — zero
     // userspace cycles when idle, real-time delivery when active.
+    // The shared `nick_lists` map is populated by the supervisor and
+    // later read by the App for @-completion (M6.3).
+    let nick_lists: sources::weechat_relay::NickLists =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Some(sid) = weechat_relay_source_id {
         sources::weechat_relay::spawn_supervisor(
-            db.clone(), sid, messages_dirty.clone(),
+            db.clone(), sid, messages_dirty.clone(), nick_lists.clone(),
         );
     }
     let writer_mailfile = mailfile_cfg_main.clone();
@@ -1055,6 +1063,7 @@ fn main() {
         display_messages: Vec::new(),
         section_collapsed: HashMap::new(),
         current_section_order: Vec::new(),
+        nick_lists: nick_lists.clone(),
         poller: None,
         poller_rx: None,
         write_tx,
@@ -1510,6 +1519,14 @@ impl App {
         // instead. It's a small loop, runs once per render, no DB hop.
         let total = self.filtered_messages.len() as i64;
         let unread = self.filtered_messages.iter().filter(|m| !m.read).count() as i64;
+        // Unread highlights = mentions/pings still un-read in this view.
+        // Surfaced in the top bar as `!K` so a glance at the strip
+        // tells you whether the current view has anything that
+        // actually wants your attention vs. ambient chatter.
+        let highlights = self.filtered_messages.iter()
+            .filter(|m| !m.read
+                && m.metadata.get("highlight").and_then(|v| v.as_bool()) == Some(true))
+            .count() as i64;
 
         let tc = &self.config.theme_colors;
         let view_label = if let Some(ref folder) = self.active_folder {
@@ -1580,9 +1597,15 @@ impl App {
             style::fg(" [0/0]", tc.info_fg)
         };
 
-        let right_info = style::fg(
-            &format!("{} unread / {} msgs", unread, total), tc.info_fg
-        );
+        let right_info = if highlights > 0 {
+            format!(
+                "{}  {}",
+                style::fg(&format!("!{}", highlights), tc.unread),
+                style::fg(&format!("{} unread / {} msgs", unread, total), tc.info_fg),
+            )
+        } else {
+            style::fg(&format!("{} unread / {} msgs", unread, total), tc.info_fg)
+        };
 
         // Build top bar: " Kastrup - [key] ViewName [Sort] [Mode] [pos] ... N unread / T msgs"
         let prefix = style::fg(" Kastrup - ", tc.prefix_fg);
@@ -1656,7 +1679,14 @@ impl App {
             .copied()
             .unwrap_or(self.group_by_folder);
         let arrow = if is_collapsed { "\u{25B8}" } else { "\u{25BE}" };
-        let unread_mark = if !msg.read {
+        // Section header carries `highlight_count` in metadata so the
+        // renderer can swap the unread `*` for a louder `!` when at
+        // least one unread mention/ping lives inside.
+        let highlight_count = msg.metadata.get("highlight_count")
+            .and_then(|v| v.as_u64()).unwrap_or(0);
+        let unread_mark = if highlight_count > 0 {
+            style::fg(" !", tc.unread)
+        } else if !msg.read {
             style::fg(" *", tc.unread)
         } else {
             String::new()
@@ -3225,6 +3255,16 @@ impl App {
                 .unwrap_or(self.group_by_folder);
             let mut header = Message::default_header();
             header.subject = Some(section.display_name.clone());
+            // Count UNREAD highlights inside the section so the header
+            // can show `!` instead of `*` when at least one mention is
+            // waiting. metadata.`highlight` is set by the weechat-relay
+            // source when the relay flagged the line for the user.
+            let highlight_count: u64 = section.messages.iter()
+                .filter_map(|&i| self.filtered_messages.get(i))
+                .filter(|m| !m.read
+                    && m.metadata.get("highlight").and_then(|v| v.as_bool()) == Some(true))
+                .count() as u64;
+            header.metadata = serde_json::json!({ "highlight_count": highlight_count });
             // Compact `[N/M]` counter so a wall of collapsed channels
             // stays readable. The `*` unread marker on the right is
             // appended by `format_section_header`.
