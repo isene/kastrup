@@ -1,4 +1,5 @@
 mod chat_send;
+mod completion_ipc;
 mod config;
 mod database;
 mod log;
@@ -432,6 +433,17 @@ fn parse_chat_attachments(data: &str) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+/// `/me <action>` → Some(action) with the prefix stripped; else None.
+/// Single-line body only (multi-line messages with a `/me` first line
+/// are treated as regular messages — Slack's chat.meMessage doesn't
+/// accept newlines in the action text). Trailing whitespace stripped.
+fn strip_me_prefix(body: &str) -> Option<&str> {
+    let trimmed = body.trim_end();
+    if trimmed.contains('\n') { return None; }
+    let action = trimmed.strip_prefix("/me ")?.trim_start();
+    if action.is_empty() { None } else { Some(action) }
 }
 
 /// Body of a chat draft: everything after the first blank line.
@@ -1157,6 +1169,12 @@ fn main() {
             nick_lists.clone(), subscribed_buffers.clone(),
         );
     }
+    // Editor completion socket at ~/.kastrup/completion.sock.
+    // Blocking accept loop on a worker thread; only consumes cycles
+    // when an editor actively connects to ask for @nick / #channel
+    // matches. Safe to start unconditionally — bind failures (e.g.
+    // ~/.kastrup unwritable) silently no-op.
+    completion_ipc::start_server(nick_lists.clone(), subscribed_buffers.clone());
     let writer_mailfile = mailfile_cfg_main.clone();
     let writer_handle = std::thread::spawn(move || {
         while let Ok(op) = write_rx.recv() {
@@ -7471,7 +7489,14 @@ impl App {
             .ok_or_else(|| "no SLACK_API_TOKEN in ~/.kastrup/.env".to_string())?;
         let cookie = secrets.slack_cookie.as_deref();
         let channel_id = chat_send::slack_resolve_channel(token, cookie, &channel_raw)?;
-        chat_send::send_slack(token, cookie, &channel_id, &body)?;
+        // /me action: route to chat.meMessage with the prefix stripped.
+        // Matches IRC convention; Slack renders these in italics with no
+        // leading nick, same as wee-slack's `/me` does.
+        if let Some(action) = strip_me_prefix(&body) {
+            chat_send::send_slack_me(token, cookie, &channel_id, action)?;
+        } else {
+            chat_send::send_slack(token, cookie, &channel_id, &body)?;
+        }
         // Attachments: one Slack `files.upload` per `Attach:` header.
         // Posted after the main message so they appear visually below
         // it. Each upload uses the same Bearer/Cookie auth as the
@@ -7493,15 +7518,67 @@ impl App {
 
     /// Send a discord-kind draft via webhook or bot API.
     /// Channel: targets — channel:<id>, dm:<userId>, webhook:<name>.
+    /// Attach: headers (one per line, ~ expanded) upload alongside the
+    /// message body via a single multipart POST so the file(s) and the
+    /// caption appear as one Discord message instead of two.
     fn send_discord_draft(&self, data: &str) -> Result<String, String> {
         let target = parse_chat_channel(data)
             .ok_or_else(|| "missing Channel: header".to_string())?;
         let body = parse_chat_body(data);
-        if body.is_empty() {
+        let attachments = parse_chat_attachments(data);
+        let live_attachments: Vec<std::path::PathBuf> = attachments.into_iter()
+            .filter(|p| {
+                if p.exists() { true }
+                else { log::info(&format!("discord: skipping attach (not found): {}", p.display())); false }
+            })
+            .collect();
+        if body.is_empty() && live_attachments.is_empty() {
             return Err("body is empty".to_string());
         }
         let secrets = chat_send::load_secrets();
-        chat_send::send_discord(&secrets, &target, &body)
+        // Discord has no native /me — convert to italicised third-person
+        // text. Underscore-wrapping renders as italics across desktop /
+        // mobile / web clients and stays readable in raw form too.
+        let effective_body: String = match strip_me_prefix(&body) {
+            Some(action) => format!("_{}_", action),
+            None => body.clone(),
+        };
+        if live_attachments.is_empty() {
+            // Plain text send — single API call.
+            return chat_send::send_discord(&secrets, &target, &effective_body);
+        }
+
+        // Attachment path: one multipart POST per target type, so the
+        // file(s) and caption land as a single Discord message.
+        let target_t = target.trim();
+        if let Some(name) = target_t.strip_prefix("webhook:") {
+            let key = name.trim().to_ascii_lowercase();
+            let url = secrets.discord_webhooks.get(&key)
+                .ok_or_else(|| format!("no DISCORD_WEBHOOK_{} in ~/.kastrup/.env",
+                    key.to_ascii_uppercase()))?;
+            chat_send::discord_upload_files_to_webhook(url, &effective_body, &live_attachments)?;
+            return Ok(format!("webhook:{}", key));
+        }
+        if let Some(cid) = target_t.strip_prefix("channel:") {
+            let token = secrets.discord_bot_token.as_ref()
+                .ok_or_else(|| "DISCORD_BOT_TOKEN not set".to_string())?;
+            chat_send::discord_upload_files_to_channel(token, cid.trim(), &effective_body, &live_attachments)?;
+            return Ok(format!("channel:{}", cid.trim()));
+        }
+        if let Some(uid) = target_t.strip_prefix("dm:") {
+            let token = secrets.discord_bot_token.as_ref()
+                .ok_or_else(|| "DISCORD_BOT_TOKEN not set".to_string())?;
+            let cid = chat_send::discord_create_dm_pub(token, uid.trim())?;
+            chat_send::discord_upload_files_to_channel(token, &cid, &effective_body, &live_attachments)?;
+            return Ok(format!("dm:{}", uid.trim()));
+        }
+        if target_t.chars().all(|c| c.is_ascii_digit()) {
+            let token = secrets.discord_bot_token.as_ref()
+                .ok_or_else(|| "DISCORD_BOT_TOKEN not set".to_string())?;
+            chat_send::discord_upload_files_to_channel(token, target_t, &effective_body, &live_attachments)?;
+            return Ok(format!("channel:{}", target_t));
+        }
+        Err(format!("unrecognised discord target: {}", target_t))
     }
 
     /// Send a weechat-kind draft. Connects to the relay, types the
@@ -8476,13 +8553,27 @@ impl App {
                 if !cached.exists() {
                     self.set_feedback(&format!("Downloading {}…", name),
                         self.config.theme_colors.feedback_info);
+                    let source_type = att.get("source_type").and_then(|v| v.as_str()).unwrap_or("slack");
                     let secrets = chat_send::load_secrets();
                     let mut req = ureq::get(url);
-                    if let Some(t) = secrets.slack_token.as_deref() {
-                        req = req.set("Authorization", &format!("Bearer {}", t));
-                    }
-                    if let Some(c) = secrets.slack_cookie.as_deref() {
-                        req = req.set("Cookie", &format!("d={}", c));
+                    // Slack: files.slack.com URLs need Bearer + d-cookie auth.
+                    // Discord CDN, Instagram CDN: URLs are pre-signed (or
+                    // public) — adding auth headers can cause 4xx responses
+                    // and leaks the Slack credential to unrelated origins.
+                    match source_type {
+                        "slack" => {
+                            if let Some(t) = secrets.slack_token.as_deref() {
+                                req = req.set("Authorization", &format!("Bearer {}", t));
+                            }
+                            if let Some(c) = secrets.slack_cookie.as_deref() {
+                                req = req.set("Cookie", &format!("d={}", c));
+                            }
+                        }
+                        "discord" => {
+                            req = req.set("User-Agent",
+                                "kastrup (https://github.com/isene/kastrup, 0.1)");
+                        }
+                        _ => {}
                     }
                     match req.call() {
                         Ok(resp) => {

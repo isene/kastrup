@@ -77,13 +77,27 @@ pub fn sync_discord(_config: &serde_json::Value, known_ids: &HashSet<String>) ->
             let ts_iso = m["timestamp"].as_str().unwrap_or("");
             let timestamp = parse_iso8601_to_unix(ts_iso).unwrap_or(0);
 
-            // attachments → JSON array of {filename, url, size}
+            // attachments → JSON array of {filename, url, size, content_type,
+            // kastrup_remote, source_type}. kastrup_remote+source_type tell
+            // the V/v fetch path to download directly from Discord's CDN
+            // (no auth — URLs are pre-signed) instead of expecting a
+            // maildir on disk.
             let attachments: Vec<serde_json::Value> = m["attachments"].as_array()
-                .map(|arr| arr.iter().map(|a| serde_json::json!({
-                    "filename": a["filename"].as_str().unwrap_or(""),
-                    "url":      a["url"].as_str().unwrap_or(""),
-                    "size":     a["size"].as_i64().unwrap_or(0),
-                })).collect())
+                .map(|arr| arr.iter().enumerate().map(|(i, a)| {
+                    let filename = a["filename"].as_str().unwrap_or("");
+                    let ct = a["content_type"].as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| guess_content_type(filename));
+                    serde_json::json!({
+                        "filename":       filename,
+                        "url":            a["url"].as_str().unwrap_or(""),
+                        "size":           a["size"].as_i64().unwrap_or(0),
+                        "content_type":   ct,
+                        "file_id":        format!("{}_{}", mid, i),
+                        "kastrup_remote": true,
+                        "source_type":    "discord",
+                    })
+                }).collect())
                 .unwrap_or_default();
 
             // Carry channel + author IDs in metadata so the reply
@@ -141,6 +155,34 @@ fn fetch_self_id(auth: &str) -> Option<String> {
         .into_string().ok()?;
     let v: serde_json::Value = serde_json::from_str(&resp).ok()?;
     v["id"].as_str().map(|s| s.to_string())
+}
+
+/// Cheap MIME guess from filename extension. Discord's API only
+/// populates `content_type` for newer uploads; older attachments
+/// arrive with the field absent. The V/v image check at fetch
+/// time needs `content_type` OR an image-suffix filename, so we
+/// fill in the gap here rather than at the call site.
+fn guess_content_type(filename: &str) -> String {
+    let ext = filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png"           => "image/png",
+        "jpg" | "jpeg"  => "image/jpeg",
+        "gif"           => "image/gif",
+        "webp"          => "image/webp",
+        "bmp"           => "image/bmp",
+        "tiff" | "tif"  => "image/tiff",
+        "svg"           => "image/svg+xml",
+        "mp4"           => "video/mp4",
+        "webm"          => "video/webm",
+        "mov"           => "video/quicktime",
+        "mp3"           => "audio/mpeg",
+        "ogg"           => "audio/ogg",
+        "wav"           => "audio/wav",
+        "pdf"           => "application/pdf",
+        "txt"           => "text/plain",
+        "json"          => "application/json",
+        _               => "application/octet-stream",
+    }.to_string()
 }
 
 fn list_dm_channels(auth: &str) -> Option<Vec<serde_json::Value>> {

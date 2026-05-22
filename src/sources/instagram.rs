@@ -196,8 +196,18 @@ fn extract_content(item: &serde_json::Value, item_type: &str) -> String {
     }
 }
 
-fn extract_attachments(item: &serde_json::Value, item_type: &str, _item_id: &str) -> Vec<serde_json::Value> {
+fn extract_attachments(item: &serde_json::Value, item_type: &str, item_id: &str) -> Vec<serde_json::Value> {
     let mut attachments = Vec::new();
+    let push_remote = |list: &mut Vec<serde_json::Value>, url: &str, ctype: &str, name: &str, idx: usize| {
+        list.push(serde_json::json!({
+            "url":            url,
+            "content_type":   ctype,
+            "name":           name,
+            "file_id":        format!("{}_{}", item_id, idx),
+            "kastrup_remote": true,
+            "source_type":    "instagram",
+        }));
+    };
 
     let (media, name) = match item_type {
         "media" | "media_share" => {
@@ -221,11 +231,7 @@ fn extract_attachments(item: &serde_json::Value, item_type: &str, _item_id: &str
             let url = item.pointer("/animated_media/images/fixed_height/url")
                 .and_then(|u| u.as_str());
             if let Some(url) = url {
-                attachments.push(serde_json::json!({
-                    "url": url,
-                    "content_type": "image/gif",
-                    "name": "animation.gif",
-                }));
+                push_remote(&mut attachments, url, "image/gif", "animation.gif", 0);
             }
             return attachments;
         }
@@ -237,11 +243,7 @@ fn extract_attachments(item: &serde_json::Value, item_type: &str, _item_id: &str
                         .or_else(|| first.get("header_icon_url"))
                         .and_then(|u| u.as_str());
                     if let Some(url) = url {
-                        attachments.push(serde_json::json!({
-                            "url": url,
-                            "content_type": "image/jpeg",
-                            "name": "shared.jpg",
-                        }));
+                        push_remote(&mut attachments, url, "image/jpeg", "shared.jpg", 0);
                     }
                 }
             }
@@ -265,11 +267,7 @@ fn extract_attachments(item: &serde_json::Value, item_type: &str, _item_id: &str
                         Some(2) => "video/mp4",
                         _ => "image/jpeg",
                     };
-                    attachments.push(serde_json::json!({
-                        "url": url,
-                        "content_type": content_type,
-                        "name": name,
-                    }));
+                    push_remote(&mut attachments, url, content_type, name, 0);
                 }
             }
         }

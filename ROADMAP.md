@@ -1,6 +1,6 @@
 # Roadmap
 
-Snapshot as of v0.1.115. Items grouped by realistic scope. Tractable items get knocked off as time allows; "shelf" items need their own focused session each.
+Snapshot as of v0.1.117. Items grouped by realistic scope. Tractable items get knocked off as time allows; "shelf" items need their own focused session each.
 
 ## Recently shipped
 
@@ -17,34 +17,15 @@ Snapshot as of v0.1.115. Items grouped by realistic scope. Tractable items get k
 - **v0.1.113** — Tolerate lying charset declarations (sender says iso-8859-1, body is actually UTF-8).
 - **v0.1.114** — Killed a destructive second QP decode pass that mojibaked Norwegian bodies via accidental hex-digit pattern matching.
 - **v0.1.115** — Final cleanup of doc-comment examples that still leaked workspace/identity strings.
+- **v0.1.116** — M8.1: nested email threading (DFS-walk over `In-Reply-To` / `References` headers; indent rail in left pane).
+- **v0.1.117** — Pulled in glow v0.1.14: first inline image V on any new attachment drops from ~250-500 ms (magick subprocess) to ~10-50 ms (in-process `image` crate decode + Triangle resize + cell-aligned pad). Repeat shows already instant via Phase 1 disk PNG cache (glow v0.1.13).
+- **v0.1.118** — M8.2 (v/V across all chat sources): Discord and Instagram attachment objects now carry `kastrup_remote: true` and `source_type` so the unified fetch path downloads from their CDNs without leaking Slack auth headers. Discord file send: `.discord` drafts gain `Attach:` headers and post via a single `multipart/form-data` to `POST /channels/<id>/messages` (bot, webhook, or DM target). `/me` send: bodies starting with `/me ` route to Slack `chat.meMessage`, Discord `_italic_` markdown, and weechat's native `input` handler (IRC `ACTION` / Slack action). Editor completion socket at `~/.kastrup/completion.sock` — scribe/vim can query `NICKS [substr]`, `NICKS_IN <folder> [substr]`, `CHANNELS [substr]` over a Unix-domain socket; one-shot request/response, no polling.
 
 ## Tractable next (small/medium, ~half-day each)
 
-### `O` action on Discord / Messenger / Instagram attachments
-
-`O` (download attachment) currently knows how to fetch Slack file URLs with the Bearer + cookie auth. Other chat sources have their own attachment shapes (Discord CDN URLs, Marionette-scraped Instagram payloads) and need their own handlers. The `enrich_attachments_from_chat_urls` hook is the right place to extend.
-
-### File send to Discord
-
-The pattern is the same as Slack file send (`.discord` drafts gain `Attach:` headers, post via multipart upload to the channel). Implementation: roughly the Slack code mirrored against Discord's `POST /channels/<id>/messages` with `multipart/form-data`. ~150 lines.
-
-### Compose-side editor IPC for true @-completion
-
-The current `Ctrl+N` / `Ctrl+G` pickers copy to clipboard for paste. A nicer flow: scribe (or whatever `$EDITOR` is) asks kastrup for a live nick/channel snapshot over a Unix socket when the user types `@<tab>` or `#<tab>`. Editor-side work, but the kastrup side is just a small reader server that exposes `nick_lists` / `subscribed_buffers`.
-
-### `/me` action send
-
-Currently kastrup can RENDER incoming `/me` actions but can't SEND one. A `Channel:` line plus a body starting with `/me` should route to the relay's `input` command with the action prefix preserved, and to Slack via `chat.meMessage`.
+_None at the moment — all previously-tractable items shipped in v0.1.118._
 
 ## Shelf items (multi-day, each its own session)
-
-### glow image speedup
-
-Three phases, all in the [glow](https://github.com/isene/glow) repo, not kastrup.
-
-- **Phase 1**: disk-persisted PNG cache so kastrup launches don't re-convert every image. Cache keyed by content hash.
-- **Phase 2**: replace external converters (`magick` / `montage`) with the Rust `image` crate. Cuts per-image fork cost and dependency.
-- **Phase 3**: idle preconvert in a background thread so the next image is ready before the user navigates to it.
 
 ### scroll → Servo embed
 
@@ -62,9 +43,13 @@ A key to edit, another to delete one's own message in Slack/Discord. Slack: `cha
 
 The Marionette-driven Python plugins are the only path for these — no public API. Either extend the plugin protocol with an `upload` template, or skip until the user actually needs it.
 
-### Threaded conversations as nested replies
+### Slack thread parent/child
 
-Slack thread parent/child support. Currently messages in a thread share the parent's folder but lose the parent→child relationship. Would require `thread_ts` capture at insert time and a tree-render mode in Folders/Threaded view.
+Currently Slack messages in a thread share the parent's folder but lose the parent→child relationship (the wee-slack relay's `tags_array` doesn't carry `slack_thread_ts`). Would need either a Slack-API-side enrichment pass or upstream wee-slack changes before the M8.1-style nested view extends to chat.
+
+## Done (recent, not re-listed above)
+
+- **glow image speedup** — Phases 1 (disk PNG cache) + 2 (Rust `image` crate) shipped 2026-05-22. Phase 3 (idle preconvert thread) **shelved per battery-first directive**: would fire image decode + disk-write on every cursor move for messages the user may never V open, against "hot paths must be cold when idle." The remaining ~30 ms latency on the first show of any new image is below user-perception threshold.
 
 ## Out of scope (intentionally)
 
