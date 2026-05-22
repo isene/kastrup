@@ -2,12 +2,21 @@ use super::MessageData;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-/// Sync Messenger DMs via Heathrow's Marionette-based Python script.
+/// Sync Messenger DMs via a Marionette-based Python script.
 /// Connects to a running Firefox instance on Marionette port 2828,
 /// scrapes the Messenger tab for thread list and snippets.
-pub fn sync_messenger(_config: &serde_json::Value, known_ids: &HashSet<String>) -> Vec<MessageData> {
-    let script_path = home_dir()
-        .join("Main/G/GIT-isene/heathrow/lib/heathrow/sources/messenger_fetch_marionette.py");
+///
+/// The Python script's path is read from the source's `config`:
+///
+///     { "fetch_script": "~/.kastrup/plugins/messenger_fetch.py" }
+///
+/// `~/` and `$HOME` are expanded. Default if unset:
+/// `~/.kastrup/plugins/messenger_fetch.py`. Function is a no-op
+/// when the script doesn't exist.
+pub fn sync_messenger(config: &serde_json::Value, known_ids: &HashSet<String>) -> Vec<MessageData> {
+    let script_path = resolve_fetch_script(
+        config, "fetch_script", "messenger_fetch.py",
+    );
     if !script_path.exists() { return Vec::new(); }
 
     // Run with timeout to avoid hanging
@@ -165,4 +174,30 @@ fn now_secs() -> i64 {
 
 fn home_dir() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Resolve a fetch-script path from the source's JSON config. Looks
+/// for the `config_key` field first; if absent or empty, falls back
+/// to `~/.kastrup/plugins/<default_name>`. Tilde and `$HOME` are
+/// expanded so users can write portable config.
+pub(super) fn resolve_fetch_script(
+    config: &serde_json::Value,
+    config_key: &str,
+    default_name: &str,
+) -> PathBuf {
+    if let Some(p) = config.get(config_key).and_then(|v| v.as_str()) {
+        let p = p.trim();
+        if !p.is_empty() { return expand_tilde(p); }
+    }
+    home_dir().join(".kastrup").join("plugins").join(default_name)
+}
+
+fn expand_tilde(p: &str) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        return home_dir().join(rest);
+    }
+    if let Some(rest) = p.strip_prefix("$HOME/") {
+        return home_dir().join(rest);
+    }
+    PathBuf::from(p)
 }
