@@ -5,6 +5,7 @@ pub mod messenger;
 pub mod instagram;
 pub mod discord;
 pub mod slack;
+pub mod weechat_relay;
 
 /// Data for a single message from any source plugin.
 /// Used by pollers to pass parsed messages to the database layer.

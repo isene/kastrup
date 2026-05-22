@@ -68,6 +68,11 @@ enum DraftKind {
     Email,
     Slack,
     Discord,
+    /// Any channel/room reachable through the weechat relay: IRC
+    /// channels, Slack-via-weechat, Matrix rooms, Discord-bridge
+    /// mirrors, etc. `Channel:` header carries the buffer's
+    /// `full_name` (e.g. `python.slack.dualog.#general`).
+    Weechat,
 }
 
 impl DraftKind {
@@ -76,6 +81,7 @@ impl DraftKind {
             DraftKind::Email   => "email",
             DraftKind::Slack   => "slack",
             DraftKind::Discord => "discord",
+            DraftKind::Weechat => "weechat",
         }
     }
 
@@ -85,6 +91,7 @@ impl DraftKind {
             DraftKind::Email   => "Subject",
             DraftKind::Slack   => "Channel",
             DraftKind::Discord => "Channel",
+            DraftKind::Weechat => "Channel",
         }
     }
 
@@ -94,6 +101,7 @@ impl DraftKind {
         match p.extension().and_then(|e| e.to_str()) {
             Some("slack")   => DraftKind::Slack,
             Some("discord") => DraftKind::Discord,
+            Some("weechat") => DraftKind::Weechat,
             _               => DraftKind::Email,
         }
     }
@@ -162,6 +170,7 @@ fn parse_draft_preview(data: &str, kind: DraftKind) -> (String, String) {
             DraftKind::Email   => "(no subject)".to_string(),
             DraftKind::Slack   => "(no channel)".to_string(),
             DraftKind::Discord => "(no channel)".to_string(),
+            DraftKind::Weechat => "(no channel)".to_string(),
         };
     }
     (subject, body_preview)
@@ -181,6 +190,36 @@ fn parse_chat_channel(data: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Map a wee-slack relay folder name to a Slack Web API target
+/// string suitable for the `.slack` draft `Channel:` header. Used to
+/// route Slack replies through the API (always reaches the workspace)
+/// instead of the relay (which silently drops messages to closed DM
+/// buffers). Returns None for non-Slack folders so the caller keeps
+/// using the relay for IRC / Discord-bridge / Matrix.
+///
+/// Folder layout from wee-slack: `python.slack.<workspace>.<chan>`
+/// where `<chan>` is one of:
+///   - `#name`  → public/private channel (pass through unchanged)
+///   - `&name`  → wee-slack private channel; API treats as `#name`
+///   - `Name`   → DM with a single user → `@Name`
+///   - `a,b,c`  → multi-party DM → `mpdm:a,b,c` (resolved into a
+///                conversation by `slack_resolve_channel`)
+fn slack_target_from_weechat_folder(folder: &str) -> Option<String> {
+    let rest = folder.strip_prefix("python.slack.")?;
+    let (_workspace, chan) = rest.split_once('.')?;
+    if chan.is_empty() { return None; }
+    if let Some(name) = chan.strip_prefix('#') {
+        return Some(format!("#{}", name));
+    }
+    if let Some(name) = chan.strip_prefix('&') {
+        return Some(format!("#{}", name));
+    }
+    if chan.contains(',') {
+        return Some(format!("mpdm:{}", chan));
+    }
+    Some(format!("@{}", chan))
 }
 
 /// Body of a chat draft: everything after the first blank line.
@@ -652,6 +691,11 @@ struct App {
     group_by_folder: bool,
     display_messages: Vec<Message>,
     section_collapsed: HashMap<String, bool>,
+    /// User-pinned section order for the current view. Sections in
+    /// this list rank above unpinned ones (which then sort by
+    /// latest-message). Persisted per-view as `section_order_<key>`
+    /// in the settings table. Reloaded on view switch.
+    current_section_order: Vec<String>,
 
     // Background poller
     poller: Option<poller::Poller>,
@@ -684,6 +728,31 @@ fn ensure_discord_source(db: &Arc<Database>) {
     );
 }
 
+/// Auto-register a Weechat-Relay source if the connection triplet is
+/// present in `~/.kastrup/.env`. Mirrors live IRC + Slack channels +
+/// Discord-bridge + Matrix rooms (anything weechat sees) into kastrup
+/// as DB messages, one folder per buffer. As of M5, transport is a
+/// long-lived push connection driven by `spawn_weechat_relay_supervisor`;
+/// poll_interval is set very large so the regular poller skips it.
+fn ensure_weechat_relay_source(db: &Arc<Database>) -> Option<i64> {
+    let secrets = sources::weechat_relay::load_secrets_for_main();
+    if !secrets.has_all() { return None; }
+    let existing = db.get_sources(false);
+    if let Some(s) = existing.iter().find(|s| s.plugin_type == "weechat-relay") {
+        return Some(s.id);
+    }
+    db.add_source(
+        "WeeChat Relay",
+        "weechat-relay",
+        "{}",
+        "[\"read\"]",
+        86400,    // 1 day — push connection does the real work
+    );
+    db.get_sources(false).into_iter()
+        .find(|s| s.plugin_type == "weechat-relay")
+        .map(|s| s.id)
+}
+
 /// Auto-register a Slack polling source the first time we see a user
 /// token (via `SLACK_API_TOKEN` in `~/.kastrup/.env`, or the weechat
 /// fallback). Idempotent.
@@ -702,6 +771,55 @@ fn ensure_slack_source(db: &Arc<Database>) {
 }
 
 fn main() {
+    // --weechat-probe: M1 one-shot wire test for the relay client.
+    // Hijacks main() before any TUI / DB init so the output goes
+    // straight to stdout/stderr with no alt-screen interference.
+    if std::env::args().any(|a| a == "--weechat-probe") {
+        match sources::weechat_relay::probe() {
+            Ok(_) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("weechat-probe FAILED: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+    // --weechat-tail <buffer>: M2 — print last 20 lines of a
+    // buffer + subscribe + tail forever. Buffer arg matches full_name
+    // exactly, or case-insensitive contains as a fallback.
+    {
+        let cli: Vec<String> = std::env::args().collect();
+        if let Some(i) = cli.iter().position(|a| a == "--weechat-tail") {
+            let buf = cli.get(i + 1).cloned().unwrap_or_default();
+            if buf.is_empty() {
+                eprintln!("usage: kastrup --weechat-tail <buffer-full-name>");
+                std::process::exit(2);
+            }
+            match sources::weechat_relay::tail(&buf) {
+                Ok(_) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("weechat-tail FAILED: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        // --weechat-tags <buffer>: diagnostic — dump raw prefix bytes
+        // and tags_array for the last 5 lines of a buffer. Used when
+        // sender-from-tags fallback turns up weird values.
+        if let Some(i) = cli.iter().position(|a| a == "--weechat-tags") {
+            let buf = cli.get(i + 1).cloned().unwrap_or_default();
+            if buf.is_empty() {
+                eprintln!("usage: kastrup --weechat-tags <buffer-full-name>");
+                std::process::exit(2);
+            }
+            match sources::weechat_relay::dump_tags(&buf, 5) {
+                Ok(_) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("weechat-tags FAILED: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
     log::info(&format!("Kastrup v{} starting", env!("CARGO_PKG_VERSION")));
     // Parse CLI args: --compose-to EMAIL --subject SUBJECT, or mailto:URL
     let args: Vec<String> = std::env::args().collect();
@@ -762,6 +880,7 @@ fn main() {
     // next poll tick.
     ensure_discord_source(&db);
     ensure_slack_source(&db);
+    let weechat_relay_source_id = ensure_weechat_relay_source(&db);
     log_phase("ensure chat sources", &mut phase);
     let source_type_map = db.get_source_type_map();
     log_phase("source type map", &mut phase);
@@ -789,6 +908,15 @@ fn main() {
     let writer_db = db.clone();
     let messages_dirty = Arc::new(AtomicBool::new(false));
     let writer_dirty = messages_dirty.clone();
+
+    // M5: long-lived push connection to the weechat relay. Replaces
+    // the 2-min poll path with kernel-parked blocking reads — zero
+    // userspace cycles when idle, real-time delivery when active.
+    if let Some(sid) = weechat_relay_source_id {
+        sources::weechat_relay::spawn_supervisor(
+            db.clone(), sid, messages_dirty.clone(),
+        );
+    }
     let writer_mailfile = mailfile_cfg_main.clone();
     let writer_handle = std::thread::spawn(move || {
         while let Ok(op) = write_rx.recv() {
@@ -926,6 +1054,7 @@ fn main() {
         group_by_folder: false,
         display_messages: Vec::new(),
         section_collapsed: HashMap::new(),
+        current_section_order: Vec::new(),
         poller: None,
         poller_rx: None,
         write_tx,
@@ -1105,6 +1234,10 @@ impl App {
             "h" | "LEFT" => {
                 if self.show_threaded { self.collapse_current(); }
             }
+            "RIGHT" => {
+                if self.show_threaded { self.expand_current(); }
+            }
+            "a" => { self.mark_section_read(); }
             "HOME" => { self.go_first(); }
             "END" => { self.go_last(); }
             "PgDOWN" => { self.page_down(); }
@@ -1124,11 +1257,12 @@ impl App {
             "p" => { self.prev_unread(); }
             "J" => { self.jump_to_date(); }
             "G" => { self.cycle_view_mode(); }
-            "{" | "C-UP" => { /* move section - needs threading */ }
-            "}" | "C-DOWN" => { /* move section - needs threading */ }
+            "{" | "C-UP" => { self.move_section(-1); }
+            "}" | "C-DOWN" => { self.move_section(1); }
+            "C-HOME" => { self.reset_section_order(); }
 
             // View switching
-            "A" => { self.switch_to_view("A"); }
+            "=" => { self.switch_to_view("A"); }
             "N" => { self.switch_to_view("N"); }
             "S" => { self.search_command(); }
             "C-S" => { self.show_sources(); }
@@ -1147,7 +1281,7 @@ impl App {
 
             // Message operations
             "R" => { self.toggle_read(); }
-            "M" => { self.mark_all_read(); }
+            "A" => { self.mark_all_read(); }
             "*" | "-" => { self.toggle_star(); }
             "t" => { self.toggle_tag(); }
             "T" => { self.tag_all_toggle(); }
@@ -1520,26 +1654,50 @@ impl App {
         let is_collapsed = msg.thread_id.as_ref()
             .and_then(|name| self.section_collapsed.get(name))
             .copied()
-            .unwrap_or(false);
+            .unwrap_or(self.group_by_folder);
         let arrow = if is_collapsed { "\u{25B8}" } else { "\u{25BE}" };
         let unread_mark = if !msg.read {
             style::fg(" *", tc.unread)
         } else {
             String::new()
         };
-        let (icon, _scolor) = source_info(&msg.source_type, tc);
 
-        // Selection affects only the subject text: underline it when selected.
-        // Everything else keeps the same thread color so collapsed/selected
-        // rows visually match their neighbours.
-        let subject_styled = if selected {
-            style::underline(&style::bold(&style::fg(subject, tc.thread)))
-        } else {
-            style::bold(&style::fg(subject, tc.thread))
+        // Pick a chat-source theme colour from the display name (so a
+        // `slack.dualog.&team` header lights up in Slack colour, IRC
+        // channels in the IRC colour, etc.). For a non-chat folder we
+        // fall through to tc.thread.
+        let chat_source = chat_source_type_for_display(subject);
+        let (icon, _row) = source_info(chat_source.unwrap_or(&msg.source_type), tc);
+        let channel_color = match chat_source {
+            Some(st) => source_info(st, tc).1,
+            None => tc.thread,
         };
-        let prefix = style::bold(&style::fg(&format!("{} {} ", arrow, icon), tc.thread));
-        let suffix = style::bold(&style::fg(&format!(" [{}]", msg.content), tc.thread));
-        let content = format!("{}{}{}{}", prefix, subject_styled, suffix, unread_mark);
+
+        // Split the display name at the LAST `.` — everything up to
+        // and including that dot is dimmed (it's the workspace /
+        // network prefix); the tail is the actual channel name and
+        // keeps the source-themed colour. No dot → no split, the
+        // whole name uses the source colour.
+        let (dim_part, chan_part) = match subject.rfind('.') {
+            Some(idx) => (&subject[..=idx], &subject[idx + 1..]),
+            None      => ("", subject),
+        };
+        let chan_styled = if selected {
+            style::underline(&style::bold(&style::fg(chan_part, channel_color)))
+        } else {
+            style::bold(&style::fg(chan_part, channel_color))
+        };
+        let dim_styled = if dim_part.is_empty() {
+            String::new()
+        } else if selected {
+            style::underline(&style::fg(dim_part, tc.hint_fg))
+        } else {
+            style::fg(dim_part, tc.hint_fg)
+        };
+
+        let lead = style::bold(&style::fg(&format!("{} {} ", arrow, icon), tc.thread));
+        let suffix = style::fg(&format!(" [{}]", msg.content), tc.hint_fg);
+        let content = format!("{}{}{}{}{}", lead, dim_styled, chan_styled, suffix, unread_mark);
 
         // Trailing pad so the row bg fills the pane width; padding is not
         // underlined so the underline hugs just the subject.
@@ -1715,7 +1873,7 @@ impl App {
                     let is_collapsed = m.thread_id.as_ref()
                         .and_then(|name| self.section_collapsed.get(name))
                         .copied()
-                        .unwrap_or(false);
+                        .unwrap_or(self.group_by_folder);
                     lines.push(format!("{} {}", style::fg("State:", tc.header_date),
                         if is_collapsed { "Collapsed" } else { "Expanded" }));
                     lines.push(String::new());
@@ -2128,7 +2286,7 @@ impl App {
             format!(" {}", style::fg(msg, color))
         } else {
             style::fg(
-                " q:Quit | ?:Help | A:All | N:New | 0-9:Views | Space:Fold | t:Tag | T:All | s:Save | B:Browse | F:Fav",
+                " q:Quit | ?:Help | =:All | N:New | 0-9:Views | a/A:Read | Space:Fold | t/T:Tag | s:Save | B:Browse | F:Fav",
                 tc.hint_fg
             )
         };
@@ -2351,6 +2509,9 @@ impl App {
             Some("folders") => { self.show_threaded = true; self.group_by_folder = true; }
             _ => { self.show_threaded = false; self.group_by_folder = false; } // "flat" or unset
         }
+        // Restore per-view manual section order so the Folders view
+        // opens with channels in the order the user last arranged.
+        self.current_section_order = self.load_section_order(key);
 
         let mut filters = Filters::default();
 
@@ -2374,6 +2535,7 @@ impl App {
                         if let Some(rules) = f["rules"].as_array() {
                             for rule in rules {
                                 let field = rule["field"].as_str().unwrap_or("");
+                                let op    = rule["op"].as_str().unwrap_or("=");
                                 let value = &rule["value"];
                                 match field {
                                     "read" => {
@@ -2383,7 +2545,15 @@ impl App {
                                         filters.is_starred = value.as_bool();
                                     }
                                     "folder" => {
-                                        filters.folder = value.as_str().map(|s| s.to_string());
+                                        // `op=like` → LIKE %v%, possibly
+                                        // pipe-OR. Default (`=`) → exact.
+                                        if op == "like" {
+                                            filters.folder_pattern =
+                                                value.as_str().map(|s| s.to_string());
+                                        } else {
+                                            filters.folder =
+                                                value.as_str().map(|s| s.to_string());
+                                        }
                                     }
                                     "source_id" => {
                                         filters.source_id = value.as_i64();
@@ -2499,11 +2669,18 @@ impl App {
                         if let Some(rules) = f["rules"].as_array() {
                             for rule in rules {
                                 let field = rule["field"].as_str().unwrap_or("");
+                                let op    = rule["op"].as_str().unwrap_or("=");
                                 let value = &rule["value"];
                                 match field {
                                     "read" => { filters.is_read = Some(!value.as_bool().unwrap_or(true)); }
                                     "starred" => { filters.is_starred = value.as_bool(); }
-                                    "folder" => { filters.folder = value.as_str().map(|s| s.to_string()); }
+                                    "folder" => {
+                                        if op == "like" {
+                                            filters.folder_pattern = value.as_str().map(|s| s.to_string());
+                                        } else {
+                                            filters.folder = value.as_str().map(|s| s.to_string());
+                                        }
+                                    }
                                     "source_id" => { filters.source_id = value.as_i64(); }
                                     "sender" => { filters.sender_pattern = value.as_str().map(|s| s.to_string()); }
                                     "source_type" => { filters.source_type = value.as_str().map(|s| s.to_string()); }
@@ -3033,17 +3210,29 @@ impl App {
             return;
         }
         let sections = if self.group_by_folder {
-            organizer::organize_by_folder(&self.filtered_messages, self.sort_inverted)
+            organizer::organize_by_folder(&self.filtered_messages, self.sort_inverted, &self.current_section_order)
         } else {
             organizer::organize_messages(&self.filtered_messages, &self.sort_order, self.sort_inverted)
         };
 
         self.display_messages.clear();
         for section in &sections {
-            let is_collapsed = self.section_collapsed.get(&section.name).copied().unwrap_or(false);
+            // In Folders mode, default to COLLAPSED so the left pane
+            // looks like weechat's buflist (one row per channel). User
+            // toggles persist in section_collapsed and override the
+            // default for that section.
+            let is_collapsed = self.section_collapsed.get(&section.name).copied()
+                .unwrap_or(self.group_by_folder);
             let mut header = Message::default_header();
             header.subject = Some(section.display_name.clone());
-            header.content = format!("{} messages", section.messages.len());
+            // Compact `[N/M]` counter so a wall of collapsed channels
+            // stays readable. The `*` unread marker on the right is
+            // appended by `format_section_header`.
+            header.content = if section.unread_count > 0 {
+                format!("{}/{}", section.unread_count, section.messages.len())
+            } else {
+                format!("{}", section.messages.len())
+            };
             header.source_type = section.source_type.clone();
             header.is_header = true;
             header.read = section.unread_count == 0;
@@ -3126,7 +3315,12 @@ impl App {
         if was_on_child {
             self.section_collapsed.insert(name, true);
         } else {
-            let collapsed = self.section_collapsed.entry(name).or_insert(false);
+            // First touch of a never-toggled section: pretend it was at
+            // the current mode's default so the toggle flips correctly
+            // (collapsed → expanded in Folders mode, expanded → collapsed
+            // everywhere else).
+            let default_collapsed = self.group_by_folder;
+            let collapsed = self.section_collapsed.entry(name).or_insert(default_collapsed);
             *collapsed = !*collapsed;
         }
         self.index = header_ix;
@@ -3150,6 +3344,161 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Expand the section the cursor is currently on. Counterpart of
+    /// `collapse_current` — bound to `l`/Right for vim-style hjkl
+    /// navigation in Folders mode.
+    fn expand_current(&mut self) {
+        if !self.show_threaded { return; }
+        let Some(msg) = self.display_messages.get(self.index) else { return };
+        if !msg.is_header { return; }
+        let Some(name) = msg.thread_id.clone() else { return };
+        self.section_collapsed.insert(name, false);
+        self.rebuild_display();
+        self.render_all();
+    }
+
+    /// Load the user's hand-pinned section order for `view_key`. Stored
+    /// as `section_order_<key>` in the settings table as a JSON array
+    /// of folder names. Empty list when nothing's been pinned yet.
+    fn load_section_order(&self, view_key: &str) -> Vec<String> {
+        let setting_key = format!("section_order_{}", view_key);
+        let Some(raw) = self.db.get_setting(&setting_key) else { return Vec::new() };
+        serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
+    }
+
+    /// Persist the current section order for the current view.
+    fn save_section_order(&self) {
+        let setting_key = format!("section_order_{}", self.current_view);
+        let json = serde_json::to_string(&self.current_section_order).unwrap_or_else(|_| "[]".into());
+        self.db.set_setting(&setting_key, &json);
+    }
+
+    /// Discard the manual section order for the current view so
+    /// channels fall back to the default "latest message first" sort.
+    /// Bound to Ctrl+Home. Only meaningful in Folder-grouped view.
+    fn reset_section_order(&mut self) {
+        if !self.group_by_folder { return; }
+        if self.current_section_order.is_empty() {
+            self.set_feedback(
+                "No manual order set for this view",
+                self.config.theme_colors.feedback_info,
+            );
+            return;
+        }
+        self.current_section_order.clear();
+        self.save_section_order();
+        self.rebuild_display();
+        self.set_feedback(
+            "Section order reset to latest-first",
+            self.config.theme_colors.feedback_ok,
+        );
+        self.render_all();
+    }
+
+    /// Move the section under the cursor one slot up (delta=-1) or
+    /// down (delta=+1). Bound to Ctrl+Up / Ctrl+Down on a section
+    /// header. Persists the new order to settings. Only works in
+    /// Folder-grouped view — sections in Threaded view are derived
+    /// from subjects and don't have a stable folder identifier.
+    fn move_section(&mut self, delta: i32) {
+        if !self.group_by_folder { return; }
+        let Some(msg) = self.display_messages.get(self.index) else { return };
+        if !msg.is_header { return; }
+        let Some(section_name) = msg.thread_id.clone() else { return };
+
+        // Build the list of currently-visible section names in their
+        // current display order (used as the baseline for an order
+        // that has never been pinned).
+        let visible: Vec<String> = self.display_messages.iter()
+            .filter(|m| m.is_header)
+            .filter_map(|m| m.thread_id.clone())
+            .collect();
+
+        // Start from the persisted order, then append any visible
+        // section that isn't already in it. This lets a brand-new
+        // channel be moved up without having to touch every other
+        // channel first.
+        let mut order = self.current_section_order.clone();
+        for name in &visible {
+            if !order.contains(name) { order.push(name.clone()); }
+        }
+
+        let Some(pos) = order.iter().position(|n| n == &section_name) else { return };
+        let new_pos = pos as i32 + delta;
+        if new_pos < 0 || new_pos as usize >= order.len() { return; }
+        order.swap(pos, new_pos as usize);
+
+        self.current_section_order = order;
+        self.save_section_order();
+        self.rebuild_display();
+
+        // Follow the moved section: find its new index in display_messages.
+        for (i, m) in self.display_messages.iter().enumerate() {
+            if m.is_header && m.thread_id.as_deref() == Some(section_name.as_str()) {
+                self.index = i;
+                break;
+            }
+        }
+        self.render_all();
+    }
+
+    /// Mark every message in the section under the cursor as read.
+    /// Section is the channel-grouped header in Folders mode, or the
+    /// thread/subject group in Threaded mode. Scopes the existing
+    /// MarkAllReadBulk path by adding the section's folder to the
+    /// view filter.
+    fn mark_section_read(&mut self) {
+        if !self.show_threaded { return; }
+        // Walk back from cursor to find the section header.
+        let mut ix = self.index;
+        while ix > 0 && !self.display_messages[ix].is_header { ix -= 1; }
+        let Some(header) = self.display_messages.get(ix).filter(|m| m.is_header) else { return };
+        let Some(section_name) = header.thread_id.clone() else { return };
+
+        // Only Folders mode gives us a real folder name to scope on.
+        // For Threaded mode the section_name is a subject/thread label
+        // that doesn't map cleanly to a SQL filter, so bail out with a
+        // hint instead of marking the whole view by accident.
+        if !self.group_by_folder {
+            self.set_feedback(
+                "Mark-section-read only works in Folder-grouped view (press G)",
+                self.config.theme_colors.feedback_warn,
+            );
+            return;
+        }
+
+        let mut filters = self.build_current_filters();
+        filters.folder = Some(section_name.clone());
+        filters.folder_pattern = None;  // exact match on this channel
+
+        let maildir_source_ids: Vec<i64> = self.source_type_map.iter()
+            .filter_map(|(id, t)| if t == "maildir" { Some(*id) } else { None })
+            .collect();
+
+        let _ = self.write_tx.send(DbWriteOp::MarkAllReadBulk {
+            filters: Some(filters),
+            maildir_source_ids,
+        });
+
+        // In-memory flip so the UI reflects the new state immediately.
+        let mut flipped = 0usize;
+        for msg in &mut self.filtered_messages {
+            if msg.folder.as_deref() == Some(section_name.as_str()) && !msg.read {
+                msg.read = true;
+                flipped += 1;
+            }
+        }
+        let label = section_name
+            .rsplit_once('.').map(|(_, c)| c).unwrap_or(section_name.as_str());
+        self.set_feedback(
+            &format!("Marked {} as read in {}", flipped, label),
+            self.config.theme_colors.feedback_ok,
+        );
+        self.sync_mail_count();
+        self.rebuild_display();
+        self.render_all();
     }
 }
 
@@ -4168,11 +4517,18 @@ impl App {
                         if let Some(rules) = f["rules"].as_array() {
                             for rule in rules {
                                 let field = rule["field"].as_str().unwrap_or("");
+                                let op    = rule["op"].as_str().unwrap_or("=");
                                 let value = &rule["value"];
                                 match field {
                                     "read" => { filters.is_read = Some(!value.as_bool().unwrap_or(true)); }
                                     "starred" => { filters.is_starred = value.as_bool(); }
-                                    "folder" => { filters.folder = value.as_str().map(|s| s.to_string()); }
+                                    "folder" => {
+                                        if op == "like" {
+                                            filters.folder_pattern = value.as_str().map(|s| s.to_string());
+                                        } else {
+                                            filters.folder = value.as_str().map(|s| s.to_string());
+                                        }
+                                    }
                                     "source_id" => { filters.source_id = value.as_i64(); }
                                     "sender" => { filters.sender_pattern = value.as_str().map(|s| s.to_string()); }
                                     "source_type" => { filters.source_type = value.as_str().map(|s| s.to_string()); }
@@ -5425,6 +5781,36 @@ impl App {
         self.compose_source_type = Some(msg.source_type.clone());
         self.pending_reply_id = Some(msg.id);
 
+        // Weechat-relay reply. We split by transport based on the
+        // folder prefix:
+        //
+        // * `python.slack.*` → Slack Web API (kind=Slack). wee-slack
+        //   auto-closes inactive DM buffers, and the relay's `input`
+        //   command silently drops messages to non-existent buffers.
+        //   The Web API works against the workspace regardless of
+        //   which buffers are open in weechat.
+        //
+        // * IRC / Discord-bridge / Matrix / WhatsApp etc. → relay
+        //   `input` (kind=Weechat). These transports keep their
+        //   buffers persistently in weechat, so the relay path is
+        //   the right one.
+        if msg.source_type == "weechat-relay" {
+            if let Some(folder) = msg.folder.clone() {
+                if let Some(slack_target) = slack_target_from_weechat_folder(&folder) {
+                    self.compose_kind = DraftKind::Slack;
+                    let template = format!("Channel: {}\n\n", slack_target);
+                    self.run_editor_compose_at_full(&template, Some(3), Some(1), true);
+                    self.compose_kind = DraftKind::Email;
+                    return;
+                }
+                self.compose_kind = DraftKind::Weechat;
+                let template = format!("Channel: {}\n\n", folder);
+                self.run_editor_compose_at_full(&template, Some(3), Some(1), true);
+                self.compose_kind = DraftKind::Email;
+                return;
+            }
+        }
+
         let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
         let subject = msg.subject.as_deref().unwrap_or("");
         let re_subject = if subject.starts_with("Re:") {
@@ -6002,7 +6388,26 @@ impl App {
             Some("email".to_string())
         };
 
-        // Normal compose
+        // Weechat-relay compose: same split as reply() — Slack channels
+        // route through the Web API (kind=Slack), IRC / Discord-bridge /
+        // Matrix stay on the relay (kind=Weechat).
+        let weechat_target = self.compose_weechat_target_from_context();
+        if let Some(channel) = weechat_target {
+            if let Some(slack_target) = slack_target_from_weechat_folder(&channel) {
+                self.compose_kind = DraftKind::Slack;
+                let template = format!("Channel: {}\n\n", slack_target);
+                self.run_editor_compose_at_full(&template, Some(3), Some(1), true);
+                self.compose_kind = DraftKind::Email;
+                return;
+            }
+            self.compose_kind = DraftKind::Weechat;
+            let template = format!("Channel: {}\n\n", channel);
+            self.run_editor_compose_at_full(&template, Some(3), Some(1), true);
+            self.compose_kind = DraftKind::Email;  // reset for next time
+            return;
+        }
+
+        // Normal compose (email).
         let from = self.compose_from();
         let reply_to = self.compose_email();
         let sig = self.compose_signature();
@@ -6027,6 +6432,22 @@ impl App {
         // types the recipient. Reply/forward paths still use the plain
         // `run_editor_compose_at` because their To: is already filled in.
         self.run_editor_compose_at_full(&template, Some(2), Some(5), true);
+    }
+
+    /// If the currently-selected message or the current view points
+    /// at a weechat-relay buffer, return that buffer's `full_name`
+    /// (the value the relay's `input` command expects). Otherwise
+    /// `None` so the caller falls through to the email compose path.
+    fn compose_weechat_target_from_context(&self) -> Option<String> {
+        // Selected message wins — it's the most specific signal.
+        if let Some(msg) = self.filtered_messages.get(self.index) {
+            if msg.source_type == "weechat-relay" {
+                if let Some(folder) = msg.folder.as_deref() {
+                    if !folder.is_empty() { return Some(folder.to_string()); }
+                }
+            }
+        }
+        None
     }
 
     /// Get displayable text content from a message, converting HTML if needed.
@@ -6477,6 +6898,32 @@ impl App {
         chat_send::send_discord(&secrets, &target, &body)
     }
 
+    /// Send a weechat-kind draft. Connects to the relay, types the
+    /// body into the named buffer via `input <full_name> <body>`.
+    /// Returns the channel name on success so the status line shows
+    /// "Sent to <full_name>".
+    ///
+    /// Connection is opened fresh per send for now (M4 simplicity);
+    /// M5's supervised long-lived connection lets us reuse the same
+    /// socket for sends + receives so this round-trips in ~50ms.
+    fn send_weechat_draft(&self, data: &str) -> Result<String, String> {
+        let channel = parse_chat_channel(data)
+            .ok_or_else(|| "missing Channel: header".to_string())?;
+        let body = parse_chat_body(data);
+        if body.is_empty() {
+            return Err("body is empty".to_string());
+        }
+        let secrets = sources::weechat_relay::load_secrets_for_main();
+        let host = secrets.host.ok_or("WEECHAT_RELAY_HOST not set")?;
+        let port = secrets.port.ok_or("WEECHAT_RELAY_PORT not set")?;
+        let pass = secrets.password.ok_or("WEECHAT_RELAY_PASSWORD not set")?;
+        let mut c = sources::weechat_relay::Connection::connect(&host, port)?;
+        let _ = c.handshake()?;
+        c.init_plain(&pass)?;
+        c.input_by_name(&channel, &body)?;
+        Ok(channel)
+    }
+
     /// Recall-path entry: open a previously-saved draft. Forces the
     /// review screen even when the editor returns with no changes,
     /// because `zz` (save+quit, unmodified) on a recalled draft must
@@ -6603,9 +7050,29 @@ impl App {
                         // Post-editor loop with compose plugins and attachments
                         let mut attachments: Vec<String> = std::mem::take(&mut self.pending_forward_attachments);
                         let plugins = self.load_compose_plugins();
+                        // Last send-attempt error, persisted across the
+                        // loop iteration so the review pane can show
+                        // it. The bottom bar gets clobbered by the
+                        // key-hint prompt on the next tick, so a
+                        // bottom-bar-only feedback flashes for a frame
+                        // and disappears — leaving the user thinking
+                        // "nothing happened" after Enter.
+                        let mut last_send_error: Option<String> = None;
                         loop {
                             // Show message summary in right pane
                             self.show_compose_review(&final_content, &attachments);
+                            if let Some(ref err) = last_send_error {
+                                let tc2 = self.config.theme_colors.clone();
+                                let mut t = self.right.text().to_string();
+                                t.push('\n');
+                                t.push('\n');
+                                t.push_str(&style::bold(&style::fg(
+                                    &format!("✗ {}", err), tc2.feedback_warn,
+                                )));
+                                self.right.set_text(&t);
+                                self.right.full_refresh();
+                                if self.right.border { self.right.border_refresh(); }
+                            }
 
                             let plugin_hints: String = plugins.iter()
                                 .map(|(k, l, _)| format!(" {}:{}", k, l)).collect();
@@ -6631,8 +7098,11 @@ impl App {
                                                     break;
                                                 }
                                                 Err(msg) => {
+                                                    last_send_error = Some(
+                                                        format!("Slack send failed: {}", msg)
+                                                    );
                                                     self.set_feedback(
-                                                        &format!("Slack send failed: {}", msg),
+                                                        last_send_error.as_deref().unwrap_or(""),
                                                         tc.feedback_warn,
                                                     );
                                                     continue;
@@ -6649,8 +7119,32 @@ impl App {
                                                     break;
                                                 }
                                                 Err(msg) => {
+                                                    last_send_error = Some(
+                                                        format!("Discord send failed: {}", msg)
+                                                    );
                                                     self.set_feedback(
-                                                        &format!("Discord send failed: {}", msg),
+                                                        last_send_error.as_deref().unwrap_or(""),
+                                                        tc.feedback_warn,
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        DraftKind::Weechat => {
+                                            match self.send_weechat_draft(&final_content) {
+                                                Ok(channel) => {
+                                                    self.set_feedback(
+                                                        &format!("Sent to weechat {}", channel),
+                                                        tc.feedback_ok,
+                                                    );
+                                                    break;
+                                                }
+                                                Err(msg) => {
+                                                    last_send_error = Some(
+                                                        format!("Weechat send failed: {}", msg)
+                                                    );
+                                                    self.set_feedback(
+                                                        last_send_error.as_deref().unwrap_or(""),
                                                         tc.feedback_warn,
                                                     );
                                                     continue;
@@ -6735,15 +7229,15 @@ impl App {
                                 "p" => {
                                     let now = database::now_secs();
                                     match self.compose_kind {
-                                        DraftKind::Slack | DraftKind::Discord => {
+                                        DraftKind::Slack | DraftKind::Discord | DraftKind::Weechat => {
                                             // The `postponed` DB table is email-
                                             // shaped (data → editor template).
-                                            // Slack/discord drafts round-trip
-                                            // through the drop folder so the
-                                            // kind survives.
+                                            // Non-email drafts round-trip through
+                                            // the drop folder so the kind survives.
                                             let ext = match self.compose_kind {
-                                                DraftKind::Slack => "slack",
+                                                DraftKind::Slack   => "slack",
                                                 DraftKind::Discord => "discord",
+                                                DraftKind::Weechat => "weechat",
                                                 _ => "eml",
                                             };
                                             let dir = drafts_drop_dir();
@@ -10307,6 +10801,25 @@ fn is_invisible_format_char(c: char) -> bool {
 /// shows the configured `src_<source>_icon` colour while sender /
 /// subject text continues in `src_<source>`. Both colors are
 /// user-configurable per source via `~/.kastrup/config.yml`.
+/// Heuristic: given a section's display name (after pretty_folder_name
+/// stripping), return the matching chat source_type so the renderer
+/// can theme it. Returns None for folders that don't look like chat
+/// transports — e.g. mail folders like `Geir.Personal`.
+fn chat_source_type_for_display(display: &str) -> Option<&'static str> {
+    if display.starts_with("slack.") { return Some("slack"); }
+    if display.starts_with("discord-bridge.") { return Some("discord"); }
+    if display.starts_with("matrix.") { return Some("telegram"); /* closest theme */ }
+    if display.starts_with("whatsapp.") { return Some("whatsapp"); }
+    // IRC networks: any of the common server short-names that survive
+    // pretty_folder_name's `irc.` strip.
+    for irc in ["libera.", "oftc.", "efnet.", "bitlbee.", "freenode.",
+                "dalnet.", "undernet.", "rizon."]
+    {
+        if display.starts_with(irc) { return Some("weechat"); }
+    }
+    None
+}
+
 fn source_info(source_type: &str, tc: &config::ThemeColors) -> (String, u8) {
     let (glyph, icon_color, row_color) = match source_type {
         "discord"  => ("\u{25C6}", tc.src_discord_icon,  tc.src_discord),

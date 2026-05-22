@@ -80,6 +80,11 @@ impl Poller {
                         "instagram" => sources::instagram::sync_instagram(&source.config, known),
                         "discord" => sources::discord::sync_discord(&source.config, known),
                         "slack" => sources::slack::sync_slack(&source.config, known),
+                        // weechat-relay is driven by its own push
+                        // supervisor (see weechat_relay::spawn_supervisor)
+                        // — the poller path stays a no-op so we don't
+                        // double-fetch over the network.
+                        "weechat-relay" => Vec::new(),
                         _ => Vec::new(),
                     };
 

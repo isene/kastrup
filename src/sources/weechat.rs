@@ -214,6 +214,11 @@ fn parse_weechat_date(s: &str) -> Option<i64> {
 
 /// Simple MD5 hex digest (djb2-based, matching Heathrow's Digest::MD5).
 /// Since we lack an MD5 crate, use a good hash with low collision rate.
+/// Public re-export for the new `weechat_relay` source so it can use
+/// the same content-hash external_id scheme without duplicating the
+/// hash impl.
+pub fn md5_hex_public(s: &str) -> String { md5_hex(s) }
+
 fn md5_hex(s: &str) -> String {
     // Use FNV-1a 128-bit folded to produce a 32-char hex string
     let mut h1: u64 = 0xcbf29ce484222325;

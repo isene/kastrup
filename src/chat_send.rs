@@ -103,9 +103,32 @@ fn slack_token_from_weechat() -> Option<String> {
 ///   - `C…` / `G…` / `D…`  → passed through
 ///   - `#name`               → resolved via `conversations.list`
 ///   - `@name` / `U…`        → opened as a DM via `conversations.open`
+///   - `mpdm:a,b,c`          → opened as a multi-party DM (each handle
+///                             resolved, then `conversations.open` with
+///                             the comma-separated user IDs)
 pub fn slack_resolve_channel(token: &str, raw: &str) -> Result<String, String> {
     let raw = raw.trim();
     if raw.is_empty() { return Err("empty channel".into()); }
+    if let Some(rest) = raw.strip_prefix("mpdm:") {
+        let mut user_ids: Vec<String> = Vec::new();
+        for handle in rest.split(',') {
+            let handle = handle.trim();
+            if handle.is_empty() { continue; }
+            // Allow `U…` IDs verbatim, otherwise look up by handle.
+            let id = if handle.starts_with('U') && handle.len() >= 9
+                && handle[1..].chars().all(|c| c.is_ascii_alphanumeric())
+            {
+                handle.to_string()
+            } else {
+                slack_lookup_user_by_handle(token, handle.trim_start_matches('@'))?
+            };
+            user_ids.push(id);
+        }
+        if user_ids.is_empty() {
+            return Err("mpdm: no users in target".into());
+        }
+        return slack_open_dm(token, &user_ids.join(","));
+    }
     // Already an ID?
     if let Some(c0) = raw.chars().next() {
         if (c0 == 'C' || c0 == 'G' || c0 == 'D') && raw.len() >= 9

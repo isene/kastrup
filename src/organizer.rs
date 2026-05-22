@@ -154,7 +154,11 @@ pub fn organize_messages(
     sections
 }
 
-pub fn organize_by_folder(messages: &[Message], sort_inverted: bool) -> Vec<Section> {
+pub fn organize_by_folder(
+    messages: &[Message],
+    sort_inverted: bool,
+    pinned_order: &[String],
+) -> Vec<Section> {
     let mut folder_map: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, msg) in messages.iter().enumerate() {
         let folder = msg.folder.as_deref().unwrap_or("INBOX").to_string();
@@ -162,21 +166,58 @@ pub fn organize_by_folder(messages: &[Message], sort_inverted: bool) -> Vec<Sect
     }
     let mut sections: Vec<Section> = folder_map.into_iter().map(|(folder, indices)| {
         let unread = indices.iter().filter(|&&i| !messages[i].read).count();
+        let display_name = pretty_folder_name(&folder);
         Section {
             section_type: "channel".to_string(),
-            name: folder.clone(),
-            display_name: folder,
+            name: folder,
+            display_name,
             source_type: "folder".to_string(),
             messages: indices,
             unread_count: unread,
         }
     }).collect();
-    sections.sort_by(|a, b| a.name.cmp(&b.name));
+    // Two-tier sort:
+    //   1. Pinned channels (in the order given by pinned_order)
+    //   2. Everything else, by latest-message timestamp (descending)
+    // The user's `section_order` persists their hand-pinned channels;
+    // newly-active unpinned channels still float to just below them.
+    let pin_rank: HashMap<&str, usize> = pinned_order.iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
+    sections.sort_by(|a, b| {
+        let ra = pin_rank.get(a.name.as_str()).copied();
+        let rb = pin_rank.get(b.name.as_str()).copied();
+        match (ra, rb) {
+            (Some(ia), Some(ib)) => ia.cmp(&ib),
+            (Some(_),  None)     => std::cmp::Ordering::Less,
+            (None,     Some(_))  => std::cmp::Ordering::Greater,
+            (None,     None)     => {
+                let la = a.messages.iter().map(|&i| messages[i].timestamp).max().unwrap_or(0);
+                let lb = b.messages.iter().map(|&i| messages[i].timestamp).max().unwrap_or(0);
+                lb.cmp(&la)
+            }
+        }
+    });
     if sort_inverted { sections.reverse(); }
     for section in &mut sections {
         section.messages.sort_by(|&a, &b| messages[b].timestamp.cmp(&messages[a].timestamp));
     }
     sections
+}
+
+/// Strip the leading transport word (`python.`, `irc.`) from a
+/// weechat-relay folder so the section header reads `slack.dualog.&team`
+/// instead of `python.slack.dualog.&team`. We keep the workspace
+/// segment so the renderer can dim it; the DB folder stays untouched
+/// so view filters still match.
+fn pretty_folder_name(folder: &str) -> String {
+    for prefix in ["python.", "irc.server.", "irc."] {
+        if let Some(rest) = folder.strip_prefix(prefix) {
+            return rest.to_string();
+        }
+    }
+    folder.to_string()
 }
 
 fn sort_sections(sections: &mut [Section], messages: &[Message], sort_order: &str) {
