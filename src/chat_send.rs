@@ -325,6 +325,65 @@ pub fn send_slack(token: &str, cookie: Option<&str>, channel: &str, text: &str) 
     Ok(())
 }
 
+/// Upload a single file to a Slack channel via the legacy
+/// `files.upload` endpoint. Multipart form constructed by hand to
+/// avoid pulling in a multipart crate for one call site. `channel`
+/// is the resolved channel ID (`C…` / `G…` / `D…`), not a name —
+/// the caller resolves first via `slack_resolve_channel`.
+///
+/// `comment` is an optional message that appears alongside the
+/// file in the channel; pass an empty string to skip.
+pub fn slack_upload_file(
+    token: &str, cookie: Option<&str>,
+    channel: &str, path: &std::path::Path, comment: &str,
+) -> Result<(), String> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let filename = path.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("attachment")
+        .to_string();
+
+    let boundary = format!("----kastrup-{:x}", crate::database::now_secs());
+    let mut body: Vec<u8> = Vec::with_capacity(bytes.len() + 1024);
+
+    let mut add_field = |name: &str, value: &str| {
+        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        body.extend_from_slice(format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", name).as_bytes());
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    };
+    add_field("channels", channel);
+    add_field("filename", &filename);
+    if !comment.is_empty() {
+        add_field("initial_comment", comment);
+    }
+    // file part
+    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n",
+            filename).as_bytes());
+    body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+    let resp = apply_slack_auth(
+        ureq::post("https://slack.com/api/files.upload"),
+        token, cookie,
+    )
+        .set("Content-Type", &format!("multipart/form-data; boundary={}", boundary))
+        .send_bytes(&body)
+        .map_err(|e| format!("files.upload: {}", e))?
+        .into_string()
+        .map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&resp).map_err(|e| e.to_string())?;
+    if !v["ok"].as_bool().unwrap_or(false) {
+        return Err(format!("slack: {}", v["error"].as_str().unwrap_or("files.upload failed")));
+    }
+    Ok(())
+}
+
 // --- Discord ---------------------------------------------------------------
 
 /// Route a discord draft. `target` is the post-prefix value, e.g.
