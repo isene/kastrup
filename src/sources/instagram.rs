@@ -1,13 +1,17 @@
 use super::MessageData;
 use std::collections::HashSet;
-use std::path::PathBuf;
 
-/// Sync Instagram DMs via Heathrow's Marionette-based Python script.
+/// Sync Instagram DMs via a Marionette-based Python script.
 /// Connects to Firefox on Marionette port 2828, fetches the Instagram
 /// private API inbox endpoint through the logged-in session.
-pub fn sync_instagram(_config: &serde_json::Value, known_ids: &HashSet<String>) -> Vec<MessageData> {
-    let script_path = home_dir()
-        .join("Main/G/GIT-isene/heathrow/lib/heathrow/sources/instagram_fetch.py");
+///
+/// Source `config` may set `fetch_script` to override the default
+/// path of `~/.kastrup/plugins/instagram_fetch.py`. `~/` and `$HOME`
+/// are expanded. Function is a no-op when the script doesn't exist.
+pub fn sync_instagram(config: &serde_json::Value, known_ids: &HashSet<String>) -> Vec<MessageData> {
+    let script_path = super::messenger::resolve_fetch_script(
+        config, "fetch_script", "instagram_fetch.py",
+    );
     if !script_path.exists() { return Vec::new(); }
 
     // Run with timeout to avoid hanging
@@ -272,8 +276,4 @@ fn extract_attachments(item: &serde_json::Value, item_type: &str, _item_id: &str
     }
 
     attachments
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."))
 }
