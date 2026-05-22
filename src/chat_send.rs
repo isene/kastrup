@@ -325,6 +325,31 @@ pub fn send_slack(token: &str, cookie: Option<&str>, channel: &str, text: &str) 
     Ok(())
 }
 
+/// Post a `/me`-style action message (third-person narration) to a
+/// Slack channel via `chat.meMessage`. Caller has already stripped
+/// the `/me ` prefix from `text`. The xoxc/xoxd browser flow is
+/// supported here too so the message lands with no app attribution.
+pub fn send_slack_me(token: &str, cookie: Option<&str>, channel: &str, text: &str) -> Result<(), String> {
+    let body = serde_json::json!({
+        "channel": channel,
+        "text": text,
+    });
+    let resp = apply_slack_auth(
+        ureq::post("https://slack.com/api/chat.meMessage"),
+        token, cookie,
+    )
+        .set("Content-Type", "application/json; charset=utf-8")
+        .send_string(&body.to_string())
+        .map_err(|e| format!("chat.meMessage: {}", e))?
+        .into_string()
+        .map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&resp).map_err(|e| e.to_string())?;
+    if !v["ok"].as_bool().unwrap_or(false) {
+        return Err(format!("slack: {}", v["error"].as_str().unwrap_or("chat.meMessage failed")));
+    }
+    Ok(())
+}
+
 /// Upload a single file to a Slack channel via the legacy
 /// `files.upload` endpoint. Multipart form constructed by hand to
 /// avoid pulling in a multipart crate for one call site. `channel`
@@ -463,6 +488,110 @@ fn discord_post_bot_channel(token: &str, channel_id: &str, text: &str) -> Result
         }
         Err(e) => Err(format!("discord bot: {}", e)),
     }
+}
+
+/// Build the multipart body Discord expects for an attachment-bearing
+/// message: a `payload_json` part with the JSON content + per-file
+/// `files[i]` parts. Returns `(boundary, body_bytes)`. Empty `text`
+/// is allowed (Discord accepts files with no caption).
+fn build_discord_multipart(text: &str, files: &[(&std::path::Path, Vec<u8>)])
+    -> Result<(String, Vec<u8>), String>
+{
+    let boundary = format!("----kastrup-d-{:x}", crate::database::now_secs());
+    let mut body: Vec<u8> = Vec::with_capacity(
+        files.iter().map(|(_, b)| b.len()).sum::<usize>() + 1024
+    );
+
+    // payload_json — Discord requires this exact field name.
+    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"payload_json\"\r\n");
+    body.extend_from_slice(b"Content-Type: application/json\r\n\r\n");
+    let payload = serde_json::json!({ "content": text });
+    body.extend_from_slice(payload.to_string().as_bytes());
+    body.extend_from_slice(b"\r\n");
+
+    for (i, (path, bytes)) in files.iter().enumerate() {
+        let filename = path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("attachment");
+        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"files[{}]\"; filename=\"{}\"\r\n",
+                i, filename).as_bytes());
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+    Ok((boundary, body))
+}
+
+/// Upload one or more files to a Discord channel as a single message
+/// (with optional caption `text`). Discord accepts up to 10 files per
+/// message — we don't cap here; the API will reject oversize requests
+/// itself.
+pub fn discord_upload_files_to_channel(
+    token: &str, channel_id: &str, text: &str, paths: &[std::path::PathBuf],
+) -> Result<(), String> {
+    let mut buffers: Vec<(&std::path::Path, Vec<u8>)> = Vec::with_capacity(paths.len());
+    let mut owned_bufs: Vec<Vec<u8>> = Vec::with_capacity(paths.len());
+    for p in paths {
+        let b = std::fs::read(p).map_err(|e| format!("read {}: {}", p.display(), e))?;
+        owned_bufs.push(b);
+    }
+    for (i, p) in paths.iter().enumerate() {
+        buffers.push((p.as_path(), owned_bufs[i].clone()));
+    }
+    let (boundary, body) = build_discord_multipart(text, &buffers)?;
+    let auth = if token.starts_with("Bot ") || token.starts_with("Bearer ") {
+        token.to_string()
+    } else {
+        format!("Bot {}", token)
+    };
+    let url = format!("https://discord.com/api/v10/channels/{}/messages", channel_id);
+    let resp = ureq::post(&url)
+        .set("Authorization", &auth)
+        .set("Content-Type", &format!("multipart/form-data; boundary={}", boundary))
+        .set("User-Agent", "kastrup (https://github.com/isene/kastrup, 0.1)")
+        .send_bytes(&body);
+    match resp {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(code, r)) => {
+            Err(format!("discord upload {}: {}", code, r.into_string().unwrap_or_default()))
+        }
+        Err(e) => Err(format!("discord upload: {}", e)),
+    }
+}
+
+/// Webhook variant: same payload format, but the destination is a
+/// webhook URL and there's no bot Authorization header.
+pub fn discord_upload_files_to_webhook(
+    webhook_url: &str, text: &str, paths: &[std::path::PathBuf],
+) -> Result<(), String> {
+    let mut buffers: Vec<(&std::path::Path, Vec<u8>)> = Vec::with_capacity(paths.len());
+    let mut owned_bufs: Vec<Vec<u8>> = Vec::with_capacity(paths.len());
+    for p in paths {
+        let b = std::fs::read(p).map_err(|e| format!("read {}: {}", p.display(), e))?;
+        owned_bufs.push(b);
+    }
+    for (i, p) in paths.iter().enumerate() {
+        buffers.push((p.as_path(), owned_bufs[i].clone()));
+    }
+    let (boundary, body) = build_discord_multipart(text, &buffers)?;
+    let resp = ureq::post(webhook_url)
+        .set("Content-Type", &format!("multipart/form-data; boundary={}", boundary))
+        .send_bytes(&body);
+    match resp {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(code, r)) => {
+            Err(format!("discord webhook upload {}: {}", code, r.into_string().unwrap_or_default()))
+        }
+        Err(e) => Err(format!("discord webhook upload: {}", e)),
+    }
+}
+
+pub fn discord_create_dm_pub(token: &str, user_id: &str) -> Result<String, String> {
+    discord_create_dm(token, user_id)
 }
 
 fn discord_create_dm(token: &str, user_id: &str) -> Result<String, String> {
