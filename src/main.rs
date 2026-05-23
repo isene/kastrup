@@ -4470,8 +4470,24 @@ impl App {
         if !self.tagged.is_empty() {
             for &id in &msg_ids { self.tagged.remove(&id); }
         }
-        if self.index >= self.filtered_messages.len() {
-            self.index = self.filtered_messages.len().saturating_sub(1);
+        // Rebuild the threaded / folders display from the pruned
+        // filtered_messages — render_all renders from display_messages
+        // in those modes, not from filtered_messages, so without this
+        // rebuild the moved message stays painted on screen until the
+        // next view switch or kastrup restart.
+        self.rebuild_display();
+        // Clamp the cursor against whichever list the current mode
+        // actually paints. Without this, the cursor can land past the
+        // end of display_messages and the right pane stops updating.
+        let display_len = if self.show_threaded {
+            self.display_messages.len()
+        } else {
+            self.filtered_messages.len()
+        };
+        if display_len == 0 {
+            self.index = 0;
+        } else if self.index >= display_len {
+            self.index = display_len - 1;
         }
 
         let msg = format!(
