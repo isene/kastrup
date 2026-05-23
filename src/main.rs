@@ -3407,6 +3407,14 @@ impl App {
         self.active_folder = Some(folder.to_string());
         self.in_source_view = false;
         self.index = 0;
+        // Browsing a specific folder via B / F is always a flat,
+        // chronological list of mails in that folder — no per-channel
+        // sections, no threading rail. Folders / threaded modes only
+        // make sense in the combined Views (3, 4) where multiple
+        // source folders contribute. Reset here so a previous
+        // Views-mode setting doesn't leak in.
+        self.show_threaded = false;
+        self.group_by_folder = false;
 
         self.set_feedback(
             &format!("Loading {}...", folder),
@@ -4291,23 +4299,49 @@ impl App {
         // just rewrite its DB folder column to a maildir path, hiding
         // it from its real channel while never producing an actual
         // archived file. Email is identified by a `maildir_file` key
-        // in metadata. Bulk-file (tagged) accepts mixed selections,
-        // but each individual message is gated inside the loop too —
-        // here we only block the trivial "cursor on a chat message"
-        // path with no tagged set.
+        // in metadata. Bulk-file (tagged) accepts mixed selections —
+        // file_single_message gates each id individually.
+        //
+        // The cursor lookup is mode-aware: in threaded/folders view
+        // self.index points into display_messages (which includes
+        // section header pseudo-rows); cross-reference back to the
+        // real Message via filtered_messages.iter().find(id) so we
+        // inspect the right metadata. Pre-fix this read
+        // filtered_messages[self.index] directly, which lands on a
+        // random message when the cursor sits on a section header.
         if self.tagged.is_empty() {
-            if let Some(msg) = self.filtered_messages.get(self.index) {
-                let is_mail = msg.metadata.get("maildir_file")
-                    .and_then(|v| v.as_str())
-                    .map(|s| !s.is_empty())
-                    .unwrap_or(false);
-                if !is_mail {
+            let current_id_and_header = if self.show_threaded {
+                self.display_messages.get(self.index)
+                    .map(|m| (m.id, m.is_header))
+            } else {
+                self.filtered_messages.get(self.index)
+                    .map(|m| (m.id, false))
+            };
+            match current_id_and_header {
+                Some((_, true)) => {
                     self.set_feedback(
-                        "Save (s) only applies to email — this is a chat message",
+                        "Save (s) needs a message — cursor is on a section header",
                         self.config.theme_colors.feedback_warn,
                     );
                     return;
                 }
+                Some((id, false)) => {
+                    let msg = self.filtered_messages.iter().find(|m| m.id == id);
+                    let is_mail = msg
+                        .map(|m| m.metadata.get("maildir_file")
+                            .and_then(|v| v.as_str())
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false))
+                        .unwrap_or(false);
+                    if !is_mail {
+                        self.set_feedback(
+                            "Save (s) only applies to email — this is a chat message",
+                            self.config.theme_colors.feedback_warn,
+                        );
+                        return;
+                    }
+                }
+                None => return,
             }
         }
 
@@ -4394,16 +4428,29 @@ impl App {
             typed
         };
 
-        // Collect messages to file
+        // Collect messages to file. Cursor lookup is mode-aware: in
+        // threaded/folders view self.index points into display_messages
+        // (with section-header pseudo-rows); fall back to
+        // filtered_messages by id so we route the actual message
+        // under the cursor, not whatever happens to sit at the same
+        // numeric offset in filtered_messages.
         let msg_ids: Vec<i64> = if !self.tagged.is_empty() {
             self.filtered_messages.iter()
                 .filter(|m| self.tagged.contains(&m.id))
                 .map(|m| m.id)
                 .collect()
-        } else if let Some(msg) = self.filtered_messages.get(self.index) {
-            vec![msg.id]
         } else {
-            return;
+            let cursor_id = if self.show_threaded {
+                self.display_messages.get(self.index)
+                    .filter(|m| !m.is_header)
+                    .map(|m| m.id)
+            } else {
+                self.filtered_messages.get(self.index).map(|m| m.id)
+            };
+            match cursor_id {
+                Some(id) => vec![id],
+                None => return,
+            }
         };
 
         if msg_ids.is_empty() { return; }
