@@ -4307,9 +4307,11 @@ impl App {
 
         // Wait for sub-key
         let Some(chr) = Input::getchr(Some(5)) else {
+            log::info("file_message: sub-key timeout (no save)");
             self.render_bottom_bar();
             return;
         };
+        log::info(&format!("file_message: sub-key = {:?}", chr));
 
         if chr == "ESC" || chr == "\x1b" {
             self.render_bottom_bar();
@@ -4411,8 +4413,10 @@ impl App {
     fn file_single_message(&self, id: i64, dest: &str) -> Result<(), String> {
         // Get message from DB with metadata
         let msg = self.db.get_message(id).ok_or("Message not found")?;
+        let old_folder = msg.folder.clone().unwrap_or_default();
         let mut meta = msg.metadata.clone();
 
+        let mut rename_status = "(no maildir file)".to_string();
         // Move maildir file on disk if applicable
         if let Some(file_path) = meta.get("maildir_file").and_then(|v| v.as_str()).map(String::from) {
             if std::path::Path::new(&file_path).exists() {
@@ -4430,17 +4434,29 @@ impl App {
                     .and_then(|f| f.to_str())
                     .unwrap_or("msg");
                 let new_path = cur_dir.join(filename);
-                if std::fs::rename(&file_path, &new_path).is_ok() {
-                    meta["maildir_file"] =
-                        serde_json::json!(new_path.to_string_lossy().to_string());
-                    meta["maildir_folder"] = serde_json::json!(dest);
+                match std::fs::rename(&file_path, &new_path) {
+                    Ok(()) => {
+                        rename_status = format!("renamed → {}", new_path.display());
+                        meta["maildir_file"] =
+                            serde_json::json!(new_path.to_string_lossy().to_string());
+                        meta["maildir_folder"] = serde_json::json!(dest);
+                    }
+                    Err(e) => {
+                        rename_status = format!("rename FAILED ({}): {} → {}",
+                            e, file_path, new_path.display());
+                    }
                 }
+            } else {
+                rename_status = format!("source missing: {}", file_path);
             }
         }
 
         // Update folder + metadata in DB
         self.db.update_message_folder(id, dest, &meta);
         self.db.mark_as_read(id);
+
+        log::info(&format!("file_single_message: id={} {} → {} | {}",
+            id, old_folder, dest, rename_status));
 
         Ok(())
     }
