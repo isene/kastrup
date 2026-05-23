@@ -3553,7 +3553,13 @@ impl App {
         // matches the current view filter, so empty channels still
         // render as sections (weechat-buflist parity). Then drop any
         // section the user has explicitly hidden for this view.
-        if self.group_by_folder {
+        //
+        // Skip the merge entirely when the user is browsing a specific
+        // maildir folder via B / F — that's a pure mail folder view,
+        // and chat channels would never have messages in it. Without
+        // this guard, every subscribed channel renders as a `[0]`
+        // section alongside the mail folder.
+        if self.group_by_folder && self.active_folder.is_none() {
             let view_filters = self.build_current_filters();
             let have_folder: std::collections::HashSet<String> = sections.iter()
                 .map(|s| s.name.clone()).collect();
@@ -4279,6 +4285,32 @@ impl App {
     fn file_message(&mut self) {
         if self.filtered_messages.is_empty() { return; }
 
+        // Guard: refuse to file chat / non-maildir messages. The save
+        // shortcuts map to maildir folder paths ("PassionFruits.Archive",
+        // etc.); applying that to a Slack/Discord/IRC message would
+        // just rewrite its DB folder column to a maildir path, hiding
+        // it from its real channel while never producing an actual
+        // archived file. Email is identified by a `maildir_file` key
+        // in metadata. Bulk-file (tagged) accepts mixed selections,
+        // but each individual message is gated inside the loop too —
+        // here we only block the trivial "cursor on a chat message"
+        // path with no tagged set.
+        if self.tagged.is_empty() {
+            if let Some(msg) = self.filtered_messages.get(self.index) {
+                let is_mail = msg.metadata.get("maildir_file")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+                if !is_mail {
+                    self.set_feedback(
+                        "Save (s) only applies to email — this is a chat message",
+                        self.config.theme_colors.feedback_warn,
+                    );
+                    return;
+                }
+            }
+        }
+
         // Build hint from save_folders
         let shortcuts = self.config.save_folders.clone();
         let mut keys: Vec<&String> = shortcuts.keys().collect();
@@ -4415,6 +4447,21 @@ impl App {
         let msg = self.db.get_message(id).ok_or("Message not found")?;
         let old_folder = msg.folder.clone().unwrap_or_default();
         let mut meta = msg.metadata.clone();
+
+        // Reject non-mail messages — they have no maildir_file and
+        // shouldn't have their DB folder rewritten to a maildir path.
+        // This also fires for any tagged-bulk save that includes chat
+        // messages, leaving them untouched.
+        let has_maildir_file = meta.get("maildir_file")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if !has_maildir_file {
+            log::info(&format!(
+                "file_single_message: id={} skipped (not a mail message; folder={})",
+                id, old_folder));
+            return Err("not a mail message".into());
+        }
 
         let mut rename_status = "(no maildir file)".to_string();
         // Move maildir file on disk if applicable
