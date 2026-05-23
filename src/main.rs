@@ -2866,6 +2866,20 @@ impl App {
 impl App {
     fn switch_to_view(&mut self, key: &str) {
         log::info(&format!("Switch to view: {}", key));
+        // Unbound view key → no-op. Without this guard, pressing F4..F12
+        // (or any other key not in self.views) silently falls through
+        // to `Filters::default()` which matches every message — i.e.
+        // identical to View A. Stay on the current view instead and
+        // surface a hint so the keystroke wasn't lost in silence.
+        let is_builtin = matches!(key, "A" | "N" | "*");
+        let is_defined = self.views.iter().any(|v| v.key_binding.as_deref() == Some(key));
+        if !is_builtin && !is_defined {
+            self.set_feedback(
+                &format!("No view bound to {}", key),
+                self.config.theme_colors.feedback_warn,
+            );
+            return;
+        }
         self.current_view = key.to_string();
         self.active_folder = None;
         self.in_source_view = false;
