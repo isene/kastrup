@@ -558,7 +558,11 @@ fn line_to_message(
     // so `_16alice` shows as `alice`.
     let nick_from_prefix = strip_codes(prefix_raw).trim().to_string();
     let nick = if !nick_from_prefix.is_empty() && !is_continuation_marker(&nick_from_prefix) {
-        nick_from_prefix
+        // wee-slack also leaks the `_<NN>` palette-colour prefix into
+        // the prefix field on certain live push events (notably the
+        // user's own outgoing messages echoed back). Strip the same
+        // pattern here so `_16isene` shows as `isene`.
+        strip_weeslack_color_prefix(&nick_from_prefix)
     } else {
         nick_from_tags(line.fields.get("tags_array"))
             .map(|n| strip_weeslack_color_prefix(&n))
