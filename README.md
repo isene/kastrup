@@ -165,7 +165,7 @@ To express OR across heterogeneous criteria — e.g. one view for "everything re
 {
   "name": "Foo",
   "branches": [
-    {"rules": [{"field":"folder","op":"=","value":"AA.Customers.Foo"}]},
+    {"rules": [{"field":"folder","op":"=","value":"Customers.Foo"}]},
     {"rules": [{"field":"folder","op":"like","value":"python.slack.workspace.#foo"}]},
     {"rules": [{"field":"sender","op":"like","value":"foo"}]}
   ],
