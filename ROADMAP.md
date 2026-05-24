@@ -1,6 +1,6 @@
 # Roadmap
 
-Snapshot as of v0.1.117. Items grouped by realistic scope. Tractable items get knocked off as time allows; "shelf" items need their own focused session each.
+Snapshot as of v0.1.126. Items grouped by realistic scope. Tractable items get knocked off as time allows; "shelf" items need their own focused session each.
 
 ## Recently shipped
 
@@ -20,6 +20,10 @@ Snapshot as of v0.1.117. Items grouped by realistic scope. Tractable items get k
 - **v0.1.116** — M8.1: nested email threading (DFS-walk over `In-Reply-To` / `References` headers; indent rail in left pane).
 - **v0.1.117** — Pulled in glow v0.1.14: first inline image V on any new attachment drops from ~250-500 ms (magick subprocess) to ~10-50 ms (in-process `image` crate decode + Triangle resize + cell-aligned pad). Repeat shows already instant via Phase 1 disk PNG cache (glow v0.1.13).
 - **v0.1.118** — M8.2 (v/V across all chat sources): Discord and Instagram attachment objects now carry `kastrup_remote: true` and `source_type` so the unified fetch path downloads from their CDNs without leaking Slack auth headers. Discord file send: `.discord` drafts gain `Attach:` headers and post via a single `multipart/form-data` to `POST /channels/<id>/messages` (bot, webhook, or DM target). `/me` send: bodies starting with `/me ` route to Slack `chat.meMessage`, Discord `_italic_` markdown, and weechat's native `input` handler (IRC `ACTION` / Slack action). Editor completion socket at `~/.kastrup/completion.sock` — scribe/vim can query `NICKS [substr]`, `NICKS_IN <folder> [substr]`, `CHANNELS [substr]` over a Unix-domain socket; one-shot request/response, no polling.
+- **v0.1.119** — Pressing a function key (or any other view key) with no matching view in the DB used to fall through to `Filters::default()` and silently show the entire database; now shows "No view bound to <key>" and leaves the current view in place.
+- **v0.1.120** — Stripped wee-slack's `_<NN>` colour-palette prefix from prefix-derived nicks too (previously only stripped from tag-derived nicks), fixing the user appearing as `_16<nick>` in some live push-event echoes.
+- **v0.1.121-v0.1.124** — `s`-save guards: refuse non-mail messages (chat messages no longer get their DB folder rewritten to a maildir path), cursor lookup is mode-aware in folders / threaded view (was reading the wrong message at the same numeric index), folder browse via B/F now defaults to flat view, and `rebuild_display` after save so the moved message disappears without a restart.
+- **v0.1.125-v0.1.126** — M9: **AI-assisted triage** (`z` key). Claude reads the current message, optional free-text hint, and emits a JSON action plan (calendar events → ICS in `~/.tock/incoming/` for tock; todos → `~/.tasks/todo.hl` appended atomically under the right category so a scribe buffer reloads cleanly). Multi-pick preview before commit. `:triage` shows the last 20 decisions from `~/.kastrup/triage.log`. Defaults install on first `z` use; both prompt and wrapper are user-editable in `~/.kastrup/`.
 
 ## Tractable next (small/medium, ~half-day each)
 
