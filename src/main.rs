@@ -10443,9 +10443,16 @@ impl App {
         // (Claude triages from the message body alone). The hint is
         // useful when the actionable item isn't IN the body — e.g.
         // the message is a secure-PDF link the user wants to follow
-        // up on by a specific date.
+        // up on by a specific date. ESC at the hint prompt cancels
+        // the whole triage BEFORE spending tokens on a Claude call
+        // the user no longer wants.
         let hint = self.prompt(
-            "Triage hint (Enter to skip): ", "");
+            "Triage hint (Enter to skip, ESC to cancel): ", "");
+        if self.bottom.last_escaped {
+            self.set_feedback("Triage cancelled", tc.feedback_info);
+            self.render_bottom_bar();
+            return;
+        }
         self.render_bottom_bar();
 
         // Build context JSON for the wrapper.
@@ -10580,32 +10587,32 @@ impl App {
         let tock_home = std::path::PathBuf::from(&home).join(".tock");
         let mut log_results: Vec<(triage::Action, String)> = Vec::new();
 
+        let mut committed_cal = 0usize;
+        let mut committed_todo = 0usize;
         for (i, a) in actions.iter().enumerate() {
             if !selected[i] {
                 log_results.push((a.clone(), "skipped".to_string()));
                 continue;
             }
-            let res: Result<String, String> = match a {
+            let res: Result<&'static str, String> = match a {
                 triage::Action::Todo { category, text } => {
                     triage::append_todo(todo_path, category, text)
-                        .map(|_| format!("todo: [{}] {}", category, text))
+                        .map(|_| "todo")
                 }
                 triage::Action::Calendar { title, when, duration_min, calendar } => {
                     self.commit_calendar(msg_id, &tock_home,
                         title, when, *duration_min, calendar.as_deref())
+                        .map(|_| "calendar")
                 }
                 triage::Action::Clarify { question } => {
-                    // Clarify can't be "committed" — surface to the user
-                    // for now (interactive answer + re-triage is a v2
-                    // feature).
                     Err(format!("clarify needs manual follow-up: {}", question))
                 }
             };
             match res {
-                Ok(_label) => {
-                    committed += 1;
-                    log_results.push((a.clone(), "committed".to_string()));
-                }
+                Ok("calendar") => { committed += 1; committed_cal += 1;
+                    log_results.push((a.clone(), "committed".to_string())); }
+                Ok(_)          => { committed += 1; committed_todo += 1;
+                    log_results.push((a.clone(), "committed".to_string())); }
                 Err(e) => {
                     failed += 1;
                     log::info(&format!("triage commit failed: {}", e));
@@ -10624,12 +10631,25 @@ impl App {
             results: &log_results,
         });
 
-        let summary = if failed > 0 {
-            format!("Triage: {} committed, {} failed (see log)",
-                committed, failed)
-        } else {
-            format!("Triage: {} committed", committed)
-        };
+        // Spell out where the commits actually went so the user knows
+        // tock events are queued (visible only after tock runs
+        // watch_incoming on next start / idle tick), while todos are
+        // live in ~/.tasks/todo.hl immediately.
+        let mut parts: Vec<String> = Vec::new();
+        if committed_cal > 0 {
+            parts.push(format!("{} queued for tock (open tock to import)",
+                committed_cal));
+        }
+        if committed_todo > 0 {
+            parts.push(format!("{} appended to todo.hl", committed_todo));
+        }
+        if committed == 0 && failed == 0 {
+            parts.push("nothing selected".to_string());
+        }
+        if failed > 0 {
+            parts.push(format!("{} failed (see log)", failed));
+        }
+        let summary = format!("Triage: {}", parts.join("; "));
         let color = if failed > 0 {
             tc.feedback_warn
         } else {
