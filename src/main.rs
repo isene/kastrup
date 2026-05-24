@@ -9,6 +9,7 @@ mod organizer;
 mod poller;
 mod source;
 mod sources;
+mod triage;
 
 use crust::{Crust, Pane, Input};
 use crust::style;
@@ -1612,6 +1613,7 @@ impl App {
             "-" => { self.external_react(true); }
             "I" => { self.ai_assistant(); }
             "Z" => { self.open_in_tock(); }
+            "z" => { self.triage_message(); }
 
             // UI
             "w" => { self.cycle_width(); }
@@ -10405,6 +10407,254 @@ impl App {
         );
     }
 
+    /// AI triage — Ctrl+t. Shells out to ~/.kastrup/triage.sh which
+    /// calls `claude --print` with the message context; gets back a
+    /// JSON array of action objects (calendar / todo / clarify);
+    /// shows a multi-pick preview; commits selected actions to tock
+    /// (ICS in ~/.tock/incoming/) and/or ~/.tasks/todo.hl.
+    fn triage_message(&mut self) {
+        let tc = self.config.theme_colors.clone();
+
+        // Resolve the cursor to a real message (skip section headers
+        // in folders/threaded view — same lookup as the save flow).
+        let cursor_id = if self.show_threaded {
+            self.display_messages.get(self.index)
+                .filter(|m| !m.is_header).map(|m| m.id)
+        } else {
+            self.filtered_messages.get(self.index).map(|m| m.id)
+        };
+        let msg_id = match cursor_id {
+            Some(id) => id,
+            None => {
+                self.set_feedback("Triage: no message under cursor",
+                    tc.feedback_warn);
+                return;
+            }
+        };
+        let msg = match self.filtered_messages.iter().find(|m| m.id == msg_id) {
+            Some(m) => m.clone(),
+            None => return,
+        };
+
+        // Optional user-supplied hint. Enter with empty input skips
+        // (Claude triages from the message body alone). The hint is
+        // useful when the actionable item isn't IN the body — e.g.
+        // the message is a secure-PDF link the user wants to follow
+        // up on by a specific date.
+        let hint = self.prompt(
+            "Triage hint (Enter to skip): ", "");
+        self.render_bottom_bar();
+
+        // Build context JSON for the wrapper.
+        let body = self.get_display_content(&msg);
+        let body_short: String = body.chars().take(4000).collect();
+        let today = {
+            let secs = database::now_secs() + local_utc_offset();
+            let (y, m, d) = days_to_ymd(secs / 86400);
+            format!("{:04}-{:02}-{:02}", y, m, d)
+        };
+        let home = std::env::var("HOME").unwrap_or_default();
+        let todo_path = std::path::PathBuf::from(&home).join(".tasks/todo.hl");
+        let mut context = serde_json::json!({
+            "subject":    msg.subject.clone().unwrap_or_default(),
+            "sender":     msg.sender_name.clone().unwrap_or_else(|| msg.sender.clone()),
+            "folder":     msg.folder.clone().unwrap_or_default(),
+            "body":       body_short,
+            "today":      today,
+            "tz":         "Europe/Oslo",
+            "calendars":  triage::read_calendars(),
+            "categories": triage::read_categories(&todo_path),
+        });
+        if !hint.trim().is_empty() {
+            context["user_hint"] = serde_json::json!(hint.trim());
+        }
+
+        self.set_feedback("Triaging with Claude... (~5s)", tc.unread);
+        self.render_bottom_bar();
+
+        let actions = match triage::run_triage(&context.to_string()) {
+            Ok(a) => a,
+            Err(e) => {
+                self.set_feedback(&format!("Triage failed: {}", e),
+                    tc.feedback_warn);
+                return;
+            }
+        };
+
+        if actions.is_empty() {
+            self.set_feedback("Triage: no actionable items found",
+                tc.feedback_info);
+            return;
+        }
+
+        self.triage_preview_and_commit(msg_id, actions, &todo_path);
+    }
+
+    /// Multi-pick preview screen for triage actions.
+    /// Space toggles, j/k moves, Enter commits selected, Esc cancels.
+    fn triage_preview_and_commit(
+        &mut self,
+        msg_id: i64,
+        actions: Vec<triage::Action>,
+        todo_path: &std::path::Path,
+    ) {
+        let tc = self.config.theme_colors.clone();
+        // Pre-select all non-clarify items.
+        let mut selected: Vec<bool> = actions.iter()
+            .map(|a| !matches!(a, triage::Action::Clarify { .. }))
+            .collect();
+        let mut cursor = 0usize;
+
+        loop {
+            // Render preview into the right pane.
+            let mut lines: Vec<String> = Vec::new();
+            lines.push(style::bold(&style::fg(
+                &format!("Triage — message #{} ({} actions)",
+                    msg_id, actions.len()),
+                tc.view_custom)));
+            lines.push(String::new());
+            for (i, a) in actions.iter().enumerate() {
+                let marker = if selected[i] { "[x]" } else { "[ ]" };
+                let arrow = if i == cursor { "→ " } else { "  " };
+                let label = a.short_label();
+                let line = format!("{}{} {}", arrow, marker, label);
+                lines.push(if i == cursor {
+                    style::bold(&style::fg(&line, tc.unread))
+                } else {
+                    style::fg(&line, tc.info_fg)
+                });
+            }
+            lines.push(String::new());
+            lines.push(style::fg(
+                "Space:toggle  j/k:move  Enter:commit selected  Esc:cancel",
+                tc.hint_fg));
+            self.right.set_text(&lines.join("\n"));
+            self.right.ix = 0;
+            self.right.full_refresh();
+            if self.right.border { self.right.border_refresh(); }
+
+            let Some(key) = Input::getchr(None) else { continue };
+            match key.as_str() {
+                "ESC" | "q" => {
+                    self.set_feedback("Triage cancelled", tc.feedback_info);
+                    self.render_all();
+                    return;
+                }
+                "j" | "DOWN" => {
+                    if cursor + 1 < actions.len() { cursor += 1; }
+                }
+                "k" | "UP" => {
+                    if cursor > 0 { cursor -= 1; }
+                }
+                " " | "SPACE" => {
+                    selected[cursor] = !selected[cursor];
+                }
+                "ENTER" => break,
+                _ => {}
+            }
+        }
+
+        // Commit selected actions.
+        let mut committed = 0u32;
+        let mut failed = 0u32;
+        let home = std::env::var("HOME").unwrap_or_default();
+        let tock_home = std::path::PathBuf::from(&home).join(".tock");
+
+        for (i, a) in actions.iter().enumerate() {
+            if !selected[i] { continue; }
+            let res: Result<String, String> = match a {
+                triage::Action::Todo { category, text } => {
+                    triage::append_todo(todo_path, category, text)
+                        .map(|_| format!("todo: [{}] {}", category, text))
+                }
+                triage::Action::Calendar { title, when, duration_min, calendar } => {
+                    self.commit_calendar(msg_id, &tock_home,
+                        title, when, *duration_min, calendar.as_deref())
+                }
+                triage::Action::Clarify { question } => {
+                    // Clarify can't be "committed" — surface to the user
+                    // for now (interactive answer + re-triage is a v2
+                    // feature).
+                    Err(format!("clarify needs manual follow-up: {}", question))
+                }
+            };
+            match res {
+                Ok(_label) => committed += 1,
+                Err(e) => {
+                    failed += 1;
+                    log::info(&format!("triage commit failed: {}", e));
+                }
+            }
+        }
+
+        let summary = if failed > 0 {
+            format!("Triage: {} committed, {} failed (see log)",
+                committed, failed)
+        } else {
+            format!("Triage: {} committed", committed)
+        };
+        let color = if failed > 0 {
+            tc.feedback_warn
+        } else {
+            tc.feedback_ok
+        };
+        self.set_feedback(&summary, color);
+        self.render_all();
+    }
+
+    /// Build a single-event ICS and drop it in ~/.tock/incoming/.
+    /// `when` is ISO8601 ("YYYY-MM-DDTHH:MM:SS+HH:MM"); we parse the
+    /// date + time components and let local_utc_offset() resolve TZ
+    /// implicitly via the existing ICS path. Returns a label on success.
+    fn commit_calendar(
+        &mut self,
+        msg_id: i64,
+        tock_home: &std::path::Path,
+        title: &str,
+        when: &str,
+        duration_min: u32,
+        calendar: Option<&str>,
+    ) -> Result<String, String> {
+        // Parse ISO8601 "YYYY-MM-DDTHH:MM:SS..." — first 19 chars.
+        if when.len() < 16 {
+            return Err(format!("invalid when: {}", when));
+        }
+        let y: i32 = when[0..4].parse().map_err(|_| "bad year")?;
+        let m: u32 = when[5..7].parse().map_err(|_| "bad month")?;
+        let d: u32 = when[8..10].parse().map_err(|_| "bad day")?;
+        let h: u32 = when[11..13].parse().map_err(|_| "bad hour")?;
+        let mi: u32 = when[14..16].parse().map_err(|_| "bad minute")?;
+
+        // Resolve calendar name → numeric id via tock.db. None → default.
+        let cal_id = calendar
+            .and_then(|name| triage_lookup_calendar_id(tock_home, name))
+            .or_else(|| triage_default_calendar_id(tock_home))
+            .unwrap_or(1);
+
+        let incoming = tock_home.join("incoming");
+        let _ = std::fs::create_dir_all(&incoming);
+        let path = incoming.join(format!("kastrup_triage_{}_{}.ics",
+            msg_id, when.replace(':', "").replace('+', "p")));
+
+        let uid = format!("kastrup-triage-{}-{}", msg_id,
+            y * 10000 + m as i32 * 100 + d as i32);
+        let ics = inject_tock_calendar_id(
+            &build_ics_event_dur(&uid, title, "",
+                y, m, d, Some((h, mi)), duration_min),
+            cal_id,
+        );
+        std::fs::write(&path, ics)
+            .map_err(|e| format!("write ics: {}", e))?;
+
+        // Nudge tock to navigate to this date.
+        let goto_path = tock_home.join("goto");
+        let _ = std::fs::write(&goto_path,
+            format!("{:04}-{:02}-{:02}", y, m, d));
+
+        Ok(format!("calendar: {} ({:04}-{:02}-{:02} {:02}:{:02})",
+            title, y, m, d, h, mi))
+    }
+
     // Batch M: Extended Help
     fn show_extended_help(&mut self) {
         let tc = self.config.theme_colors.clone();
@@ -11985,6 +12235,96 @@ fn build_ics_event(uid: &str, summary: &str, description: &str,
              END:VCALENDAR\r\n"
         ),
     }
+}
+
+/// Triage variant of build_ics_event that honours an explicit
+/// duration in minutes (not the fixed 30-min default of the Z path).
+fn build_ics_event_dur(uid: &str, summary: &str, description: &str,
+                       y: i32, m: u32, d: u32, time: Option<(u32, u32)>,
+                       duration_min: u32) -> String {
+    let now_stamp = {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+        let days = secs / 86400;
+        let (yy, mm, dd) = days_to_ymd(days);
+        let tod = secs.rem_euclid(86400);
+        let h = tod / 3600;
+        let mi = (tod % 3600) / 60;
+        let s = tod % 60;
+        format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", yy, mm, dd, h, mi, s)
+    };
+    let escape = |s: &str| s.replace('\\', r"\\").replace(';', r"\;")
+        .replace(',', r"\,").replace('\n', r"\n");
+    let summary = escape(summary);
+    let description = escape(description);
+    let dur = if duration_min == 0 { 30 } else { duration_min };
+
+    match time {
+        Some((h, mi)) => {
+            let total = mi + dur;
+            let (eh, em) = (h + total / 60, total % 60);
+            format!(
+                "BEGIN:VCALENDAR\r\n\
+                 VERSION:2.0\r\n\
+                 PRODID:-//Kastrup//triage//EN\r\n\
+                 CALSCALE:GREGORIAN\r\n\
+                 BEGIN:VEVENT\r\n\
+                 UID:{uid}\r\n\
+                 DTSTAMP:{now_stamp}\r\n\
+                 DTSTART:{y:04}{m:02}{d:02}T{h:02}{mi:02}00\r\n\
+                 DTEND:{y:04}{m:02}{d:02}T{eh:02}{em:02}00\r\n\
+                 SUMMARY:{summary}\r\n\
+                 DESCRIPTION:{description}\r\n\
+                 END:VEVENT\r\n\
+                 END:VCALENDAR\r\n"
+            )
+        }
+        None => format!(
+            "BEGIN:VCALENDAR\r\n\
+             VERSION:2.0\r\n\
+             PRODID:-//Kastrup//triage//EN\r\n\
+             CALSCALE:GREGORIAN\r\n\
+             BEGIN:VEVENT\r\n\
+             UID:{uid}\r\n\
+             DTSTAMP:{now_stamp}\r\n\
+             DTSTART;VALUE=DATE:{y:04}{m:02}{d:02}\r\n\
+             DTEND;VALUE=DATE:{y:04}{m:02}{d:02}\r\n\
+             SUMMARY:{summary}\r\n\
+             DESCRIPTION:{description}\r\n\
+             END:VEVENT\r\n\
+             END:VCALENDAR\r\n"
+        ),
+    }
+}
+
+/// Resolve a tock calendar name → numeric id by querying tock.db.
+/// Returns None if the calendar isn't found (caller falls back to
+/// the default). Read-only access; tock can have the DB open in WAL
+/// mode concurrently without locking issues.
+fn triage_lookup_calendar_id(tock_home: &std::path::Path, name: &str) -> Option<i64> {
+    let db = tock_home.join("tock.db");
+    let conn = rusqlite::Connection::open_with_flags(
+        &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).ok()?;
+    conn.query_row(
+        "SELECT id FROM calendars WHERE name = ? LIMIT 1",
+        rusqlite::params![name],
+        |r| r.get::<_, i64>(0),
+    ).ok()
+}
+
+/// Read tock's default_calendar from ~/.tock/config.yml (a single
+/// `default_calendar: <id>` line).
+fn triage_default_calendar_id(tock_home: &std::path::Path) -> Option<i64> {
+    let cfg = std::fs::read_to_string(tock_home.join("config.yml")).ok()?;
+    for line in cfg.lines() {
+        if let Some(rest) = line.trim().strip_prefix("default_calendar:") {
+            if let Ok(n) = rest.trim().parse::<i64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 /// Get local UTC offset in seconds using libc
