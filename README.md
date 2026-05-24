@@ -25,6 +25,7 @@ Unified terminal messaging client. All your email, chat, and feeds in one TUI. B
 - **Folder browser**: hierarchical Maildir folder navigation (B key)
 - **Search**: substring and notmuch full-text search
 - **AI assistant**: draft, summarize, translate, ask (I key)
+- **AI triage** (z key): Claude reads the current message, optionally takes a free-text hint, and emits a JSON action plan (calendar events to [Tock](https://github.com/isene/tock) / todos to a [hyperlist](https://github.com/isene/hyperlist) at `~/.tasks/todo.hl`). Multi-pick preview before commit; rolling history via `:triage`
 - **Address book**: contact storage and lookup (@ key)
 - **Labels and tagging**: multi-select tagging, label management
 - **Customizable themes**: full 256-color theme editor with presets
@@ -113,9 +114,11 @@ cp target/release/kastrup ~/.local/bin/
 | I | AI assistant menu (draft / summarize / translate / ask) |
 | **c** | **`:claude PROMPT`** — pipe message + custom prompt to `claude -p`, response shown in the right pane |
 | **C** | **`:chat`** — suspend kastrup, open interactive `claude` with the current message snapshot as context |
-| **`:`** | **Colon prompt** — type any verb explicitly: `:claude PROMPT`, `:search QUERY`, `:chat`, `:q`/`:quit` |
+| **`:`** | **Colon prompt** — type any verb explicitly: `:claude PROMPT`, `:search QUERY`, `:chat`, `:triage`, `:q`/`:quit` |
 | Esc | Clear sticky search, return to current view |
-| Z | Open in Tock (calendar events) |
+| **z** | **AI triage** — Claude reads the current message (+ optional hint) and proposes calendar events / hyperlist todos; multi-pick preview before committing to `~/.tock/incoming/` and `~/.tasks/todo.hl` |
+| Z | Open in Tock (regex date capture → calendar event) |
+| **`:triage`** | Show the most recent 20 triage decisions from `~/.kastrup/triage.log` |
 
 ### UI
 | Key | Action |
@@ -173,6 +176,51 @@ To express OR across heterogeneous criteria — e.g. one view for "everything re
 There's nothing source-specific about which view-key gets a "chat" badge or layout — any view (numbered or F-key) can mix mail folders, chat channels, and sender / content patterns however the user wants.
 
 Supported rule fields: `read`, `starred`, `folder`, `source_id`, `source_type`, `sender`. Supported `op` values: `=` (exact) and `like` (SQL `LIKE %value%`, pipe-separated value gives OR-of-LIKE within the field).
+
+## AI triage (`z` key)
+
+Mail and chat make passable todo lists, but the bookkeeping is manual: read the message, decide if it's an event or a task, mentally route it. The `z` key delegates that triage to Claude.
+
+Press `z` on any message:
+
+1. **Optional hint** — kastrup prompts for free-text. Skip with Enter, or steer the result, e.g. `add as a reminder a week before the deadline mentioned in the linked PDF`.
+2. **Triage call** — shells out to `~/.kastrup/triage.sh` (a small bash wrapper around `claude --print`). The system prompt at `~/.kastrup/triage-prompt.txt` constrains Claude to return a strict JSON array of action objects, with the current message subject / sender / folder / body and your tock calendar names + existing hyperlist categories as context.
+3. **Multi-pick preview** — actions render in the right pane with `[x]` / `[ ]` markers. Space to toggle, j/k to move, Enter to commit selected, Esc to cancel.
+4. **Commits** — calendar actions drop an ICS into `~/.tock/incoming/` (picked up by [Tock](https://github.com/isene/tock)); todo actions append to `~/.tasks/todo.hl` under the right category (creates the section if missing), atomically so an open scribe buffer reloads cleanly.
+5. **History** — every triage decision logs to `~/.kastrup/triage.log` (rolling 20 entries). `:triage` displays the log in the right pane.
+
+Both the prompt and the wrapper live as user-editable files in `~/.kastrup/` — tune the prompt without rebuilding kastrup. The shipped defaults install on first `z` use if missing.
+
+Defaults the wrapper expects:
+
+| File | Purpose |
+|------|---------|
+| `~/.kastrup/triage-prompt.txt` | System prompt sent to Claude |
+| `~/.kastrup/triage.sh` | Shell wrapper around `claude --print` |
+| `~/.tasks/todo.hl` | Destination [hyperlist](https://github.com/isene/hyperlist); edit in [scribe](https://github.com/isene/scribe) (which reloads on external append from v0.1.43) |
+| `~/.tock/incoming/` | Drop folder for ICS events (existing Tock convention) |
+| `~/.kastrup/triage.log` | Rolling history of triage decisions |
+
+Action shapes Claude can return:
+
+```json
+[
+  { "kind": "calendar",
+    "title":        "Project kickoff",
+    "when":         "2026-06-03T14:00:00+02:00",
+    "duration_min": 60,
+    "calendar":     "Work" },
+
+  { "kind": "todo",
+    "category":     "Personal",
+    "text":         "Renew passport before travel" },
+
+  { "kind": "clarify",
+    "question":     "Body mentions both 'next week' and a fixed date — one event or two items?" }
+]
+```
+
+A pure FYI message (newsletter, ack, etc.) returns `[]` — no actions, nothing to commit.
 
 ## Architecture
 

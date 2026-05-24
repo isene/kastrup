@@ -4993,9 +4993,11 @@ impl App {
   I              AI assistant / plugins\n\
   c              :claude PROMPT (response in right pane)\n\
   C              :chat (suspend, claude w/ message context)\n\
-  :              Colon command (claude/chat/search/q)\n\
+  :              Colon command (claude/chat/search/triage/q)\n\
   Esc            Clear sticky search, return to current view\n\
-  Z              Tock action\n\n\
+  z              AI triage → tock calendar or ~/.tasks/todo.hl\n\
+  Z              Tock action (regex date capture)\n\
+  :triage        Show triage history (last 20)\n\n\
 {}\n\
   o              Cycle sort order\n\
   i              Invert sort\n\
@@ -9988,6 +9990,7 @@ impl App {
                     self.run_search_with_query(rest);
                 }
             }
+            "triage" => { self.show_triage_history(); }
             "q" | "quit" => { self.running = false; }
             other => {
                 self.set_feedback(&format!("unknown command: {}", other),
@@ -10484,10 +10487,21 @@ impl App {
         if actions.is_empty() {
             self.set_feedback("Triage: no actionable items found",
                 tc.feedback_info);
+            // Still log the call so the history shows "ran but nothing
+            // to commit" — useful debugging when you press z and
+            // nothing happens.
+            let _ = triage::append_log(triage::LogEntry {
+                msg_id,
+                folder: &msg.folder.clone().unwrap_or_default(),
+                sender: &msg.sender_name.clone().unwrap_or_else(|| msg.sender.clone()),
+                subject: msg.subject.as_deref().unwrap_or(""),
+                hint: if hint.trim().is_empty() { None } else { Some(hint.trim()) },
+                results: &[],
+            });
             return;
         }
 
-        self.triage_preview_and_commit(msg_id, actions, &todo_path);
+        self.triage_preview_and_commit(msg_id, &msg, hint.trim().to_string(), actions, &todo_path);
     }
 
     /// Multi-pick preview screen for triage actions.
@@ -10495,6 +10509,8 @@ impl App {
     fn triage_preview_and_commit(
         &mut self,
         msg_id: i64,
+        msg: &message::Message,
+        hint: String,
         actions: Vec<triage::Action>,
         todo_path: &std::path::Path,
     ) {
@@ -10554,14 +10570,21 @@ impl App {
             }
         }
 
-        // Commit selected actions.
+        // Commit selected actions. Collect (action, status) tuples so
+        // we can log the whole decision at the end — including the
+        // unselected items, which show as "skipped" in the log so the
+        // user can see what they declined.
         let mut committed = 0u32;
         let mut failed = 0u32;
         let home = std::env::var("HOME").unwrap_or_default();
         let tock_home = std::path::PathBuf::from(&home).join(".tock");
+        let mut log_results: Vec<(triage::Action, String)> = Vec::new();
 
         for (i, a) in actions.iter().enumerate() {
-            if !selected[i] { continue; }
+            if !selected[i] {
+                log_results.push((a.clone(), "skipped".to_string()));
+                continue;
+            }
             let res: Result<String, String> = match a {
                 triage::Action::Todo { category, text } => {
                     triage::append_todo(todo_path, category, text)
@@ -10579,13 +10602,27 @@ impl App {
                 }
             };
             match res {
-                Ok(_label) => committed += 1,
+                Ok(_label) => {
+                    committed += 1;
+                    log_results.push((a.clone(), "committed".to_string()));
+                }
                 Err(e) => {
                     failed += 1;
                     log::info(&format!("triage commit failed: {}", e));
+                    log_results.push((a.clone(), format!("failed: {}", e)));
                 }
             }
         }
+
+        // Persist the decision so :triage can show recent history.
+        let _ = triage::append_log(triage::LogEntry {
+            msg_id,
+            folder: &msg.folder.clone().unwrap_or_default(),
+            sender: &msg.sender_name.clone().unwrap_or_else(|| msg.sender.clone()),
+            subject: msg.subject.as_deref().unwrap_or(""),
+            hint: if hint.is_empty() { None } else { Some(&hint) },
+            results: &log_results,
+        });
 
         let summary = if failed > 0 {
             format!("Triage: {} committed, {} failed (see log)",
@@ -10653,6 +10690,30 @@ impl App {
 
         Ok(format!("calendar: {} ({:04}-{:02}-{:02} {:02}:{:02})",
             title, y, m, d, h, mi))
+    }
+
+    /// `:triage` — display the contents of ~/.kastrup/triage.log in
+    /// the right pane. The log holds the most recent 20 triage
+    /// decisions (z-key invocations) — one block per call showing
+    /// what message it was, the user's hint (if any), and each
+    /// resulting action with its commit status. Esc returns to the
+    /// message view.
+    fn show_triage_history(&mut self) {
+        let tc = self.config.theme_colors.clone();
+        let home = std::env::var("HOME").unwrap_or_default();
+        let path = std::path::PathBuf::from(&home).join(".kastrup/triage.log");
+        let body = std::fs::read_to_string(&path).unwrap_or_else(|_|
+            "(no triage history yet — press z on a message to triage with Claude)".to_string());
+
+        let header = style::bold(&style::fg(
+            "Triage history (most recent 20)", tc.view_custom));
+        self.right.set_text(&format!("{}\n\n{}", header, body));
+        self.right.ix = 0;
+        self.right.full_refresh();
+        if self.right.border { self.right.border_refresh(); }
+        self.set_feedback("Press any key to return", tc.hint_fg);
+        let _ = Input::getchr(None);
+        self.render_all();
     }
 
     // Batch M: Extended Help
