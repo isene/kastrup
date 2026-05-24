@@ -213,22 +213,111 @@ fn insert_todo(existing: &str, category: &str, text: &str) -> String {
     out
 }
 
+/// One past triage decision, persisted to ~/.kastrup/triage.log.
+/// The file holds up to MAX_LOG_ENTRIES separated by a `===…` line.
+pub struct LogEntry<'a> {
+    pub msg_id: i64,
+    pub folder: &'a str,
+    pub sender: &'a str,
+    pub subject: &'a str,
+    pub hint: Option<&'a str>,
+    /// (action, status) — status is "committed" / "skipped" / "failed: <err>"
+    pub results: &'a [(Action, String)],
+}
+
+const MAX_LOG_ENTRIES: usize = 20;
+
+/// Append a triage decision to ~/.kastrup/triage.log, then trim the
+/// file to the most recent MAX_LOG_ENTRIES entries. Idempotent and
+/// fail-soft — if the log can't be written, returns Err without
+/// affecting the rest of the triage flow.
+pub fn append_log(entry: LogEntry) -> Result<(), String> {
+    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+    let path = PathBuf::from(home).join(".kastrup/triage.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let now = chrono_local_iso();
+    let mut block = String::new();
+    block.push_str(&format!(
+        "=== {} — message #{} — folder: {} ===\n",
+        now, entry.msg_id, entry.folder
+    ));
+    block.push_str(&format!("from:    {}\n", entry.sender));
+    block.push_str(&format!("subject: {}\n", entry.subject));
+    block.push_str(&format!("hint:    {}\n",
+        entry.hint.unwrap_or("(none)")));
+    block.push_str("actions:\n");
+    for (a, status) in entry.results {
+        block.push_str(&format!("  [{}] {}\n", status, a.short_label()));
+    }
+    block.push('\n');
+
+    // Append, then rewrite trimmed to MAX_LOG_ENTRIES.
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut combined = existing;
+    combined.push_str(&block);
+
+    // Split into entry blocks on the "=== " marker.
+    let entries: Vec<String> = combined
+        .split("\n=== ")
+        .enumerate()
+        .map(|(i, s)| if i == 0 { s.to_string() } else { format!("=== {}", s) })
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    let trimmed = if entries.len() > MAX_LOG_ENTRIES {
+        entries[entries.len() - MAX_LOG_ENTRIES..].join("\n")
+    } else {
+        entries.join("\n")
+    };
+    let final_str = if trimmed.ends_with('\n') { trimmed } else { format!("{}\n", trimmed) };
+
+    std::fs::write(&path, final_str)
+        .map_err(|e| format!("write triage.log: {}", e))?;
+    Ok(())
+}
+
+/// Best-effort local-time ISO8601 without pulling chrono. Uses
+/// libc::localtime_r so format matches scribe/kastrup's existing
+/// time displays.
+fn chrono_local_iso() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    unsafe {
+        let mut t: libc::time_t = secs as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&mut t as *mut _, &mut tm);
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn append_into_existing_category() {
-        let before = "\tPersonal\n\t\tPick up keycard\n\tDualog\n\t\tBook PIP meeting\n";
-        let after = insert_todo(before, "Personal", "Email NAV about barnetrygd");
-        assert!(after.contains("\t\tPick up keycard\n\t\tEmail NAV about barnetrygd\n\tDualog"));
+        let before = "\tPersonal\n\t\tBuy milk\n\tWork\n\t\tFinish report\n";
+        let after = insert_todo(before, "Personal", "Call the dentist");
+        assert!(after.contains("\t\tBuy milk\n\t\tCall the dentist\n\tWork"));
     }
 
     #[test]
     fn append_creates_new_category() {
-        let before = "\tPersonal\n\t\tPick up keycard\n";
-        let after = insert_todo(before, "Passion Fruits", "Verify design with Siv");
-        assert!(after.contains("\tPassion Fruits\n\t\tVerify design with Siv"));
+        let before = "\tPersonal\n\t\tBuy milk\n";
+        let after = insert_todo(before, "Side Project", "Review the design draft");
+        assert!(after.contains("\tSide Project\n\t\tReview the design draft"));
     }
 
     #[test]

@@ -35,9 +35,11 @@ Guidelines for choosing kind:
 Category selection (for todo kind):
 - Prefer one of the existing categories listed below
 - Invent a new category only when none reasonably fit
-- Route by the message source: a Dualog mail → "Dualog"; a Passion
-  Fruits mail or Discord channel → "Passion Fruits"; personal mail →
-  "Personal"; etc.
+- Route by the message source: choose a category that matches the
+  folder or channel name (e.g. a mail in folder "Customers.AcmeCo"
+  → "AcmeCo" if that category exists; a Slack message in
+  #project-x → "Project X"; personal mail → "Personal"); fall back
+  to a sensible name when nothing matches.
 
 Text style:
 - Imperative verb-first: "Book a meeting with X", "Reply to Y about Z"
