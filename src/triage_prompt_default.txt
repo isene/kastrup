@@ -50,7 +50,7 @@ Text style:
 Context provided per request (as JSON on the user message):
   { "subject":    string,
     "sender":     string,
-    "folder":     string,           // e.g. "AA.Customers.Dualog"
+    "folder":     string,           // e.g. "Customers.AcmeCo" or "slack.team.#general"
     "body":       string,           // rendered plain text
     "today":      "YYYY-MM-DD",
     "tz":         "Europe/Oslo",    // user's timezone

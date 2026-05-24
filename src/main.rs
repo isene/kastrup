@@ -4296,8 +4296,8 @@ impl App {
         if self.filtered_messages.is_empty() { return; }
 
         // Guard: refuse to file chat / non-maildir messages. The save
-        // shortcuts map to maildir folder paths ("PassionFruits.Archive",
-        // etc.); applying that to a Slack/Discord/IRC message would
+        // shortcuts map to maildir folder paths (e.g. "Archive",
+        // "Projects.X"); applying that to a Slack/Discord/IRC message would
         // just rewrite its DB folder column to a maildir path, hiding
         // it from its real channel while never producing an actual
         // archived file. Email is identified by a `maildir_file` key
