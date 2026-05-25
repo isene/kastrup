@@ -79,10 +79,12 @@ pub fn ensure_files_installed() -> Result<(PathBuf, PathBuf), String> {
     Ok((prompt, wrap))
 }
 
-/// Read tock's calendar name list from ~/.tock/tock.db. Returns an
-/// empty Vec if tock isn't installed or the DB is unreadable — the
-/// triage prompt still works, Claude just can't suggest a specific
-/// calendar.
+/// Read tock's CLOUD calendar names from ~/.tock/tock.db. Local
+/// calendars are filtered out — triage events must always land on a
+/// cloud-synced calendar so they show up on the user's phone too.
+/// Returns an empty Vec if tock isn't installed or the DB is
+/// unreadable; in that case Claude just won't be given a calendar
+/// choice and the caller's default kicks in.
 pub fn read_calendars() -> Vec<String> {
     let home = std::env::var("HOME").unwrap_or_default();
     let db = PathBuf::from(home).join(".tock/tock.db");
@@ -90,7 +92,11 @@ pub fn read_calendars() -> Vec<String> {
     let Ok(conn) = rusqlite::Connection::open_with_flags(
         &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     ) else { return Vec::new(); };
-    let mut stmt = match conn.prepare("SELECT name FROM calendars ORDER BY id") {
+    let mut stmt = match conn.prepare(
+        "SELECT name FROM calendars \
+         WHERE source_type != 'local' AND enabled = 1 \
+         ORDER BY id"
+    ) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
