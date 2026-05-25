@@ -10682,11 +10682,15 @@ impl App {
         let h: u32 = when[11..13].parse().map_err(|_| "bad hour")?;
         let mi: u32 = when[14..16].parse().map_err(|_| "bad minute")?;
 
-        // Resolve calendar name → numeric id via tock.db. None → default.
+        // Resolve calendar name → numeric id via tock.db. Both
+        // lookups reject local calendars, so we can't fall back to
+        // id=1 (Personal) — that would defeat "show up on my phone".
+        // If tock has no cloud calendars at all, surface as an error
+        // instead of silently dropping into a local-only event.
         let cal_id = calendar
             .and_then(|name| triage_lookup_calendar_id(tock_home, name))
             .or_else(|| triage_default_calendar_id(tock_home))
-            .unwrap_or(1);
+            .ok_or_else(|| "no cloud calendar available in tock.db".to_string())?;
 
         let incoming = tock_home.join("incoming");
         let _ = std::fs::create_dir_all(&incoming);
@@ -12379,33 +12383,43 @@ fn build_ics_event_dur(uid: &str, summary: &str, description: &str,
 }
 
 /// Resolve a tock calendar name → numeric id by querying tock.db.
-/// Returns None if the calendar isn't found (caller falls back to
-/// the default). Read-only access; tock can have the DB open in WAL
-/// mode concurrently without locking issues.
+/// Restricted to cloud-synced calendars — local calendars would
+/// never reach the user's phone, which is the whole point of going
+/// through the calendar at all. Returns None if the name doesn't
+/// match any enabled cloud calendar (caller falls back to the
+/// default cloud calendar). Read-only access; tock can have the DB
+/// open in WAL mode concurrently without locking issues.
 fn triage_lookup_calendar_id(tock_home: &std::path::Path, name: &str) -> Option<i64> {
     let db = tock_home.join("tock.db");
     let conn = rusqlite::Connection::open_with_flags(
         &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     ).ok()?;
     conn.query_row(
-        "SELECT id FROM calendars WHERE name = ? LIMIT 1",
+        "SELECT id FROM calendars \
+         WHERE name = ? AND source_type != 'local' AND enabled = 1 \
+         LIMIT 1",
         rusqlite::params![name],
         |r| r.get::<_, i64>(0),
     ).ok()
 }
 
-/// Read tock's default_calendar from ~/.tock/config.yml (a single
-/// `default_calendar: <id>` line).
+/// Pick the default triage calendar: the lowest-id enabled cloud
+/// calendar. tock.config.default_calendar is intentionally ignored
+/// here — that setting often points at the local "Personal"
+/// calendar which would defeat the whole "show up on my phone"
+/// goal. Returns None only if tock.db has zero cloud calendars.
 fn triage_default_calendar_id(tock_home: &std::path::Path) -> Option<i64> {
-    let cfg = std::fs::read_to_string(tock_home.join("config.yml")).ok()?;
-    for line in cfg.lines() {
-        if let Some(rest) = line.trim().strip_prefix("default_calendar:") {
-            if let Ok(n) = rest.trim().parse::<i64>() {
-                return Some(n);
-            }
-        }
-    }
-    None
+    let db = tock_home.join("tock.db");
+    let conn = rusqlite::Connection::open_with_flags(
+        &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).ok()?;
+    conn.query_row(
+        "SELECT id FROM calendars \
+         WHERE source_type != 'local' AND enabled = 1 \
+         ORDER BY id LIMIT 1",
+        [],
+        |r| r.get::<_, i64>(0),
+    ).ok()
 }
 
 /// Get local UTC offset in seconds using libc
