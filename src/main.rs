@@ -1345,6 +1345,58 @@ fn main() {
     app.sync_mail_count();
     log_phase("sync_mail_count (folder counts query)", &mut phase);
 
+    // Stuck-maildir reconcile: find messages where the DB says read=1
+    // but the metadata's maildir_file still points at a new/ subdir.
+    // That mismatch happened when older versions of mark_browsed_as_read
+    // (and similar bulk paths) flipped read=1 in the DB without invoking
+    // sync_maildir_seen_flag. The asmite — which counts files in new/ —
+    // then disagreed with kastrup's view of unread state. One-shot
+    // reconcile here drains the backlog; the paired-write fix in
+    // mark_browsed_as_read keeps it from recurring.
+    {
+        let conn = app.db.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, metadata FROM messages \
+             WHERE read = 1 AND metadata IS NOT NULL \
+               AND instr(metadata, '\"maildir_file\":') > 0 \
+               AND instr(metadata, '/new/') > 0"
+        ).ok();
+        let mut stuck: Vec<(serde_json::Value, i64)> = Vec::new();
+        if let Some(stmt) = stmt.as_mut() {
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+            });
+            if let Ok(rows) = rows {
+                for row in rows.flatten() {
+                    let (id, meta_opt) = row;
+                    let Some(meta_str) = meta_opt else { continue };
+                    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) else { continue };
+                    // Double-check the path actually contains /new/
+                    // (instr above can match on a folder named `…/new/…`
+                    // elsewhere in the JSON; the parsed accessor is the
+                    // authoritative check).
+                    if let Some(p) = meta.get("maildir_file").and_then(|v| v.as_str()) {
+                        if p.contains("/new/") {
+                            stuck.push((meta.clone(), id));
+                        }
+                    }
+                }
+            }
+        }
+        drop(stmt);
+        drop(conn);
+        if !stuck.is_empty() {
+            log::info(&format!(
+                "Reconciling {} stuck maildir file(s) (read=1 in DB, still in new/)",
+                stuck.len()
+            ));
+            for (meta, id) in stuck {
+                let _ = app.write_tx.send(DbWriteOp::SyncMaildirFlag(meta, id));
+            }
+        }
+    }
+    log_phase("stuck-maildir reconcile", &mut phase);
+
     // Start background poller
     let (poller_tx, poller_rx) = std::sync::mpsc::channel();
     let poller = poller::Poller::start(app.db.clone(), poller_tx);
@@ -5608,7 +5660,21 @@ impl App {
         }
         let count = self.browsed_ids.len();
         for &id in &self.browsed_ids.clone() {
-            self.db.mark_as_read(id);
+            // Mirror the on-cursor mark-as-read path (line ~2194):
+            // DB flip + maildir flag sync as a paired write so the
+            // filesystem file gets the `S` flag (and moves out of
+            // new/ into cur/). Without the SyncMaildirFlag half,
+            // the message ends up read=1 in the DB while the file
+            // stays in new/, and the asmite (which counts new/)
+            // reports it as still unread.
+            let metadata = self.filtered_messages.iter()
+                .find(|m| m.id == id)
+                .map(|m| m.metadata.clone())
+                .unwrap_or(serde_json::Value::Null);
+            let _ = self.write_tx.send(DbWriteOp::MarkRead(id));
+            if !metadata.is_null() {
+                let _ = self.write_tx.send(DbWriteOp::SyncMaildirFlag(metadata, id));
+            }
             if let Some(msg) = self.filtered_messages.iter_mut().find(|m| m.id == id) {
                 msg.read = true;
             }
