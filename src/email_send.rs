@@ -66,10 +66,26 @@ pub fn send_email_gmail(
     if recipients.is_empty() {
         return Err("no recipients".to_string());
     }
+    ensure_crypto_provider();
     let (client_id, client_secret, refresh_token) =
         load_oauth_creds(safedir, from_email)?;
     let access_token = refresh_oauth_token(&client_id, &client_secret, &refresh_token)?;
     send_via_xoauth2(from_email, recipients, eml_body, &access_token)
+}
+
+/// Install the process-level rustls crypto provider exactly once.
+/// When both `aws-lc-rs` and `ring` are compiled in (which happens
+/// in our dep graph via ureq + rustls defaults), rustls can't
+/// auto-pick and `ClientConfig::builder()` panics with
+/// "no process-level CryptoProvider available". `install_default()`
+/// is idempotent across the process — subsequent calls return Err
+/// but don't reinstall, so we just discard the result.
+fn ensure_crypto_provider() {
+    use std::sync::OnceLock;
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
 }
 
 /// Read `{safedir}/{from}.json` (Google client_secret `web` block)
