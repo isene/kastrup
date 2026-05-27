@@ -4707,9 +4707,8 @@ impl App {
     /// save handlers know to fetch-on-demand instead of extracting
     /// from a maildir file.
     fn enrich_attachments_from_chat_urls(&mut self) {
-        let msg = match self.filtered_messages.get(self.index) {
-            Some(m) => m, None => return,
-        };
+        let Some(idx) = self.current_filtered_index() else { return; };
+        let msg = &self.filtered_messages[idx];
         if !msg.attachments.is_empty() { return; }
         let urls = extract_slack_file_urls(&msg.content);
         if urls.is_empty() { return; }
@@ -4736,7 +4735,7 @@ impl App {
             }));
         }
         if !synth.is_empty() {
-            self.filtered_messages[self.index].attachments = synth;
+            self.filtered_messages[idx].attachments = synth;
         }
     }
 
@@ -5271,12 +5270,13 @@ impl App {
     /// row is just the listing snapshot. Both x/X paths need the full
     /// body before they can extract HTML.
     fn ensure_full_loaded(&mut self) {
-        if !self.filtered_messages.get(self.index).map(|m| m.full_loaded).unwrap_or(true) {
-            let id = self.filtered_messages[self.index].id;
+        let Some(idx) = self.current_filtered_index() else { return; };
+        if !self.filtered_messages[idx].full_loaded {
+            let id = self.filtered_messages[idx].id;
             if let Some((content, html)) = self.db.get_message_content(id) {
-                self.filtered_messages[self.index].content = content;
-                self.filtered_messages[self.index].html_content = html;
-                self.filtered_messages[self.index].full_loaded = true;
+                self.filtered_messages[idx].content = content;
+                self.filtered_messages[idx].html_content = html;
+                self.filtered_messages[idx].full_loaded = true;
             }
         }
     }
@@ -5771,16 +5771,17 @@ impl App {
     // --- Edit Message (Batch G) ---
 
     fn edit_message(&mut self) {
-        let msg = match self.filtered_messages.get(self.index) { Some(m) => m, None => return };
+        let Some(idx) = self.current_filtered_index() else { return; };
+        let msg = &self.filtered_messages[idx];
         let id = msg.id;
         // Ensure full content
         if !msg.full_loaded {
             if let Some((content, _html)) = self.db.get_message_content(id) {
-                self.filtered_messages[self.index].content = content;
-                self.filtered_messages[self.index].full_loaded = true;
+                self.filtered_messages[idx].content = content;
+                self.filtered_messages[idx].full_loaded = true;
             }
         }
-        let content = self.filtered_messages[self.index].content.clone();
+        let content = self.filtered_messages[idx].content.clone();
         let tmpfile = format!("/tmp/kastrup_edit_{}.txt", std::process::id());
         let _ = std::fs::write(&tmpfile, &content);
 
@@ -6257,14 +6258,48 @@ impl App {
     /// Ensure the selected message has full content loaded.
     fn ensure_full_content(&mut self) {
         if self.index >= self.filtered_messages.len() { return; }
-        if !self.filtered_messages[self.index].full_loaded {
-            let msg_id = self.filtered_messages[self.index].id;
+        self.ensure_full_content_at(self.index);
+    }
+
+    /// Like `ensure_full_content` but for an explicit `filtered_messages`
+    /// index. Reply / forward must use this in threaded view, where
+    /// `self.index` points into `display_messages` (which has header
+    /// pseudo-rows) and the corresponding filtered_messages entry sits
+    /// at a different position.
+    fn ensure_full_content_at(&mut self, idx: usize) {
+        if idx >= self.filtered_messages.len() { return; }
+        if !self.filtered_messages[idx].full_loaded {
+            let msg_id = self.filtered_messages[idx].id;
             if let Some((content, html)) = self.db.get_message_content(msg_id) {
-                self.filtered_messages[self.index].content = content;
-                self.filtered_messages[self.index].html_content = html;
-                self.filtered_messages[self.index].full_loaded = true;
+                self.filtered_messages[idx].content = content;
+                self.filtered_messages[idx].html_content = html;
+                self.filtered_messages[idx].full_loaded = true;
             }
         }
+    }
+
+    /// Resolve the cursor position to an index into `filtered_messages`,
+    /// the canonical full-detail message store. In flat view this is
+    /// just `self.index`. In threaded view `self.index` indexes
+    /// `display_messages` (section headers + cloned message rows) and
+    /// we have to look the underlying message up by id. Returns `None`
+    /// when the cursor sits on a section-header row (no real message)
+    /// or either list is empty.
+    ///
+    /// Reply / forward / etc. MUST go through this — using
+    /// `self.filtered_messages[self.index]` directly produces the
+    /// "reply to email landed in slack draft" bug, because the
+    /// numeric index lines up with a completely unrelated message
+    /// elsewhere in the flat list.
+    fn current_filtered_index(&self) -> Option<usize> {
+        let id = if self.show_threaded {
+            let m = self.display_messages.get(self.index)?;
+            if m.is_header { return None; }
+            m.id
+        } else {
+            self.filtered_messages.get(self.index)?.id
+        };
+        self.filtered_messages.iter().position(|m| m.id == id)
     }
 
     /// Render a sender template: substitute @conv, @msg, @to, @emoji placeholders.
@@ -6368,8 +6403,9 @@ impl App {
         // Snapshot selected-message fields up front — holding &self across
         // mutable calls (set_feedback / edit_body_tempfile / dispatch) would
         // trip the borrow checker.
+        let Some(idx) = self.current_filtered_index() else { return false; };
         let (plugin_type, conv, msg_id, folder) = {
-            let msg = &self.filtered_messages[self.index];
+            let msg = &self.filtered_messages[idx];
             (
                 msg.source_type.clone(),
                 msg.metadata.get("conversation_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -6480,12 +6516,20 @@ impl App {
 
         // Default: the currently-selected message's channel if it's reachable,
         // otherwise the first listed (most recent in the dominant source).
-        let selected = &self.filtered_messages[self.index];
-        let default_ix = targets.iter().position(|t| {
-            t.source_id == selected.source_id
-                && selected.metadata.get("conversation_id").and_then(|v| v.as_str())
-                    .map_or(false, |c| c == t.conversation_id)
-        }).unwrap_or(0);
+        // current_filtered_index() handles threaded-view's display_messages
+        // mapping — using self.index directly into filtered_messages here
+        // landed the default on the wrong conversation in conversation view.
+        let default_ix = match self.current_filtered_index() {
+            Some(idx) => {
+                let selected = &self.filtered_messages[idx];
+                targets.iter().position(|t| {
+                    t.source_id == selected.source_id
+                        && selected.metadata.get("conversation_id").and_then(|v| v.as_str())
+                            .map_or(false, |c| c == t.conversation_id)
+                }).unwrap_or(0)
+            }
+            None => 0,
+        };
 
         // Only the selected message's own source is reachable from this cursor?
         // If so, only one target in the view → skip picker entirely.
@@ -6580,9 +6624,17 @@ impl App {
 
     fn reply(&mut self, _force_editor: bool) {
         if self.maybe_external_reply() { return; }
-        if self.filtered_messages.is_empty() { return; }
-        self.ensure_full_content();
-        let msg = &self.filtered_messages[self.index];
+        let Some(idx) = self.current_filtered_index() else {
+            // Cursor on a section header in threaded view, or nothing
+            // selected — there's no message to reply to.
+            self.set_feedback(
+                "Reply needs a message — cursor is on a section header",
+                self.config.theme_colors.feedback_warn,
+            );
+            return;
+        };
+        self.ensure_full_content_at(idx);
+        let msg = &self.filtered_messages[idx];
         self.compose_source_type = Some(msg.source_type.clone());
         self.pending_reply_id = Some(msg.id);
 
@@ -6667,9 +6719,15 @@ impl App {
     }
 
     fn reply_all(&mut self) {
-        if self.filtered_messages.is_empty() { return; }
-        self.ensure_full_content();
-        let msg = &self.filtered_messages[self.index];
+        let Some(idx) = self.current_filtered_index() else {
+            self.set_feedback(
+                "Reply-all needs a message — cursor is on a section header",
+                self.config.theme_colors.feedback_warn,
+            );
+            return;
+        };
+        self.ensure_full_content_at(idx);
+        let msg = &self.filtered_messages[idx];
         self.compose_source_type = Some(msg.source_type.clone());
         self.pending_reply_id = Some(msg.id);
 
@@ -6726,10 +6784,16 @@ impl App {
     }
 
     fn forward_inline(&mut self) {
-        if self.filtered_messages.is_empty() { return; }
+        let Some(idx) = self.current_filtered_index() else {
+            self.set_feedback(
+                "Forward needs a message — cursor is on a section header",
+                self.config.theme_colors.feedback_warn,
+            );
+            return;
+        };
         self.compose_source_type = Some("email".to_string()); // forwarding is always email
-        self.ensure_full_content();
-        let msg = &self.filtered_messages[self.index];
+        self.ensure_full_content_at(idx);
+        let msg = &self.filtered_messages[idx];
         self.pending_forward_ids = vec![msg.id];
 
         let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
@@ -6850,8 +6914,14 @@ impl App {
     }
 
     fn forward_attach(&mut self) {
-        if self.filtered_messages.is_empty() { return; }
-        let msg = &self.filtered_messages[self.index];
+        let Some(idx) = self.current_filtered_index() else {
+            self.set_feedback(
+                "Forward needs a message — cursor is on a section header",
+                self.config.theme_colors.feedback_warn,
+            );
+            return;
+        };
+        let msg = &self.filtered_messages[idx];
         self.compose_source_type = Some("email".to_string()); // forwarding is always email
         self.pending_forward_ids = vec![msg.id];
 
@@ -7198,11 +7268,13 @@ impl App {
             // ESC/n falls through to fresh compose
         }
 
-        // Set compose source type from current message context
-        self.compose_source_type = if !self.filtered_messages.is_empty() {
-            Some(self.filtered_messages[self.index].source_type.clone())
-        } else {
-            Some("email".to_string())
+        // Set compose source type from current message context.
+        // current_filtered_index() handles threaded-view's display_messages
+        // indirection — using self.index directly into filtered_messages
+        // sampled the wrong message's source_type in conversation view.
+        self.compose_source_type = match self.current_filtered_index() {
+            Some(idx) => Some(self.filtered_messages[idx].source_type.clone()),
+            None => Some("email".to_string())
         };
 
         // Weechat-relay compose: same split as reply() — Slack channels
@@ -7257,11 +7329,13 @@ impl App {
     /// `None` so the caller falls through to the email compose path.
     fn compose_weechat_target_from_context(&self) -> Option<String> {
         // Selected message wins — it's the most specific signal.
-        if let Some(msg) = self.filtered_messages.get(self.index) {
-            if msg.source_type == "weechat-relay" {
-                if let Some(folder) = msg.folder.as_deref() {
-                    if !folder.is_empty() { return Some(folder.to_string()); }
-                }
+        // Route through current_filtered_index() so threaded view
+        // resolves through display_messages.
+        let idx = self.current_filtered_index()?;
+        let msg = self.filtered_messages.get(idx)?;
+        if msg.source_type == "weechat-relay" {
+            if let Some(folder) = msg.folder.as_deref() {
+                if !folder.is_empty() { return Some(folder.to_string()); }
             }
         }
         None
@@ -8539,23 +8613,23 @@ impl App {
 
 impl App {
     fn view_attachments(&mut self) {
-        if self.filtered_messages.is_empty() { return; }
+        let Some(idx) = self.current_filtered_index() else { return; };
         // Ensure full content loaded for MIME extraction
-        self.ensure_full_content();
+        self.ensure_full_content_at(idx);
         // Try MIME extraction if attachments are empty
-        if self.filtered_messages[self.index].attachments.is_empty() {
-            let msg = &self.filtered_messages[self.index];
+        if self.filtered_messages[idx].attachments.is_empty() {
+            let msg = &self.filtered_messages[idx];
             if msg.content.contains("Content-Type:") {
                 let atts = extract_mime_attachments(&msg.content, msg.id);
                 if !atts.is_empty() {
-                    self.filtered_messages[self.index].attachments = atts;
+                    self.filtered_messages[idx].attachments = atts;
                 }
             }
         }
         // Chat message URL → synthetic attachments. Lets `v` work
         // uniformly for email AND chat (Slack files etc.).
         self.enrich_attachments_from_chat_urls();
-        let msg = &self.filtered_messages[self.index];
+        let msg = &self.filtered_messages[idx];
         if msg.attachments.is_empty() {
             self.set_feedback("No attachments", self.config.theme_colors.feedback_warn);
             return;
