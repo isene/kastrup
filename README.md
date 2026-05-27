@@ -30,7 +30,7 @@ Unified terminal messaging client. All your email, chat, and feeds in one TUI. B
 - **Labels and tagging**: multi-select tagging, label management
 - **Customizable themes**: full 256-color theme editor with presets
 - **Per-view settings**: independent sort, thread mode, and section order per view
-- **Shared database**: uses the same SQLite DB as Heathrow (~/.heathrow/heathrow.db)
+- **SQLite database**: messages and metadata at `~/.kastrup/kastrup.db`
 
 ## Install
 
@@ -137,9 +137,9 @@ cp target/release/kastrup ~/.local/bin/
 
 ## Configuration
 
-Config file: `~/.heathrow/config.yml`
+Config file: `~/.kastrup/kastruprc`
 
-On first run, Kastrup creates the database and guides you through initial setup (default email, editor, SMTP command).
+On first run, Kastrup creates the database and guides you through initial setup (default email, editor).
 
 ### External fetch scripts (messenger / instagram)
 
