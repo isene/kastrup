@@ -1142,8 +1142,8 @@ fn row_to_source(row: &rusqlite::Row) -> Source {
     }
 }
 
-/// Path to ~/.heathrow/heathrow.db
+/// Path to ~/.kastrup/kastrup.db
 fn db_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".heathrow").join("heathrow.db")
+    PathBuf::from(home).join(".kastrup").join("kastrup.db")
 }
