@@ -652,6 +652,56 @@ impl Database {
         }
     }
 
+    /// Collect (metadata, id) for unread maildir rows in the given id
+    /// set. Mirror of `collect_unread_maildir_targets` but scoped by
+    /// an explicit `id IN (...)` instead of a `Filters` predicate —
+    /// used when the caller already knows exactly which messages to
+    /// touch (e.g. the visible view).
+    pub fn collect_unread_maildir_targets_by_ids(
+        &self,
+        ids: &[i64],
+    ) -> Vec<(serde_json::Value, i64)> {
+        if ids.is_empty() { return Vec::new(); }
+        let conn = self.conn.lock().unwrap();
+        let ph: Vec<&str> = ids.iter().map(|_| "?").collect();
+        let sql = format!(
+            "SELECT id, metadata FROM messages \
+             WHERE id IN ({}) AND (read = 0 OR read IS NULL) \
+               AND metadata IS NOT NULL",
+            ph.join(",")
+        );
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let mut out = Vec::new();
+        let Ok(mut stmt) = conn.prepare(&sql) else { return out; };
+        let rows = stmt.query_map(param_refs.as_slice(), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        });
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                let (id, meta_opt) = row;
+                let Some(meta_str) = meta_opt else { continue };
+                let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) else { continue };
+                out.push((meta, id));
+            }
+        }
+        out
+    }
+
+    /// Flip `read = 1` on the explicit id set. No-op if empty.
+    pub fn mark_as_read_by_ids(&self, ids: &[i64]) {
+        if ids.is_empty() { return; }
+        let conn = self.conn.lock().unwrap();
+        let ph: Vec<&str> = ids.iter().map(|_| "?").collect();
+        let sql = format!(
+            "UPDATE messages SET read = 1 WHERE read = 0 AND id IN ({})",
+            ph.join(",")
+        );
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let _ = conn.execute(&sql, param_refs.as_slice());
+    }
+
     /// Delete messages by IDs
     pub fn delete_messages(&self, ids: &[i64]) {
         if ids.is_empty() { return; }
