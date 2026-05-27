@@ -1,6 +1,6 @@
 [package]
 name = "kastrup"
-version = "0.1.133"
+version = "0.1.134"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
 description = "Unified messaging hub TUI, built on crust."
@@ -19,6 +19,11 @@ ureq = { version = "2", features = ["tls"] }
 regex = "1"
 libc = "0.2"
 socket2 = { version = "0.5", features = ["all"] }
+# Native Rust SMTP send (XOAUTH2 to Gmail). native-tls for the TLS
+# transport, base64 for the SASL XOAUTH2 string encoding. ureq above
+# already handles the OAuth-refresh HTTPS POST.
+native-tls = "0.2"
+base64 = "0.22"
 
 [profile.release]
 opt-level = 3

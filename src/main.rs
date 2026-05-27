@@ -2,6 +2,7 @@ mod chat_send;
 mod completion_ipc;
 mod config;
 mod database;
+mod email_send;
 mod log;
 mod mailfile;
 mod message;
@@ -8548,18 +8549,23 @@ impl App {
         let _ = std::fs::write(folder.join("cur").join(&fname), rfc_msg);
     }
 
-    /// Kick off an SMTP send in the background. The shell command runs
+    /// Kick off an SMTP send in the background. The native send runs
     /// on a dedicated worker thread so a slow oauth refresh or a TCP
     /// open-timeout no longer freezes the TUI — main loop stays
     /// responsive and `pump_pending_send` finishes the transaction
     /// when the worker's result lands on the mpsc channel.
+    ///
+    /// Calls into `email_send::send_email_gmail` directly — no shell
+    /// subprocess, no Ruby `gmail_smtp`, no Python `oauth2.py`. The
+    /// XOAUTH2 + SMTP path lives in `src/email_send.rs`.
     ///
     /// Returns `true` when the send was queued; `false` if another
     /// send is already in flight (caller should leave the tempfile
     /// alone and surface a "busy" toast).
     fn spawn_smtp_send(
         &mut self,
-        cmd: String,
+        from_email: String,
+        recipients: Vec<String>,
         to_display: String,
         tmpfile: String,
         rfc_msg: String,
@@ -8575,22 +8581,12 @@ impl App {
             return false;
         }
         let (tx, rx) = std::sync::mpsc::channel::<SendOutcome>();
+        let worker_rfc = rfc_msg.clone();
         std::thread::spawn(move || {
-            let outcome = match std::process::Command::new("sh")
-                .arg("-c").arg(&cmd).output()
-            {
-                Ok(o) if o.status.success() => Ok(()),
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    let msg = if stderr.trim().is_empty() {
-                        format!("exit {}", o.status.code().unwrap_or(-1))
-                    } else {
-                        stderr.lines().next().unwrap_or("unknown error").to_string()
-                    };
-                    Err(msg)
-                }
-                Err(e) => Err(format!("spawn failed: {}", e)),
-            };
+            let safedir = email_send::default_safedir();
+            let outcome = email_send::send_email_gmail(
+                &safedir, &from_email, &recipients, worker_rfc.as_bytes(),
+            );
             // Receiver may have been dropped if kastrup is shutting
             // down mid-send; that's fine, the user has bigger
             // problems than a missing toast.
@@ -8756,16 +8752,15 @@ impl App {
             } else { addr.to_string() };
             if email.contains('@') { recipients.push(email); }
         }
-        let cmd = format!("{} -f {} -i {} < '{}'",
-            smtp_expanded, from_email, recipients.join(" "), smtp_tmpfile);
         log::info(&format!("SMTP (with attachments): {} -> {} ({} att)", from_email, recipients.join(", "), attachments.len()));
-        // Hand off to the worker thread — main loop stays interactive
-        // while the SMTP child blocks on oauth refresh / TLS / etc.
+        // Hand off to the worker thread — native SMTP+XOAUTH2 to
+        // Gmail; main loop stays interactive while the worker does
+        // the oauth refresh + TLS handshake + DATA upload.
         let forward_ids = std::mem::take(&mut self.pending_forward_ids);
         let reply_id = self.pending_reply_id.take();
         let att_n = attachments.len();
         self.spawn_smtp_send(
-            cmd, to, smtp_tmpfile, rfc_msg,
+            from_email, recipients, to, smtp_tmpfile, rfc_msg,
             forward_ids, reply_id, Some(att_n),
         );
     }
@@ -8869,13 +8864,11 @@ impl App {
             } else { addr.to_string() };
             if email.contains('@') { recipients.push(email); }
         }
-        let cmd = format!("{} -f {} -i {} < '{}'",
-            smtp_expanded, from_email, recipients.join(" "), smtp_tmpfile);
         log::info(&format!("SMTP: {} -> {}", from_email, recipients.join(", ")));
         let forward_ids = std::mem::take(&mut self.pending_forward_ids);
         let reply_id = self.pending_reply_id.take();
         self.spawn_smtp_send(
-            cmd, to, smtp_tmpfile, rfc_msg,
+            from_email, recipients, to, smtp_tmpfile, rfc_msg,
             forward_ids, reply_id, None,
         );
     }
