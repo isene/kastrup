@@ -27,9 +27,12 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
 const SMTP_HOST: &str = "smtp.gmail.com";
 const SMTP_PORT: u16 = 465;
@@ -154,10 +157,22 @@ fn send_via_xoauth2(
     tcp.set_write_timeout(Some(IO_TIMEOUT)).ok();
     tcp.set_nodelay(true).ok();
 
-    let connector = native_tls::TlsConnector::new()
-        .map_err(|e| format!("tls connector: {}", e))?;
-    let tls = connector.connect(SMTP_HOST, tcp)
-        .map_err(|e| format!("tls handshake: {}", e))?;
+    // rustls client config with Mozilla webpki-roots. Cached per
+    // connection (cheap) rather than per-process because the SMTP
+    // path runs from a worker thread that's spawned-and-dropped per
+    // send; static caching would need a OnceCell + locking and the
+    // build cost is sub-millisecond.
+    let mut root_store = RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let server_name = ServerName::try_from(SMTP_HOST)
+        .map_err(|e| format!("server name: {}", e))?
+        .to_owned();
+    let conn = ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|e| format!("rustls client init: {}", e))?;
+    let tls: StreamOwned<ClientConnection, TcpStream> = StreamOwned::new(conn, tcp);
 
     let mut io = SmtpIo::new(tls);
 
@@ -188,34 +203,30 @@ fn send_via_xoauth2(
     io.expect("250", "end-of-data")?;
 
     // QUIT is best-effort; if the server already accepted the
-    // message a failure here doesn't affect delivery.
+    // message a failure here doesn't affect delivery. Dropping
+    // `io` closes both the rustls connection and the TCP socket.
     let _ = io.write_line("QUIT");
     let _ = io.expect("221", "QUIT");
-    let _ = io.into_inner().shutdown();
     Ok(())
 }
 
-/// Owns the TLS stream and a BufReader on a clone of it, so we can
-/// alternate command-write and response-read without fighting the
-/// borrow checker on a single `&mut TlsStream`.
+/// Owns the rustls-wrapped TCP stream + a small byte buffer for
+/// line accumulation. All reads/writes route through `&mut self.tls`
+/// so we don't need to clone the stream (rustls' StreamOwned isn't
+/// Clone, and the sync API doesn't need it anyway).
 struct SmtpIo {
-    writer: native_tls::TlsStream<TcpStream>,
-    // Reader holds a separate BufReader created from the same
-    // stream via a re-wrap; we can't try_clone the TlsStream itself.
-    // Instead, route all reads through `&mut self.writer` and own
-    // an internal byte buffer for line accumulation.
+    tls: StreamOwned<ClientConnection, TcpStream>,
     buf: Vec<u8>,
 }
 impl SmtpIo {
-    fn new(tls: native_tls::TlsStream<TcpStream>) -> Self {
-        Self { writer: tls, buf: Vec::with_capacity(512) }
+    fn new(tls: StreamOwned<ClientConnection, TcpStream>) -> Self {
+        Self { tls, buf: Vec::with_capacity(512) }
     }
-    fn into_inner(self) -> native_tls::TlsStream<TcpStream> { self.writer }
 
     fn write_line(&mut self, line: &str) -> Result<(), String> {
-        self.writer.write_all(line.as_bytes())
+        self.tls.write_all(line.as_bytes())
             .map_err(|e| format!("smtp write: {}", e))?;
-        self.writer.write_all(b"\r\n")
+        self.tls.write_all(b"\r\n")
             .map_err(|e| format!("smtp write CRLF: {}", e))?;
         Ok(())
     }
@@ -229,15 +240,15 @@ impl SmtpIo {
         for line in s.split('\n') {
             let line = line.trim_end_matches('\r');
             if line.starts_with('.') {
-                self.writer.write_all(b".")
+                self.tls.write_all(b".")
                     .map_err(|e| format!("smtp dot-stuff: {}", e))?;
             }
-            self.writer.write_all(line.as_bytes())
+            self.tls.write_all(line.as_bytes())
                 .map_err(|e| format!("smtp body: {}", e))?;
-            self.writer.write_all(b"\r\n")
+            self.tls.write_all(b"\r\n")
                 .map_err(|e| format!("smtp body CRLF: {}", e))?;
         }
-        self.writer.write_all(b".\r\n")
+        self.tls.write_all(b".\r\n")
             .map_err(|e| format!("smtp data terminator: {}", e))?;
         Ok(())
     }
@@ -248,7 +259,7 @@ impl SmtpIo {
         self.buf.clear();
         let mut byte = [0u8; 1];
         loop {
-            self.writer.read_exact(&mut byte)
+            self.tls.read_exact(&mut byte)
                 .map_err(|e| format!("smtp read: {}", e))?;
             self.buf.push(byte[0]);
             // Each line ends with CRLF. Check whether we just

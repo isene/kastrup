@@ -1,6 +1,6 @@
 [package]
 name = "kastrup"
-version = "0.1.134"
+version = "0.1.135"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
 description = "Unified messaging hub TUI, built on crust."
@@ -19,10 +19,14 @@ ureq = { version = "2", features = ["tls"] }
 regex = "1"
 libc = "0.2"
 socket2 = { version = "0.5", features = ["all"] }
-# Native Rust SMTP send (XOAUTH2 to Gmail). native-tls for the TLS
-# transport, base64 for the SASL XOAUTH2 string encoding. ureq above
-# already handles the OAuth-refresh HTTPS POST.
-native-tls = "0.2"
+# Native Rust SMTP send (XOAUTH2 to Gmail). rustls (pure-Rust TLS,
+# no OpenSSL dep — important for cross-compile aarch64 CI) +
+# webpki-roots (Mozilla CA bundle). Versions match what ureq
+# already pulls in transitively so we share crates rather than
+# bloating the binary with two TLS backends. base64 for SASL
+# XOAUTH2 encoding.
+rustls = "0.23"
+webpki-roots = "0.26"
 base64 = "0.22"
 
 [profile.release]
