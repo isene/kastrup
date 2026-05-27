@@ -37,6 +37,13 @@ enum DbWriteOp {
         filters: Option<database::Filters>,
         maildir_source_ids: Vec<i64>,
     },
+    /// Mark-read scoped to an explicit list of message ids — used by
+    /// the `A` keypress to flip only what's actually visible in the
+    /// current `filtered_messages` view (sticky search, conversation
+    /// grouping, ad-hoc tag picks etc. don't always reduce to a
+    /// `Filters` predicate). Same maildir-rename + metadata bulk-update
+    /// path as `MarkAllReadBulk`, just scoped by `id IN (...)`.
+    MarkReadByIds(Vec<i64>),
     SetSetting(String, String),
     Execute(String, Vec<String>), // raw SQL with string params
 }
@@ -1203,6 +1210,36 @@ fn main() {
                 DbWriteOp::SyncMaildirFlag(metadata, id) => {
                     sync_maildir_seen_flag_bg(&metadata, &writer_db, id);
                 }
+                DbWriteOp::MarkReadByIds(ids) => {
+                    // Same shape as MarkAllReadBulk, but scoped to an
+                    // explicit id set so we cover exactly what was on
+                    // screen — no risk of touching anything outside the
+                    // current view.
+                    if !ids.is_empty() {
+                        let targets = writer_db.collect_unread_maildir_targets_by_ids(&ids);
+                        writer_db.mark_as_read_by_ids(&ids);
+                        let mut updates: Vec<(String, i64)> = Vec::with_capacity(targets.len());
+                        for (metadata, id) in &targets {
+                            if let Some(new_meta) = rename_maildir_add_seen(metadata) {
+                                let json = serde_json::to_string(&new_meta).unwrap_or_default();
+                                updates.push((json, *id));
+                            }
+                        }
+                        if !updates.is_empty() {
+                            let conn = writer_db.conn.lock().unwrap();
+                            let tx = conn.unchecked_transaction();
+                            if let Ok(tx) = tx {
+                                if let Ok(mut stmt) = tx.prepare("UPDATE messages SET metadata = ? WHERE id = ?") {
+                                    for (json, id) in &updates {
+                                        let _ = stmt.execute(rusqlite::params![json, id]);
+                                    }
+                                }
+                                let _ = tx.commit();
+                            }
+                        }
+                        counts_dirty = true;
+                    }
+                }
                 DbWriteOp::MarkAllReadBulk { filters, maildir_source_ids } => {
                     // 1. Collect unread maildir targets BEFORE flipping read=1.
                     //    Filter is `source_id IN (maildir-ids) AND read=0` so
@@ -1577,6 +1614,9 @@ impl App {
             }
             " " | "SPACE" => {
                 if self.show_threaded { self.toggle_collapse(); }
+            }
+            "C-SPACE" => {
+                if self.show_threaded { self.toggle_collapse_all(); }
             }
             "n" => { self.next_unread(); }
             "p" => { self.prev_unread(); }
@@ -3802,6 +3842,54 @@ impl App {
         self.render_all();
     }
 
+    /// Toggle collapse on every section in the threaded display. If
+    /// any section is currently expanded, this collapses them all.
+    /// If they're already all collapsed, it expands them. Cursor lands
+    /// on the section header it started inside so the view doesn't
+    /// teleport.
+    fn toggle_collapse_all(&mut self) {
+        if !self.show_threaded { return; }
+        // Collect the unique section names in display order.
+        let names: Vec<String> = self.display_messages.iter()
+            .filter(|m| m.is_header)
+            .filter_map(|m| m.thread_id.clone())
+            .collect();
+        if names.is_empty() { return; }
+        // If every section is already collapsed, expand them all.
+        // Otherwise collapse the lot.
+        let all_collapsed = names.iter()
+            .all(|n| *self.section_collapsed.get(n).unwrap_or(&false));
+        let target = !all_collapsed;
+        for n in &names {
+            self.section_collapsed.insert(n.clone(), target);
+        }
+        // Snap the cursor to the section it was in so a follow-up
+        // expand puts the user back where they were.
+        let cursor_section: Option<String> = {
+            let mut ix = self.index;
+            while ix > 0 && !self.display_messages[ix].is_header { ix -= 1; }
+            self.display_messages.get(ix)
+                .filter(|m| m.is_header)
+                .and_then(|m| m.thread_id.clone())
+        };
+        self.rebuild_display();
+        if let Some(name) = cursor_section {
+            if let Some(pos) = self.display_messages.iter()
+                .position(|m| m.is_header && m.thread_id.as_deref() == Some(name.as_str()))
+            {
+                self.index = pos;
+            }
+        }
+        let n = names.len();
+        let msg = if target {
+            format!("Collapsed {} sections", n)
+        } else {
+            format!("Expanded {} sections", n)
+        };
+        self.set_feedback(&msg, self.config.theme_colors.feedback_info);
+        self.render_all();
+    }
+
     fn collapse_current(&mut self) {
         if !self.show_threaded { return; }
         if let Some(msg) = self.display_messages.get(self.index) {
@@ -4122,33 +4210,32 @@ impl App {
 
     fn mark_all_read(&mut self) {
         let okcol = self.config.theme_colors.feedback_ok;
+        let warncol = self.config.theme_colors.feedback_warn;
 
-        // Build filters matching current view
-        let filters = self.current_view_filters();
-
-        // Identify maildir-typed sources so the writer can scope its
-        // unread-collect by `source_id IN (...)`. Cheap HashMap walk
-        // on cached metadata — no DB hit.
-        let maildir_source_ids: Vec<i64> = self.source_type_map.iter()
-            .filter_map(|(id, t)| if t == "maildir" { Some(*id) } else { None })
+        // Scope strictly to what's visible in the current view. Using
+        // `filtered_messages` as the source of truth means search,
+        // conversation grouping, ad-hoc tagging, and other in-memory
+        // narrowings are all respected — no chance of "A" reaching a
+        // message that isn't on screen.
+        let ids: Vec<i64> = self.filtered_messages.iter()
+            .filter(|m| !m.read)
+            .map(|m| m.id)
             .collect();
+        if ids.is_empty() {
+            self.set_feedback("Nothing unread in this view", warncol);
+            return;
+        }
+        let n = ids.len();
 
-        // Hand the whole sequence off to the writer thread:
-        //   1. SELECT unread maildir rows (source-scoped, read=0 →
-        //      tiny result set even on a 250k-msg DB).
-        //   2. UPDATE messages SET read=1 across the filter scope.
-        //   3. Rename files outside the conn lock.
-        //   4. Bulk metadata UPDATE under one transaction.
-        // Main thread does the in-memory flip immediately so the UI
-        // reflects "read" without waiting on the writer.
-        let _ = self.write_tx.send(DbWriteOp::MarkAllReadBulk {
-            filters: filters.clone(),
-            maildir_source_ids,
-        });
+        // Writer thread does the SQL UPDATE, the maildir-flag rename,
+        // and the bulk metadata bump in one shot. Main thread flips the
+        // in-memory rows immediately so the UI reflects "read" without
+        // waiting on the writer.
+        let _ = self.write_tx.send(DbWriteOp::MarkReadByIds(ids));
         for msg in &mut self.filtered_messages {
             msg.read = true;
         }
-        self.set_feedback("Marked all as read", okcol);
+        self.set_feedback(&format!("Marked {} as read", n), okcol);
         self.sync_mail_count();
         self.render_all();
     }
@@ -4869,18 +4956,6 @@ impl App {
         crust::clipboard_copy(&crust::strip_ansi(text), "clipboard");
     }
 
-    /// Build a Filters struct matching the current view (for mark-all-read)
-    fn current_view_filters(&self) -> Option<Filters> {
-        match self.current_view.as_str() {
-            "A" => None,
-            "N" => {
-                let mut f = Filters::default();
-                f.is_read = Some(false);
-                Some(f)
-            }
-            _ => None,
-        }
-    }
 }
 
 // --- UI controls ---
