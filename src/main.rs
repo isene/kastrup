@@ -52,6 +52,38 @@ use config::{Config, Identity};
 use database::{Database, Filters};
 use message::Message;
 
+/// One in-flight SMTP send. The shell child runs on a dedicated
+/// thread and sends `(success, stderr)` back through `result_rx` when
+/// it exits; main thread picks the result up in `pump_pending_send`
+/// and finishes the transaction (sent-folder copy, tempfile cleanup,
+/// reply / forward flag updates, feedback toast).
+struct PendingSend {
+    result_rx: std::sync::mpsc::Receiver<SendOutcome>,
+    /// "To: …" display string for the toast.
+    to_display: String,
+    /// `/tmp/kastrup_send_<pid>.eml` — kept on failure for debugging,
+    /// removed on success.
+    tmpfile: String,
+    /// Full RFC822 message, copied into the local Sent maildir on
+    /// success.
+    rfc_msg: String,
+    /// Forward / reply book-keeping deferred until after the wire
+    /// send actually succeeds. `forward_ids` populates `mark_forwarded`,
+    /// `reply_id` triggers `mark_replied`.
+    forward_ids: Vec<i64>,
+    reply_id: Option<i64>,
+    /// `Some(n)` if the send carries that many attachments; used in
+    /// the success toast for the attach path. `None` keeps the plain
+    /// "Sent to X" wording.
+    attachment_count: Option<usize>,
+}
+
+/// What the SMTP worker thread reports back. `Ok(())` means the
+/// child exited 0; `Err(msg)` carries the first stderr line (or a
+/// synthetic "exit N" string when stderr was empty) so the toast can
+/// show something actionable.
+type SendOutcome = Result<(), String>;
+
 // --- Compose target picker ---
 
 /// One reachable destination for `m` (compose new). Harvested from the
@@ -907,6 +939,14 @@ struct App {
     pending_forward_ids: Vec<i64>,
     pending_forward_attachments: Vec<String>,
     pending_reply_id: Option<i64>,
+    /// In-flight SMTP send. The worker thread runs the shell command
+    /// and posts its (ok, stderr) result through this channel; the
+    /// main loop calls `pump_pending_send` each tick to finish the
+    /// transaction (save_to_sent / remove tempfile / mark_replied /
+    /// feedback toast). `None` means no send is currently in flight.
+    /// We only allow one at a time — UI feedback when a second
+    /// attempt starts before the first completes.
+    pending_send: Option<PendingSend>,
     compose_source_type: Option<String>,
     /// Set by the recall path so an unmodified editor return still
     /// lands on the review screen (Send / Postpone / Cancel) instead
@@ -1342,6 +1382,7 @@ fn main() {
         pending_forward_ids: Vec::new(),
         pending_forward_attachments: Vec::new(),
         pending_reply_id: None,
+        pending_send: None,
         compose_source_type: None,
         compose_force_review: false,
         compose_kind: DraftKind::Email,
@@ -1463,6 +1504,10 @@ fn main() {
     }
 
     while app.running {
+        // Pick up any completed background SMTP send. Cheap try_recv
+        // when nothing's queued.
+        app.pump_pending_send();
+
         // Check feedback expiry
         if let Some(expires) = app.feedback_expires {
             if std::time::Instant::now() >= expires {
@@ -1473,10 +1518,12 @@ fn main() {
         }
 
         // Idle wake cadence: stay snappy while a feedback toast is on
-        // screen (so it expires on time), otherwise sleep longer. New-mail
-        // toasts and DB refreshes lag by up to this many seconds, which is
-        // fine for a background-poll inbox.
-        let timeout_secs: u64 = if app.feedback_expires.is_some() { 1 } else { 10 };
+        // screen (so it expires on time) OR while a send is in flight
+        // (so the "Sent" toast lands within a second of the wire send
+        // succeeding). Otherwise sleep longer. New-mail toasts and DB
+        // refreshes lag by up to this many seconds, which is fine for
+        // a background-poll inbox.
+        let timeout_secs: u64 = if app.feedback_expires.is_some() || app.pending_send.is_some() { 1 } else { 10 };
         let key = Input::getchr(Some(timeout_secs));
         match key {
             Some(k) => app.handle_key(&k),
@@ -1770,8 +1817,22 @@ impl App {
                 }
             }
 
-            // Quit
-            "q" | "Q" => { self.running = false; }
+            // Quit. `q` refuses to exit while a background send is in
+            // flight (lost it once to a closed terminal mid-oauth);
+            // `Q` (shift-q) force-quits anyway. This is a guard, not a
+            // confirmation prompt — the user gets a clear toast naming
+            // what's still running.
+            "q" => {
+                if self.pending_send.is_some() {
+                    self.set_feedback(
+                        "A send is still in flight — wait for it to finish, or press Q to force-quit",
+                        self.config.theme_colors.feedback_warn,
+                    );
+                } else {
+                    self.running = false;
+                }
+            }
+            "Q" => { self.running = false; }
 
             _ => {}
         }
@@ -2022,7 +2083,22 @@ impl App {
 
         // Build top bar: " Kastrup - [key] ViewName [Sort] [Mode] [pos] ... N unread / T msgs"
         let prefix = style::fg(" Kastrup - ", tc.prefix_fg);
-        let left_part = format!("{}{}{}{}{}", prefix, view_label, sort_label, mode_label, pos_label);
+        // In-flight SMTP badge: shows immediately when a send is
+        // spawned and stays up until `pump_pending_send` clears it,
+        // giving the user a stable "still working" cue while they
+        // navigate. Truncate the recipient at 30 chars so the badge
+        // doesn't push the right-side counts off the bar.
+        let send_badge = if let Some(ps) = &self.pending_send {
+            let mut who = ps.to_display.clone();
+            if crust::display_width(&who) > 30 {
+                who = who.chars().take(28).collect::<String>();
+                who.push_str("\u{2026}");
+            }
+            style::fg(&format!("  \u{2191} Sending to {}\u{2026}", who), tc.feedback_warn)
+        } else {
+            String::new()
+        };
+        let left_part = format!("{}{}{}{}{}{}", prefix, view_label, sort_label, mode_label, pos_label, send_badge);
         let left_width = crust::display_width(&left_part);
         let right_width = crust::display_width(&right_info);
         let padding = if self.cols as usize > left_width + right_width + 1 {
@@ -5248,6 +5324,22 @@ impl App {
         self.render_bottom_bar();
     }
 
+    /// Feedback that never auto-expires — clears only when the user
+    /// presses a key (any key trips the bottom-bar repaint with the
+    /// next message, or the next `set_feedback` displaces it). Use
+    /// for results the user MUST see: failed sends, unrecoverable
+    /// errors, anything that demands attention before the user can
+    /// safely keep working. Counterpart to `set_feedback`, which
+    /// auto-clears after 3 seconds and is fine for confirmation
+    /// toasts.
+    fn set_feedback_sticky(&mut self, msg: &str, color: u8) {
+        if color == 196 { log::error(msg); }
+        else if color == self.config.theme_colors.feedback_warn { log::warn(msg); }
+        self.feedback_message = Some((msg.to_string(), color));
+        self.feedback_expires = None;
+        self.render_bottom_bar();
+    }
+
     /// Prompt in the bottom bar, always restore status bar after
     fn prompt(&mut self, label: &str, default: &str) -> String {
         let result = self.bottom.ask_with_bg(label, default, self.config.theme_colors.cmd_bg);
@@ -8435,6 +8527,130 @@ impl App {
         let _ = std::fs::write(folder.join("cur").join(&fname), rfc_msg);
     }
 
+    /// Kick off an SMTP send in the background. The shell command runs
+    /// on a dedicated worker thread so a slow oauth refresh or a TCP
+    /// open-timeout no longer freezes the TUI — main loop stays
+    /// responsive and `pump_pending_send` finishes the transaction
+    /// when the worker's result lands on the mpsc channel.
+    ///
+    /// Returns `true` when the send was queued; `false` if another
+    /// send is already in flight (caller should leave the tempfile
+    /// alone and surface a "busy" toast).
+    fn spawn_smtp_send(
+        &mut self,
+        cmd: String,
+        to_display: String,
+        tmpfile: String,
+        rfc_msg: String,
+        forward_ids: Vec<i64>,
+        reply_id: Option<i64>,
+        attachment_count: Option<usize>,
+    ) -> bool {
+        if self.pending_send.is_some() {
+            self.set_feedback(
+                "Another send is already in flight — wait for it to finish",
+                self.config.theme_colors.feedback_warn,
+            );
+            return false;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<SendOutcome>();
+        std::thread::spawn(move || {
+            let outcome = match std::process::Command::new("sh")
+                .arg("-c").arg(&cmd).output()
+            {
+                Ok(o) if o.status.success() => Ok(()),
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    let msg = if stderr.trim().is_empty() {
+                        format!("exit {}", o.status.code().unwrap_or(-1))
+                    } else {
+                        stderr.lines().next().unwrap_or("unknown error").to_string()
+                    };
+                    Err(msg)
+                }
+                Err(e) => Err(format!("spawn failed: {}", e)),
+            };
+            // Receiver may have been dropped if kastrup is shutting
+            // down mid-send; that's fine, the user has bigger
+            // problems than a missing toast.
+            let _ = tx.send(outcome);
+        });
+        self.pending_send = Some(PendingSend {
+            result_rx: rx,
+            to_display: to_display.clone(),
+            tmpfile,
+            rfc_msg,
+            forward_ids,
+            reply_id,
+            attachment_count,
+        });
+        // Persistent "Sending..." badge in the top bar — survives any
+        // bottom-bar feedback the user might trigger while the send is
+        // in flight. Render now so it appears the instant the worker
+        // starts (the worker thread itself doesn't touch the UI).
+        self.render_top_bar();
+        true
+    }
+
+    /// Check whether the pending SMTP send has finished. Called from
+    /// the main event loop on every tick (keypress or timeout). Cheap
+    /// when nothing's queued — single `try_recv` on the channel.
+    fn pump_pending_send(&mut self) {
+        let Some(ps) = self.pending_send.as_ref() else { return; };
+        let outcome = match ps.result_rx.try_recv() {
+            Ok(o) => o,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Worker thread died without sending a result. Treat
+                // as failure; surface what we can.
+                Err("send worker disconnected".to_string())
+            }
+        };
+        // Take ownership so we can move tmpfile / rfc_msg out and
+        // re-borrow `self` mutably below.
+        let ps = self.pending_send.take().unwrap();
+        match outcome {
+            Ok(()) => {
+                self.save_to_sent(&ps.rfc_msg);
+                let _ = std::fs::remove_file(&ps.tmpfile);
+                log::info(&format!("SMTP sent OK to {}", ps.to_display));
+                let toast = if let Some(n) = ps.attachment_count {
+                    format!("Sent to {} ({} attachment(s))", ps.to_display, n)
+                } else {
+                    format!("Sent to {}", ps.to_display)
+                };
+                self.set_feedback(&toast, self.config.theme_colors.feedback_ok);
+                // Restore the forward/reply book-keeping the synchronous
+                // path used to do inline.
+                if !ps.forward_ids.is_empty() {
+                    let saved = std::mem::replace(&mut self.pending_forward_ids, ps.forward_ids);
+                    self.mark_forwarded();
+                    self.pending_forward_ids = saved;
+                }
+                if ps.reply_id.is_some() {
+                    let saved = std::mem::replace(&mut self.pending_reply_id, ps.reply_id);
+                    self.mark_replied();
+                    self.pending_reply_id = saved;
+                }
+            }
+            Err(msg) => {
+                // Keep the tempfile so the user can inspect or retry.
+                // Sticky feedback so the failure doesn't auto-expire
+                // while the user is in another workspace — they'd
+                // come back, find the top-bar badge gone, and have no
+                // idea whether the send succeeded.
+                log::info(&format!("SMTP send failed for {}: {}", ps.to_display, msg));
+                self.set_feedback_sticky(
+                    &format!("Send failed to {}: {} (draft kept at {})",
+                        ps.to_display, msg, ps.tmpfile),
+                    196,
+                );
+            }
+        }
+        // Clear the in-flight badge from the top bar.
+        self.render_top_bar();
+    }
+
     fn handle_composed_message_with_attachments(&mut self, content: &str, attachments: &[String]) {
         let mut from = String::new();
         let mut to = String::new();
@@ -8522,29 +8738,15 @@ impl App {
         let cmd = format!("{} -f {} -i {} < '{}'",
             smtp_expanded, from_email, recipients.join(" "), smtp_tmpfile);
         log::info(&format!("SMTP (with attachments): {} -> {} ({} att)", from_email, recipients.join(", "), attachments.len()));
-        let result = std::process::Command::new("sh").arg("-c").arg(&cmd).output();
-        match result {
-            Ok(output) if output.status.success() => {
-                self.save_to_sent(&rfc_msg);
-                let _ = std::fs::remove_file(&smtp_tmpfile);
-                log::info(&format!("SMTP sent OK to {}", to));
-                self.set_feedback(&format!("Sent to {} ({} attachment(s))", to, attachments.len()), self.config.theme_colors.feedback_ok);
-                self.mark_forwarded();
-                self.mark_replied();
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let msg = if stderr.trim().is_empty() {
-                    format!("Send failed (exit {}). File: {}", output.status.code().unwrap_or(-1), smtp_tmpfile)
-                } else {
-                    format!("Send failed: {}", stderr.lines().next().unwrap_or("unknown error"))
-                };
-                self.set_feedback(&msg, 196);
-            }
-            Err(e) => {
-                self.set_feedback(&format!("Send failed: {}", e), 196);
-            }
-        }
+        // Hand off to the worker thread — main loop stays interactive
+        // while the SMTP child blocks on oauth refresh / TLS / etc.
+        let forward_ids = std::mem::take(&mut self.pending_forward_ids);
+        let reply_id = self.pending_reply_id.take();
+        let att_n = attachments.len();
+        self.spawn_smtp_send(
+            cmd, to, smtp_tmpfile, rfc_msg,
+            forward_ids, reply_id, Some(att_n),
+        );
     }
 
     fn handle_composed_message(&mut self, content: &str) {
@@ -8649,38 +8851,12 @@ impl App {
         let cmd = format!("{} -f {} -i {} < '{}'",
             smtp_expanded, from_email, recipients.join(" "), smtp_tmpfile);
         log::info(&format!("SMTP: {} -> {}", from_email, recipients.join(", ")));
-        let result = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
-            .output();
-
-        match result {
-            Ok(output) if output.status.success() => {
-                self.save_to_sent(&rfc_msg);
-                let _ = std::fs::remove_file(&smtp_tmpfile);
-                log::info(&format!("SMTP sent OK to {}", to));
-                self.set_feedback(
-                    &format!("Sent to {}", to),
-                    self.config.theme_colors.feedback_ok,
-                );
-                // Mark forwarded/replied messages
-                self.mark_forwarded();
-                self.mark_replied();
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let msg = if stderr.trim().is_empty() {
-                    format!("Send failed (exit {}). File: {}", output.status.code().unwrap_or(-1), smtp_tmpfile)
-                } else {
-                    format!("Send failed: {}", stderr.lines().next().unwrap_or("unknown error"))
-                };
-                self.set_feedback(&msg, 196);
-                // Keep the file for debugging
-            }
-            Err(e) => {
-                self.set_feedback(&format!("Send failed: {}", e), 196);
-            }
-        }
+        let forward_ids = std::mem::take(&mut self.pending_forward_ids);
+        let reply_id = self.pending_reply_id.take();
+        self.spawn_smtp_send(
+            cmd, to, smtp_tmpfile, rfc_msg,
+            forward_ids, reply_id, None,
+        );
     }
 }
 
@@ -10206,7 +10382,17 @@ impl App {
                 }
             }
             "triage" => { self.show_triage_history(); }
-            "q" | "quit" => { self.running = false; }
+            "q" | "quit" => {
+                if self.pending_send.is_some() {
+                    self.set_feedback(
+                        "A send is still in flight — :Q to force-quit, or wait",
+                        self.config.theme_colors.feedback_warn,
+                    );
+                } else {
+                    self.running = false;
+                }
+            }
+            "Q" => { self.running = false; }
             other => {
                 self.set_feedback(&format!("unknown command: {}", other),
                     self.config.theme_colors.feedback_warn);
