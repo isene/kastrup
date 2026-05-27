@@ -1165,7 +1165,7 @@ fn main() {
 
     let config = Config::load();
     log_phase("config load", &mut phase);
-    let db = Arc::new(Database::new().expect("Failed to open heathrow database"));
+    let db = Arc::new(Database::new().expect("Failed to open kastrup database"));
     log_phase("database open + pragmas (incl. any WAL replay)", &mut phase);
     // Auto-register a Discord source if the user has a bot token in
     // ~/.kastrup/.env and no discord source yet. Saves a manual setup
@@ -1417,63 +1417,85 @@ fn main() {
         app.first_run_wizard();
     }
 
-    // Sync the asmite count file from current DB state at startup so a
-    // stale count from before this version was running gets corrected
-    // immediately, not on the next read mutation.
-    app.sync_mail_count();
-    log_phase("sync_mail_count (folder counts query)", &mut phase);
-
-    // Stuck-maildir reconcile: find messages where the DB says read=1
-    // but the metadata's maildir_file still points at a new/ subdir.
-    // That mismatch happened when older versions of mark_browsed_as_read
-    // (and similar bulk paths) flipped read=1 in the DB without invoking
-    // sync_maildir_seen_flag. The asmite — which counts files in new/ —
-    // then disagreed with kastrup's view of unread state. One-shot
-    // reconcile here drains the backlog; the paired-write fix in
-    // mark_browsed_as_read keeps it from recurring.
+    // Heavy startup chores moved off the boot path: sync_mail_count
+    // (asmite count file refresh — single SQL aggregate, ~300 ms when
+    // warm, multi-second under disk pressure) and the stuck-maildir
+    // reconcile (`instr()` scan over the metadata column, 2-40 s in
+    // observed runs) used to delay the first paint by 2-3 s on a good
+    // day. Both run fine as fire-and-forget background work — the
+    // mail-count file is consumed by the asmite which polls it, and
+    // the reconcile just sends DbWriteOp::SyncMaildirFlag events that
+    // the writer thread already serialises. UI now paints immediately;
+    // these chores complete a few seconds later with no user-visible
+    // effect beyond the asmite count catching up.
     {
-        let conn = app.db.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, metadata FROM messages \
-             WHERE read = 1 AND metadata IS NOT NULL \
-               AND instr(metadata, '\"maildir_file\":') > 0 \
-               AND instr(metadata, '/new/') > 0"
-        ).ok();
-        let mut stuck: Vec<(serde_json::Value, i64)> = Vec::new();
-        if let Some(stmt) = stmt.as_mut() {
-            let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
-            });
-            if let Ok(rows) = rows {
-                for row in rows.flatten() {
-                    let (id, meta_opt) = row;
-                    let Some(meta_str) = meta_opt else { continue };
-                    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) else { continue };
-                    // Double-check the path actually contains /new/
-                    // (instr above can match on a folder named `…/new/…`
-                    // elsewhere in the JSON; the parsed accessor is the
-                    // authoritative check).
-                    if let Some(p) = meta.get("maildir_file").and_then(|v| v.as_str()) {
-                        if p.contains("/new/") {
-                            stuck.push((meta.clone(), id));
+        let db = app.db.clone();
+        let write_tx = app.write_tx.clone();
+        let mailfile_cfg = app.mailfile_cfg.clone();
+        std::thread::Builder::new()
+            .name("kastrup-startup-chores".into())
+            .spawn(move || {
+                let t = std::time::Instant::now();
+                if let Some(cfg) = mailfile_cfg {
+                    let counts = db.all_folder_counts();
+                    mailfile::write_count_file(&cfg, &counts);
+                }
+                log::info(&format!(
+                    "background: sync_mail_count took {} ms",
+                    t.elapsed().as_millis()
+                ));
+
+                // Stuck-maildir reconcile — same logic as before, just
+                // off the boot path. Mismatch is: DB says read=1 but
+                // metadata's maildir_file still points at a new/ subdir
+                // (older mark_browsed_as_read paths flipped read=1
+                // without sync_maildir_seen_flag; the paired-write fix
+                // in v0.1.129 keeps new occurrences from piling up).
+                let t = std::time::Instant::now();
+                let conn = db.conn.lock().unwrap();
+                let mut stmt = conn.prepare(
+                    "SELECT id, metadata FROM messages \
+                     WHERE read = 1 AND metadata IS NOT NULL \
+                       AND instr(metadata, '\"maildir_file\":') > 0 \
+                       AND instr(metadata, '/new/') > 0"
+                ).ok();
+                let mut stuck: Vec<(serde_json::Value, i64)> = Vec::new();
+                if let Some(stmt) = stmt.as_mut() {
+                    let rows = stmt.query_map([], |r| {
+                        Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+                    });
+                    if let Ok(rows) = rows {
+                        for row in rows.flatten() {
+                            let (id, meta_opt) = row;
+                            let Some(meta_str) = meta_opt else { continue };
+                            let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) else { continue };
+                            if let Some(p) = meta.get("maildir_file").and_then(|v| v.as_str()) {
+                                if p.contains("/new/") {
+                                    stuck.push((meta.clone(), id));
+                                }
+                            }
                         }
                     }
                 }
-            }
-        }
-        drop(stmt);
-        drop(conn);
-        if !stuck.is_empty() {
-            log::info(&format!(
-                "Reconciling {} stuck maildir file(s) (read=1 in DB, still in new/)",
-                stuck.len()
-            ));
-            for (meta, id) in stuck {
-                let _ = app.write_tx.send(DbWriteOp::SyncMaildirFlag(meta, id));
-            }
-        }
+                drop(stmt);
+                drop(conn);
+                if !stuck.is_empty() {
+                    log::info(&format!(
+                        "background: reconciling {} stuck maildir file(s) (read=1 in DB, still in new/)",
+                        stuck.len()
+                    ));
+                    for (meta, id) in stuck {
+                        let _ = write_tx.send(DbWriteOp::SyncMaildirFlag(meta, id));
+                    }
+                }
+                log::info(&format!(
+                    "background: stuck-maildir reconcile took {} ms",
+                    t.elapsed().as_millis()
+                ));
+            })
+            .expect("spawn kastrup-startup-chores thread");
     }
-    log_phase("stuck-maildir reconcile", &mut phase);
+    log_phase("background startup chores spawned", &mut phase);
 
     // Start background poller
     let (poller_tx, poller_rx) = std::sync::mpsc::channel();
@@ -5021,7 +5043,7 @@ impl App {
 
     fn copy_message_id(&mut self) {
         if let Some(msg) = self.filtered_messages.get(self.index) {
-            let id_str = format!("heathrow:{}", msg.id);
+            let id_str = format!("kastrup:{}", msg.id);
             crust::clipboard_copy(&id_str, "clipboard");
             self.set_feedback(&format!("Copied: {}", id_str), self.config.theme_colors.feedback_ok);
         }
@@ -7895,7 +7917,7 @@ impl App {
     }
 
     fn load_compose_plugins(&self) -> Vec<(String, String, String)> {
-        let dir = home_dir().join(".heathrow/plugins/compose");
+        let dir = home_dir().join(".kastrup/plugins/compose");
         let mut plugins = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
@@ -8480,11 +8502,10 @@ impl App {
     /// Write the freshly-sent RFC822 message into a month-bucketed
     /// Sent maildir (`~/Maildir/.Sent.YYYY-MM/cur/<unique>:2,S`),
     /// creating the folder skeleton (`cur` / `new` / `tmp`) if it
-    /// doesn't exist yet. Mirrors heathrow's Ruby `save_to_sent`
-    /// so the resulting layout is what the user's downstream tools
-    /// (notmuch, RTFM browsing, etc.) already understand. Silent
-    /// no-op on error — failure to archive must not look like a
-    /// send failure to the user.
+    /// doesn't exist yet. Layout mirrors the standard Maildir+ scheme
+    /// the user's downstream tools (notmuch, RTFM browsing, etc.)
+    /// already understand. Silent no-op on error — failure to archive
+    /// must not look like a send failure to the user.
     fn save_to_sent(&self, rfc_msg: &str) {
         let home = match std::env::var("HOME") { Ok(h) => h, Err(_) => return };
         // YYYY-MM via `date` — kastrup doesn't pull in chrono and the
@@ -9475,7 +9496,7 @@ for part in msg.walk():
         // Download to cache. Local files (file://) and already-cached URLs
         // are served instantly. Remote URLs go to a small thread pool so
         // 10 images aren't a 10×timeout serial wait on the main loop.
-        let cache_dir = home_dir().join(".heathrow/image_cache");
+        let cache_dir = home_dir().join(".kastrup/image_cache");
         let _ = std::fs::create_dir_all(&cache_dir);
 
         // Pass 1: classify URLs (local / cached / needs-download).
@@ -9725,7 +9746,7 @@ for part in msg.walk():
 
         self.set_feedback(&format!("Downloading {} image(s)...", urls.len()), self.config.theme_colors.unread);
 
-        let cache_dir = home_dir().join(".heathrow/image_cache");
+        let cache_dir = home_dir().join(".kastrup/image_cache");
         let _ = std::fs::create_dir_all(&cache_dir);
 
         // Pass 1: classify (local copy / cached copy / needs-download).
@@ -9955,11 +9976,10 @@ fn unique_path(path: &std::path::Path) -> std::path::PathBuf {
 // --- Batch I-N feature methods ---
 
 impl App {
-    // Load AI/tool plugins from ~/.kastrup/plugins/ or ~/.heathrow/plugins/
+    // Load AI/tool plugins from ~/.kastrup/plugins/
     fn load_ai_plugins(&self) -> Vec<(String, String, String)> {
         let dirs = [
             home_dir().join(".kastrup/plugins"),
-            home_dir().join(".heathrow/plugins"),
         ];
         let mut plugins = Vec::new();
         for dir in &dirs {
@@ -10105,17 +10125,17 @@ impl App {
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
 
-        // Reference line so a Claude Code session with the heathrow
+        // Reference line so a Claude Code session with the kastrup
         // skill loaded can pull thread / sender history live. Plain
         // `claude -p` without the skill ignores this and works off the
         // inline content below — no regression either way.
-        let mut ref_line = format!("Message reference: heathrow:{}", msg_id);
+        let mut ref_line = format!("Message reference: kastrup:{}", msg_id);
         if let Some(ref tid) = thread_id {
             if !tid.is_empty() {
                 ref_line.push_str(&format!(" (thread: {})", tid));
             }
         }
-        ref_line.push_str(" — pull thread / sender history via the heathrow skill if available.");
+        ref_line.push_str(" — pull thread / sender history via the kastrup skill if available.");
 
         let full_prompt = format!(
             "{}\n\n{}\n\nContext, email from {} about \"{}\":\n{}",
@@ -10161,7 +10181,7 @@ impl App {
 
     /// Body of `:search` — natural-language query → claude translates
     /// to a `Filters` JSON spec → filter pipeline runs the query
-    /// against the heathrow DB. Live source list is included in the
+    /// against the kastrup DB. Live source list is included in the
     /// prompt so claude can resolve names. On parse failure, falls
     /// back to a content_pattern substring search using the raw query.
     fn run_search_with_query(&mut self, query: &str) {
@@ -10191,7 +10211,7 @@ impl App {
 
         let system_prompt = format!(
             "You are a search assistant for kastrup, a unified messaging hub backed by a SQLite \
-            heathrow.db. Given a user's natural-language query, output a single JSON object \
+            kastrup.db. Given a user's natural-language query, output a single JSON object \
             matching this Rust struct (omit fields that aren't constrained):\n\
             \n\
             {{\n\
@@ -10424,7 +10444,7 @@ impl App {
         let pid = std::process::id();
         let tmpfile = format!("/tmp/kastrup-chat-{}.txt", pid);
         let snapshot = format!(
-            "heathrow:{}\nFrom: {}\nSubject: {}\n\n{}\n",
+            "kastrup:{}\nFrom: {}\nSubject: {}\n\n{}\n",
             msg_id, sender, subject, content
         );
         if std::fs::write(&tmpfile, &snapshot).is_err() {
@@ -10432,8 +10452,8 @@ impl App {
             return;
         }
 
-        // Reference the message both by its heathrow:ID handle (so the
-        // heathrow skill can pull thread / sender history / related
+        // Reference the message both by its kastrup:ID handle (so the
+        // kastrup skill can pull thread / sender history / related
         // messages live from the DB) and by the inline tempfile snapshot
         // (a no-tools fallback). Thread id, when present, lets the skill
         // pull the rest of the thread without re-deriving it.
@@ -10442,7 +10462,7 @@ impl App {
             _ => String::new(),
         };
         let initial = format!(
-            "I'm reading email heathrow:{} in kastrup. Use the heathrow skill to pull \
+            "I'm reading email kastrup:{} in kastrup. Use the kastrup skill to pull \
             thread / sender history / related messages from the DB when useful.{} \
             The current message body is also snapshotted to {} for quick reference. \
             When you're done, /exit returns me to kastrup.",
@@ -12968,11 +12988,55 @@ fn sync_maildir_seen_flag_bg(metadata: &serde_json::Value, db: &database::Databa
 fn rename_maildir_add_seen(metadata: &serde_json::Value) -> Option<serde_json::Value> {
     let file_path = metadata.get("maildir_file").and_then(|v| v.as_str())?;
     let path = std::path::Path::new(file_path);
-    if !path.exists() { return None; }
-
     let filename = path.file_name().and_then(|f| f.to_str())?;
     let parent = path.parent().unwrap_or(std::path::Path::new("."));
     let parent_name = parent.file_name().and_then(|f| f.to_str()).unwrap_or("");
+
+    // Slow path: the file isn't where the metadata says. Happens when
+    // Courier IMAP / mu / mbsync / etc moved the message from new/ to
+    // cur/ without informing kastrup. We had 88 of these accumulate
+    // and they kept getting "reconciled" every startup because the
+    // rename below would silently fail (NotFound) and the metadata
+    // never got updated. Recovery: look in the sibling cur/ for any
+    // file whose name starts with the maildir base (everything up to
+    // and including ":2,"), update the metadata to point at the real
+    // location, and add the S flag if it isn't there yet.
+    if !path.exists() {
+        if parent_name != "new" { return None; }
+        let info_pos = filename.find(":2,")?;
+        let base_with_marker = &filename[..info_pos + 3];
+        let cur_dir = parent.parent()?.join("cur");
+        let entries = std::fs::read_dir(&cur_dir).ok()?;
+        let mut found: Option<std::path::PathBuf> = None;
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with(base_with_marker) {
+                    found = Some(entry.path());
+                    break;
+                }
+            }
+        }
+        let cur_path = found?;
+        let cur_filename = cur_path.file_name().and_then(|f| f.to_str())?;
+        let final_path = if cur_filename.contains('S') {
+            cur_path
+        } else {
+            let (b, flags) = cur_filename.rsplit_once(":2,")?;
+            let mut flag_chars: Vec<char> = flags.chars().collect();
+            flag_chars.push('S');
+            flag_chars.sort();
+            let new_name = format!("{}:2,{}", b, flag_chars.into_iter().collect::<String>());
+            let new_path = cur_dir.join(&new_name);
+            // If the rename fails (permission, race, anything), keep
+            // the metadata pointing at the real (unflagged) location
+            // anyway — that's still strictly better than leaving it
+            // pointing at the non-existent new/ path.
+            if std::fs::rename(&cur_path, &new_path).is_ok() { new_path } else { cur_path }
+        };
+        let mut new_meta = metadata.clone();
+        new_meta["maildir_file"] = serde_json::json!(final_path.to_string_lossy().to_string());
+        return Some(new_meta);
+    }
 
     let new_filename = if filename.contains(":2,") {
         if filename.contains('S') { return None; } // already Seen
