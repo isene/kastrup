@@ -1,8 +1,9 @@
 //! Asmite count-file writer. Mirrors `gmail-idle`'s `notify` module so
 //! both writers produce byte-identical output: one line per mailbox in
 //! `~/.gmail.conf`'s `$mailboxes` order, formatted `{label}{count}\n`,
-//! written to `$mailfile` and a duplicate `$mailfile2` (the strip
-//! display reads `$mailfile2` to avoid mid-write tear).
+//! written to `$mailfile` (`~/.mail`). The old `$mailfile2` duplicate
+//! (a Conky anti-flicker workaround) was dropped — the asmites read
+//! `~/.mail` directly now.
 //!
 //! Counts come from the SQLite DB (`messages WHERE read = 0 AND
 //! folder = X`), not a filesystem scan, so we don't race with kastrup's
@@ -146,11 +147,6 @@ pub fn write_count_file(
     let path = PathBuf::from(&cfg.path);
     if let Err(e) = fs::write(&path, &out) {
         eprintln!("[kastrup] write {}: {}", cfg.path, e);
-        return;
-    }
-    let path2 = format!("{}2", cfg.path);
-    if let Err(e) = fs::write(&path2, &out) {
-        eprintln!("[kastrup] write {}: {}", path2, e);
     }
 }
 
@@ -200,9 +196,6 @@ $mailboxes = [
         write_count_file(&cfg, &counts);
         let body = std::fs::read_to_string(&cfg.path).unwrap();
         assert_eq!(body, "P:3\nW:7\n");
-        let body2 = std::fs::read_to_string(format!("{}2", cfg.path)).unwrap();
-        assert_eq!(body2, "P:3\nW:7\n");
         let _ = std::fs::remove_file(&cfg.path);
-        let _ = std::fs::remove_file(format!("{}2", cfg.path));
     }
 }
