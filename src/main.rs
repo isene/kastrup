@@ -3855,20 +3855,42 @@ impl App {
         // section alongside the mail folder.
         if self.group_by_folder && self.active_folder.is_none() {
             let view_filters = self.build_current_filters();
-            let have_folder: std::collections::HashSet<String> = sections.iter()
-                .map(|s| s.name.clone()).collect();
-            let bufs = self.subscribed_buffers.lock().unwrap().clone();
-            for buf in bufs {
-                if have_folder.contains(&buf.full_name) { continue; }
-                if !folder_matches_filter(&buf.full_name, &view_filters) { continue; }
-                sections.push(organizer::Section {
-                    section_type: "channel".to_string(),
-                    display_name: organizer::pretty_folder_name_public(&buf.full_name),
-                    name: buf.full_name,
-                    source_type: "folder".to_string(),
-                    messages: Vec::new(),
-                    unread_count: 0,
-                });
+            // Only merge empty weechat buffers into a view that actually
+            // admits weechat-relay messages. `folder_matches_filter`
+            // returns true for a source-scoped view that carries no
+            // folder filter (e.g. the phone gateway, source_id 11) — so
+            // without this gate every IRC/Slack/Discord channel gets
+            // dumped into such a view. A weechat buffer belongs only to
+            // a view whose source dimension is unset or points at the
+            // weechat-relay source.
+            let view_admits_weechat = {
+                let src_ok = match view_filters.source_id {
+                    Some(sid) => self.source_type_map.get(&sid)
+                        .map(|t| t == "weechat-relay").unwrap_or(false),
+                    None => true,
+                };
+                let stype_ok = match &view_filters.source_type {
+                    Some(st) => st == "weechat-relay",
+                    None => true,
+                };
+                src_ok && stype_ok
+            };
+            if view_admits_weechat {
+                let have_folder: std::collections::HashSet<String> = sections.iter()
+                    .map(|s| s.name.clone()).collect();
+                let bufs = self.subscribed_buffers.lock().unwrap().clone();
+                for buf in bufs {
+                    if have_folder.contains(&buf.full_name) { continue; }
+                    if !folder_matches_filter(&buf.full_name, &view_filters) { continue; }
+                    sections.push(organizer::Section {
+                        section_type: "channel".to_string(),
+                        display_name: organizer::pretty_folder_name_public(&buf.full_name),
+                        name: buf.full_name,
+                        source_type: "folder".to_string(),
+                        messages: Vec::new(),
+                        unread_count: 0,
+                    });
+                }
             }
             // Re-sort: pinned channels first (in section_order), then
             // the rest by latest message timestamp. Empty sections
