@@ -172,6 +172,9 @@ fn poller_loop(
                 "weechat" => sources::weechat::sync_weechat(&source.config, known),
                 "messenger" => sources::messenger::sync_messenger(&source.config, known),
                 "instagram" => sources::instagram::sync_instagram(&source.config, known),
+                // Phone-notification gateway (relay app) — drains inbound JSON;
+                // replaces the Marionette messenger/instagram scrapers.
+                "gateway" => sources::gateway::sync_gateway(&source.config, known),
                 "discord" => sources::discord::sync_discord(&source.config, known),
                 "slack" => sources::slack::sync_slack(&source.config, known),
                 // weechat-relay is driven by its own push
