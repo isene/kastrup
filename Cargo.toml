@@ -1,6 +1,6 @@
 [package]
 name = "kastrup"
-version = "0.1.137"
+version = "0.1.138"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
 description = "Unified messaging hub TUI, built on crust."
@@ -28,11 +28,14 @@ socket2 = { version = "0.5", features = ["all"] }
 rustls = "0.23"
 webpki-roots = "0.26"
 base64 = "0.22"
+
 # inotify watcher for maildir new/ dirs — wakes the poller within
 # milliseconds of gmail-idle (or any other actor) dropping a file
 # into the inbox, instead of waiting up to 10 s for the next poll
 # tick. Zero idle cost: the watcher thread blocks on a single
 # read() syscall on the inotify fd until the kernel fires an event.
+# Linux-only API; macOS/BSD builds fall back to the poll cadence.
+[target.'cfg(target_os = "linux")'.dependencies]
 inotify = "0.11"
 
 [profile.release]

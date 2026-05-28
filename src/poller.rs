@@ -37,12 +37,15 @@ impl Poller {
             poller_loop(db_for_poller, tx, wake_clone);
         });
 
-        // Inotify watcher on maildir new/ dirs. Runs in its own thread
-        // because the underlying read() syscall blocks until the
-        // kernel fires an event; we don't want to interleave it with
-        // the poller's scan + sleep cycle. Best-effort: if inotify
-        // init fails (rare) or there are no maildir sources, we just
-        // skip and fall back to pure-poll behaviour.
+        // Inotify watcher on maildir new/ dirs (Linux only — inotify
+        // is a Linux kernel API). Runs in its own thread because the
+        // underlying read() syscall blocks until the kernel fires an
+        // event; we don't want to interleave it with the poller's
+        // scan + sleep cycle. Best-effort: if inotify init fails
+        // (rare) or there are no maildir sources, we skip and fall
+        // back to pure-poll behaviour. On macOS/BSD the watcher is
+        // never spawned and the 10 s poll cadence is the only driver.
+        #[cfg(target_os = "linux")]
         let inotify_thread = {
             let wake = wake.clone();
             let db = db.clone();
@@ -50,6 +53,11 @@ impl Poller {
                 .name("kastrup-inotify".to_string())
                 .spawn(move || inotify_watcher(db, wake))
                 .ok()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let inotify_thread = {
+            let _ = &db; // db only needed by the linux watcher
+            None
         };
 
         Self { wake, thread: Some(thread), inotify_thread }
@@ -201,6 +209,7 @@ fn poller_loop(
 /// sources, or the filesystem walk finds zero `new/` dirs, the
 /// thread quietly exits and the poller's 10-second fallback tick
 /// keeps things working.
+#[cfg(target_os = "linux")]
 fn inotify_watcher(db: Arc<Database>, wake: Arc<(Mutex<WakeState>, Condvar)>) {
     use inotify::{Inotify, WatchMask};
 
