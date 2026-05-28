@@ -8794,8 +8794,11 @@ impl App {
             return;
         }
         let boundary = format!("kastrup-boundary-{}", std::process::id());
+        let (date_hdr, msgid) = rfc822_date_and_msgid(&from);
         let mut rfc_msg = String::new();
         rfc_msg.push_str(&format!("From: {}\n", from));
+        rfc_msg.push_str(&format!("Date: {}\n", date_hdr));
+        rfc_msg.push_str(&format!("Message-ID: {}\n", msgid));
         rfc_msg.push_str(&format!("To: {}\n", to));
         if !cc.is_empty() { rfc_msg.push_str(&format!("Cc: {}\n", cc)); }
         if !bcc.is_empty() { rfc_msg.push_str(&format!("Bcc: {}\n", bcc)); }
@@ -8914,8 +8917,11 @@ impl App {
             return;
         }
 
+        let (date_hdr, msgid) = rfc822_date_and_msgid(&from);
         let mut rfc_msg = String::new();
         rfc_msg.push_str(&format!("From: {}\n", from));
+        rfc_msg.push_str(&format!("Date: {}\n", date_hdr));
+        rfc_msg.push_str(&format!("Message-ID: {}\n", msgid));
         rfc_msg.push_str(&format!("To: {}\n", to));
         if !cc.is_empty() {
             rfc_msg.push_str(&format!("Cc: {}\n", cc));
@@ -12925,6 +12931,45 @@ fn triage_default_calendar_id(tock_home: &std::path::Path) -> Option<i64> {
         [],
         |r| r.get::<_, i64>(0),
     ).ok()
+}
+
+/// Build an RFC 5322 `Date:` value and a `Message-ID:` for an
+/// outgoing message. The Gmail submission path backfills both when
+/// absent, but the external relay path (dmail_smtp → internal MTA)
+/// does not — without them the relayed mail is malformed and strict
+/// receivers may junk or reject it. The old Ruby helpers added these
+/// via the Mail gem; match that. `from` may be `Name <addr>` or a
+/// bare address; the Message-ID domain is taken from its `@` part.
+fn rfc822_date_and_msgid(from: &str) -> (String, String) {
+    const WDAY: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MON: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs() as i64;
+    let date = unsafe {
+        let mut t: libc::time_t = secs as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&mut t as *mut _, &mut tm);
+        let off = tm.tm_gmtoff as i64;
+        let (sign, ao) = if off < 0 { ('-', -off) } else { ('+', off) };
+        format!(
+            "{}, {:02} {} {} {:02}:{:02}:{:02} {}{:02}{:02}",
+            WDAY[(tm.tm_wday as usize) % 7],
+            tm.tm_mday,
+            MON[(tm.tm_mon as usize) % 12],
+            tm.tm_year + 1900,
+            tm.tm_hour, tm.tm_min, tm.tm_sec,
+            sign, ao / 3600, (ao % 3600) / 60,
+        )
+    };
+    let domain = from.rsplit('@').next()
+        .map(|s| s.trim_end_matches('>').trim())
+        .filter(|s| !s.is_empty() && !s.contains(' '))
+        .unwrap_or("localhost");
+    let msgid = format!("<{}.{}.{}@{}>", secs, std::process::id(), dur.subsec_nanos(), domain);
+    (date, msgid)
 }
 
 /// Get local UTC offset in seconds using libc
