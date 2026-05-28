@@ -115,6 +115,11 @@ enum DraftKind {
     /// mirrors, etc. `Channel:` header carries the buffer's
     /// `full_name` (e.g. `python.slack.<workspace>.#general`).
     Weechat,
+    /// Phone `relay` gateway: Instagram / Messenger / WhatsApp /
+    /// Telegram / Signal / SMS. `Channel:` header carries
+    /// `<platform>:<thread_key>`; the reply is queued to the gateway
+    /// `outbox/` for the phone to fire.
+    Gateway,
 }
 
 impl DraftKind {
@@ -124,6 +129,7 @@ impl DraftKind {
             DraftKind::Slack   => "slack",
             DraftKind::Discord => "discord",
             DraftKind::Weechat => "weechat",
+            DraftKind::Gateway => "gateway",
         }
     }
 
@@ -134,6 +140,7 @@ impl DraftKind {
             DraftKind::Slack   => "Channel",
             DraftKind::Discord => "Channel",
             DraftKind::Weechat => "Channel",
+            DraftKind::Gateway => "Channel",
         }
     }
 
@@ -144,6 +151,7 @@ impl DraftKind {
             Some("slack")   => DraftKind::Slack,
             Some("discord") => DraftKind::Discord,
             Some("weechat") => DraftKind::Weechat,
+            Some("gateway") => DraftKind::Gateway,
             _               => DraftKind::Email,
         }
     }
@@ -213,6 +221,7 @@ fn parse_draft_preview(data: &str, kind: DraftKind) -> (String, String) {
             DraftKind::Slack   => "(no channel)".to_string(),
             DraftKind::Discord => "(no channel)".to_string(),
             DraftKind::Weechat => "(no channel)".to_string(),
+            DraftKind::Gateway => "(no chat target)".to_string(),
         };
     }
     (subject, body_preview)
@@ -7054,6 +7063,37 @@ impl App {
             }
         }
 
+        // Phone gateway reply (Instagram / Messenger / WhatsApp / Telegram
+        // / Signal / SMS). The reply target is the thread_key the phone
+        // captured; the relay matches it to a live notification (chat
+        // apps) or sends natively (SMS). Carried as `Channel:
+        // <platform>:<thread_key>`; sent via the gateway outbox.
+        if msg.metadata.get("source").and_then(|v| v.as_str()) == Some("gateway") {
+            let platform = msg.metadata.get("platform").and_then(|v| v.as_str())
+                .unwrap_or("").to_string();
+            let thread_key = msg.metadata.get("thread_key").and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| msg.thread_id.clone())
+                .unwrap_or_default();
+            if platform.is_empty() || thread_key.is_empty() {
+                self.set_feedback("Gateway reply: message missing platform/thread",
+                    self.config.theme_colors.feedback_warn);
+                return;
+            }
+            let hint = if platform == "sms" {
+                format!("SMS reply to {} (native — any number)", thread_key)
+            } else {
+                format!("Reply to {} on {} — needs a live notification on the phone",
+                    thread_key, platform)
+            };
+            self.set_feedback(&hint, self.config.theme_colors.feedback_info);
+            self.compose_kind = DraftKind::Gateway;
+            let template = format!("Channel: {}:{}\n\n", platform, thread_key);
+            self.run_editor_compose_at_full(&template, Some(3), Some(1), true);
+            self.compose_kind = DraftKind::Email;
+            return;
+        }
+
         let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
         let subject = msg.subject.as_deref().unwrap_or("");
         let re_subject = if subject.starts_with("Re:") {
@@ -8265,6 +8305,40 @@ impl App {
         Ok(channel)
     }
 
+    /// The gateway source's `config` (carries `gateway_dir`), or `{}`
+    /// if no gateway source exists — `queue_reply` then defaults to
+    /// `~/.kastrup/gateway`.
+    fn gateway_source_config(&self) -> serde_json::Value {
+        self.db.get_sources(false).into_iter()
+            .find(|s| s.plugin_type == "gateway")
+            .map(|s| s.config)
+            .unwrap_or_else(|| serde_json::json!({}))
+    }
+
+    /// Send a gateway-kind draft: queue a reply to the phone `relay`
+    /// outbox. `Channel:` carries `<platform>:<thread_key>`; the body
+    /// is the message text. The relay fires it against a live
+    /// notification (chat apps) or via SmsManager (SMS). Returns the
+    /// `<platform>:<thread_key>` target on success.
+    fn send_gateway_draft(&self, data: &str) -> Result<String, String> {
+        let channel = parse_chat_channel(data)
+            .ok_or_else(|| "missing Channel: header".to_string())?;
+        let (platform, thread_key) = channel.split_once(':')
+            .ok_or_else(|| "Channel must be <platform>:<thread_key>".to_string())?;
+        let platform = platform.trim();
+        let thread_key = thread_key.trim();
+        if platform.is_empty() || thread_key.is_empty() {
+            return Err("empty platform or thread_key".to_string());
+        }
+        let body = parse_chat_body(data);
+        if body.is_empty() {
+            return Err("body is empty".to_string());
+        }
+        let cfg = self.gateway_source_config();
+        sources::gateway::queue_reply(&cfg, platform, thread_key, &body)?;
+        Ok(format!("{}:{}", platform, thread_key))
+    }
+
     /// Recall-path entry: open a previously-saved draft. Forces the
     /// review screen even when the editor returns with no changes,
     /// because `zz` (save+quit, unmodified) on a recalled draft must
@@ -8492,6 +8566,27 @@ impl App {
                                                 }
                                             }
                                         }
+                                        DraftKind::Gateway => {
+                                            match self.send_gateway_draft(&final_content) {
+                                                Ok(target) => {
+                                                    self.set_feedback(
+                                                        &format!("Reply queued for {}", target),
+                                                        tc.feedback_ok,
+                                                    );
+                                                    break;
+                                                }
+                                                Err(msg) => {
+                                                    last_send_error = Some(
+                                                        format!("Gateway reply failed: {}", msg)
+                                                    );
+                                                    self.set_feedback(
+                                                        last_send_error.as_deref().unwrap_or(""),
+                                                        tc.feedback_warn,
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                        }
                                         DraftKind::Email => {}
                                     }
                                     // Block sending if any recipient is a bare short
@@ -8570,7 +8665,7 @@ impl App {
                                 "p" => {
                                     let now = database::now_secs();
                                     match self.compose_kind {
-                                        DraftKind::Slack | DraftKind::Discord | DraftKind::Weechat => {
+                                        DraftKind::Slack | DraftKind::Discord | DraftKind::Weechat | DraftKind::Gateway => {
                                             // The `postponed` DB table is email-
                                             // shaped (data → editor template).
                                             // Non-email drafts round-trip through
@@ -8579,6 +8674,7 @@ impl App {
                                                 DraftKind::Slack   => "slack",
                                                 DraftKind::Discord => "discord",
                                                 DraftKind::Weechat => "weechat",
+                                                DraftKind::Gateway => "gateway",
                                                 _ => "eml",
                                             };
                                             let dir = drafts_drop_dir();
