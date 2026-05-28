@@ -8738,8 +8738,6 @@ impl App {
             return;
         }
         self.bottom.say(&style::fg(&format!(" Sending to {}...", to), 226));
-        let home = std::env::var("HOME").unwrap_or_default();
-        let smtp_expanded = smtp.replace("~/", &format!("{}/", home));
         let from_email = if let Some(lt) = from.find('<') {
             from[lt+1..].trim_end_matches('>').to_string()
         } else { from.clone() };
@@ -8848,8 +8846,6 @@ impl App {
         // Show sending feedback
         self.bottom.say(&style::fg(&format!(" Sending to {}...", to), 226));
 
-        let home = std::env::var("HOME").unwrap_or_default();
-        let smtp_expanded = smtp.replace("~/", &format!("{}/", home));
         // Extract bare from email for -f flag
         let from_email = if let Some(lt) = from.find('<') {
             from[lt+1..].trim_end_matches('>').to_string()

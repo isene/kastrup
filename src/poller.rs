@@ -98,6 +98,18 @@ fn poller_loop(
     let mut next_mem_log = std::time::Instant::now()
         + std::time::Duration::from_secs(3600);
 
+    // True when this iteration was woken by inotify (a maildir file
+    // actually appeared) rather than by the 10 s safety-net timeout.
+    // A forced iteration scans maildir NOW, bypassing both the
+    // poll-interval loop gate and sync_maildir's mtime gate, so a
+    // delivery that lands within the poll-interval window can't get
+    // orphaned (the bug: inotify wake skipped by the 5 s gate, then
+    // the next timeout poll advances last_sync past the file's dir
+    // mtime → sync_maildir mtime-skips it forever until the next
+    // delivery bumps the dir). First iteration is unforced (normal
+    // startup gating / last_sync from DB).
+    let mut forced = false;
+
     loop {
         if std::time::Instant::now() >= next_mem_log {
             log_process_memory("poller hourly", &known_cache);
@@ -118,7 +130,12 @@ fn poller_loop(
         for source in &sources_list {
             let interval = source.poll_interval;
             let last_sync = source.last_sync.unwrap_or(0);
-            if now - last_sync < interval { continue; }
+            let is_maildir = source.plugin_type == "maildir";
+            // inotify-forced wakes bypass the poll-interval gate for
+            // maildir — reacting immediately to a delivery is the
+            // whole point. Other sources (and timeout polls) keep the
+            // normal gate.
+            if !(forced && is_maildir) && now - last_sync < interval { continue; }
 
             // Get or initialize cached known_ids (only load from DB on first access)
             let known = known_cache.entry(source.id).or_insert_with(|| {
@@ -134,7 +151,16 @@ fn poller_loop(
                         .unwrap_or("~/Maildir");
                     let expanded = path.replace("~/",
                         &format!("{}/", std::env::var("HOME").unwrap_or_default()));
-                    sources::maildir::sync_maildir(&expanded, known, last_sync)
+                    // Forced (inotify) scan passes last_sync=0 to defeat
+                    // sync_maildir's per-dir mtime gate — we KNOW a file
+                    // just landed, so scan every dir and let known_ids
+                    // dedup down to the genuinely-new file(s). This full
+                    // walk only fires on a real delivery event, so the
+                    // tens-of-ms cost is paid only when there's something
+                    // to find; idle 10 s timeout polls still use the
+                    // cheap mtime gate.
+                    let eff_last_sync = if forced { 0 } else { last_sync };
+                    sources::maildir::sync_maildir(&expanded, known, eff_last_sync)
                 }
                 "rss" => {
                     let feeds = source.config.get("feeds")
@@ -190,11 +216,11 @@ fn poller_loop(
             std::time::Duration::from_secs(10),
             |state| *state == WakeState::Idle,
         ).unwrap();
-        match *guard {
+        forced = match *guard {
             WakeState::Stop => return,
-            WakeState::Wake => { *guard = WakeState::Idle; }
-            WakeState::Idle => { /* 10 s timeout, just loop */ }
-        }
+            WakeState::Wake => { *guard = WakeState::Idle; true }
+            WakeState::Idle => false, // 10 s timeout — normal gated poll
+        };
     }
 }
 
