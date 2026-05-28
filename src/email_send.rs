@@ -41,6 +41,58 @@ const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Outbound transport for a send, chosen from the resolved identity's
+/// `smtp` config value:
+///
+/// * empty, the `gmail` sentinel, or a `…/gmail_smtp` path → Gmail
+///   XOAUTH2, the native in-process path.
+/// * any other command path → shell out to that external helper
+///   (sendmail-style). This keeps site-specific transports — e.g. an
+///   internal corporate relay reachable only on a VPN — entirely
+///   outside kastrup: the helper binary owns all the addressing, so
+///   no private endpoints are committed to this repo.
+pub enum Transport {
+    GmailXoauth2,
+    Command(String),
+}
+
+/// Pick a transport from an identity's `smtp` value. The historical
+/// gmail script is now handled natively, so it (and the explicit
+/// `gmail` sentinel / an empty value) maps to XOAUTH2; everything
+/// else is treated as an external sendmail-style helper to exec.
+pub fn transport_for(smtp_spec: &str) -> Transport {
+    let spec = smtp_spec.trim();
+    if spec.is_empty() {
+        return Transport::GmailXoauth2;
+    }
+    let prog = spec.split_whitespace().next().unwrap_or("");
+    let base = prog.rsplit('/').next().unwrap_or(prog);
+    if spec == "gmail" || base == "gmail_smtp" {
+        return Transport::GmailXoauth2;
+    }
+    Transport::Command(spec.to_string())
+}
+
+/// Send a complete RFC822 message over the chosen transport. Single
+/// entry point for the send worker — dispatches to native Gmail
+/// XOAUTH2 or an external helper. `safedir`/`from_email` carry the
+/// Gmail OAuth lookup; the command path passes `from_email` as the
+/// envelope sender to the helper.
+pub fn send_email(
+    safedir: &Path,
+    from_email: &str,
+    recipients: &[String],
+    eml_body: &[u8],
+    transport: &Transport,
+) -> Result<(), String> {
+    match transport {
+        Transport::GmailXoauth2 =>
+            send_email_gmail(safedir, from_email, recipients, eml_body),
+        Transport::Command(cmd) =>
+            send_via_command(cmd, from_email, recipients, eml_body),
+    }
+}
+
 /// Default OAuth secret directory — matches the legacy
 /// `~/bin/gmail_smtp` Ruby script's `$safedir`. Override-able when
 /// kastrup grows a config field for it.
@@ -226,23 +278,75 @@ fn send_via_xoauth2(
     Ok(())
 }
 
-/// Owns the rustls-wrapped TCP stream + a small byte buffer for
-/// line accumulation. All reads/writes route through `&mut self.tls`
-/// so we don't need to clone the stream (rustls' StreamOwned isn't
-/// Clone, and the sync API doesn't need it anyway).
-struct SmtpIo {
-    tls: StreamOwned<ClientConnection, TcpStream>,
+/// Shell out to an external sendmail-style SMTP helper (e.g. the
+/// private `dmail_smtp` relay binary). Invoked as
+/// `<cmd> -f <from> -- <recipient…>` with the RFC822 message on
+/// stdin — the mutt/heathrow convention the existing helpers already
+/// expect. Keeps site-specific transports (internal corporate
+/// relays) entirely out of kastrup: the helper owns the addressing.
+fn send_via_command(
+    cmd: &str,
+    from_email: &str,
+    recipients: &[String],
+    eml_body: &[u8],
+) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    if recipients.is_empty() {
+        return Err("no recipients".to_string());
+    }
+    // Expand a leading ~/ and allow inline args (first token = program,
+    // remaining tokens = leading args before the sendmail flags).
+    let home = std::env::var("HOME").unwrap_or_default();
+    let expanded = cmd.replace("~/", &format!("{}/", home));
+    let mut tokens = expanded.split_whitespace();
+    let prog = tokens.next().ok_or("empty smtp command")?;
+    let mut args: Vec<String> = tokens.map(|s| s.to_string()).collect();
+    args.push("-f".to_string());
+    args.push(from_email.to_string());
+    args.push("--".to_string());
+    args.extend(recipients.iter().cloned());
+
+    let mut child = Command::new(prog)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn {}: {}", prog, e))?;
+    {
+        let mut stdin = child.stdin.take().ok_or("no stdin handle")?;
+        stdin.write_all(eml_body).map_err(|e| format!("write stdin: {}", e))?;
+        // stdin dropped here → EOF so the helper proceeds.
+    }
+    let out = child.wait_with_output()
+        .map_err(|e| format!("wait {}: {}", prog, e))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(format!("{} exited {}: {}", prog, out.status, stderr.trim()))
+    }
+}
+
+/// Owns a byte stream (`Read + Write`) + a small line-accumulation
+/// buffer. Generic over the transport so the same SMTP state machine
+/// drives both the rustls-wrapped Gmail connection and a plain
+/// `TcpStream` to an internal relay. All I/O routes through
+/// `&mut self.stream`; no cloning needed (rustls' StreamOwned isn't
+/// Clone, and the sync API doesn't need it).
+struct SmtpIo<S: Read + Write> {
+    stream: S,
     buf: Vec<u8>,
 }
-impl SmtpIo {
-    fn new(tls: StreamOwned<ClientConnection, TcpStream>) -> Self {
-        Self { tls, buf: Vec::with_capacity(512) }
+impl<S: Read + Write> SmtpIo<S> {
+    fn new(stream: S) -> Self {
+        Self { stream, buf: Vec::with_capacity(512) }
     }
 
     fn write_line(&mut self, line: &str) -> Result<(), String> {
-        self.tls.write_all(line.as_bytes())
+        self.stream.write_all(line.as_bytes())
             .map_err(|e| format!("smtp write: {}", e))?;
-        self.tls.write_all(b"\r\n")
+        self.stream.write_all(b"\r\n")
             .map_err(|e| format!("smtp write CRLF: {}", e))?;
         Ok(())
     }
@@ -256,15 +360,15 @@ impl SmtpIo {
         for line in s.split('\n') {
             let line = line.trim_end_matches('\r');
             if line.starts_with('.') {
-                self.tls.write_all(b".")
+                self.stream.write_all(b".")
                     .map_err(|e| format!("smtp dot-stuff: {}", e))?;
             }
-            self.tls.write_all(line.as_bytes())
+            self.stream.write_all(line.as_bytes())
                 .map_err(|e| format!("smtp body: {}", e))?;
-            self.tls.write_all(b"\r\n")
+            self.stream.write_all(b"\r\n")
                 .map_err(|e| format!("smtp body CRLF: {}", e))?;
         }
-        self.tls.write_all(b".\r\n")
+        self.stream.write_all(b".\r\n")
             .map_err(|e| format!("smtp data terminator: {}", e))?;
         Ok(())
     }
@@ -275,7 +379,7 @@ impl SmtpIo {
         self.buf.clear();
         let mut byte = [0u8; 1];
         loop {
-            self.tls.read_exact(&mut byte)
+            self.stream.read_exact(&mut byte)
                 .map_err(|e| format!("smtp read: {}", e))?;
             self.buf.push(byte[0]);
             // Each line ends with CRLF. Check whether we just
