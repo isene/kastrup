@@ -990,6 +990,12 @@ struct App {
     /// at least one folder with unread messages gets a key-only
     /// badge (e.g. `1 5 F2`).
     unread_cache: std::collections::HashMap<String, i64>,
+    /// Cache of `source_id → unread-message count`, refreshed on the
+    /// same tick as `unread_cache`. Source-scoped views (Messenger,
+    /// RSS, etc.) carry no folder filter, so the folder cache can't
+    /// answer "does this source have unread" — without this, those
+    /// views' badges lit whenever ANY folder anywhere had unread.
+    source_unread_cache: std::collections::HashMap<i64, i64>,
     last_highlight_refresh: std::time::Instant,
     /// Per-view list of folder names the user has hidden from the
     /// Folders view. Persisted as `hidden_channels_<view>` in the
@@ -1403,6 +1409,7 @@ fn main() {
         nick_lists: nick_lists.clone(),
         subscribed_buffers: subscribed_buffers.clone(),
         unread_cache: std::collections::HashMap::new(),
+        source_unread_cache: std::collections::HashMap::new(),
         last_highlight_refresh: std::time::Instant::now() - std::time::Duration::from_secs(60),
         current_hidden_channels: Vec::new(),
         poller: None,
@@ -1603,6 +1610,7 @@ fn main() {
                 if app.last_highlight_refresh.elapsed().as_secs() >= 5 {
                     app.last_highlight_refresh = std::time::Instant::now();
                     app.unread_cache = app.db.unread_count_by_folder();
+                    app.source_unread_cache = app.db.unread_count_by_source();
                     app.render_top_bar();
                 }
             }
@@ -1973,6 +1981,52 @@ impl App {
         self.render_bottom_bar();
     }
 
+    /// Does this view's filter currently match at least one unread
+    /// message? Drives the inactive-view badges. Respects the source
+    /// dimension: a source-scoped view (no folder filter) lights up
+    /// only when THAT source has unread, instead of the old
+    /// `folder_matches_filter` "no folder → match anything" default
+    /// that lit every source-only view whenever any folder anywhere
+    /// had unread.
+    fn filter_has_unread(&self, f: &Filters) -> bool {
+        if let Some(branches) = &f.branches {
+            return branches.iter().any(|b| self.filter_has_unread(b));
+        }
+        if let Some(sid) = f.source_id {
+            if self.source_unread_cache.get(&sid).copied().unwrap_or(0) == 0 {
+                return false;
+            }
+            // Source AND folder constrained: also require an unread
+            // folder match. (No current view combines them, but keep
+            // the AND honest.)
+            if f.folder.is_some() || f.folder_pattern.is_some() {
+                return self.unread_cache.iter()
+                    .any(|(folder, n)| *n > 0 && folder_matches_filter(folder, f));
+            }
+            return true;
+        }
+        if let Some(stype) = &f.source_type {
+            return self.source_unread_cache.iter().any(|(sid, n)| {
+                *n > 0 && self.source_type_map.get(sid).map(|t| t == stype).unwrap_or(false)
+            });
+        }
+        if f.folder.is_some() || f.folder_pattern.is_some() {
+            return self.unread_cache.iter()
+                .any(|(folder, n)| *n > 0 && folder_matches_filter(folder, f));
+        }
+        // No source and no folder dimension. A sender/content-only view
+        // (e.g. Family, filtered by sender) can't be evaluated from the
+        // folder/source caches, so don't light a badge we can't verify —
+        // a phantom "go look, there's unread" that sends the user to an
+        // empty view is worse than no badge. A truly empty filter
+        // (match-all custom view) lights if anything is unread anywhere.
+        if f.sender_pattern.is_some() || f.content_pattern.is_some() {
+            return false;
+        }
+        self.unread_cache.values().any(|n| *n > 0)
+            || self.source_unread_cache.values().any(|n| *n > 0)
+    }
+
     fn render_top_bar(&mut self) {
         // Unread + total both scoped to the current view. The previous
         // "9543 unread / 12 msgs" mixed scopes — `9543` was the DB-wide
@@ -2067,40 +2121,22 @@ impl App {
         // everything and would always be lit. The display is just the
         // view's key glyph: e.g. `1 5 F2`, in the unread colour.
         let mut other_view_badges: Vec<String> = Vec::new();
-        if !self.unread_cache.is_empty() {
+        if !self.unread_cache.is_empty() || !self.source_unread_cache.is_empty() {
+            // Use the canonical filter parser so `branches` views
+            // (PassionFruits, Dualog) parse correctly — the old inline
+            // parser only read `rules`, leaving branch views with an
+            // empty filter that matched everything.
             let view_keys_and_filters: Vec<(String, Filters)> = self.views.iter()
                 .filter_map(|v| {
                     let key = v.key_binding.clone()?;
                     if key == self.current_view { return None; }
                     if matches!(key.as_str(), "A" | "N" | "*") { return None; }
                     let f = serde_json::from_str::<serde_json::Value>(&v.filters).ok()?;
-                    let mut filters = Filters::default();
-                    if let Some(rules) = f["rules"].as_array() {
-                        for rule in rules {
-                            let field = rule["field"].as_str().unwrap_or("");
-                            let op    = rule["op"].as_str().unwrap_or("=");
-                            let value = &rule["value"];
-                            match field {
-                                "folder" => {
-                                    if op == "like" {
-                                        filters.folder_pattern = value.as_str().map(|s| s.to_string());
-                                    } else {
-                                        filters.folder = value.as_str().map(|s| s.to_string());
-                                    }
-                                }
-                                "source_id" => { filters.source_id = value.as_i64(); }
-                                "source_type" => { filters.source_type = value.as_str().map(|s| s.to_string()); }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Some((key, filters))
+                    Some((key, parse_view_filters_json(&f)))
                 })
                 .collect();
             for (key, filters) in view_keys_and_filters {
-                let any_unread = self.unread_cache.iter()
-                    .any(|(folder, n)| *n > 0 && folder_matches_filter(folder, &filters));
-                if any_unread {
+                if self.filter_has_unread(&filters) {
                     other_view_badges.push(style::fg(&key, tc.unread));
                 }
             }
