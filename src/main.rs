@@ -872,6 +872,35 @@ fn pad_visible(s: &str, target: usize) -> String {
     }
 }
 
+/// How a muted (hidden) channel resurfaces. `m` mutes until any new
+/// message; `M` mutes until a mention/highlight. Stored per hidden
+/// channel alongside the mute timestamp so resurfacing is based on
+/// activity *newer* than the mute (re-pressing re-stamps it).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HideMode {
+    UntilNew,
+    UntilHighlight,
+}
+
+impl HideMode {
+    fn as_str(self) -> &'static str {
+        match self { HideMode::UntilNew => "new", HideMode::UntilHighlight => "highlight" }
+    }
+    fn from_str(s: &str) -> HideMode {
+        match s { "highlight" => HideMode::UntilHighlight, _ => HideMode::UntilNew }
+    }
+}
+
+/// A muted channel in a view: its section name, the resurface mode, and
+/// the unix-seconds timestamp when it was muted. Persisted as
+/// `hidden_channels_<view>` (JSON array of `{name, mode, at}`).
+#[derive(Clone)]
+struct HiddenChannel {
+    name: String,
+    mode: HideMode,
+    hidden_at: i64,
+}
+
 struct App {
     top: Pane,
     left: Pane,
@@ -997,11 +1026,12 @@ struct App {
     /// views' badges lit whenever ANY folder anywhere had unread.
     source_unread_cache: std::collections::HashMap<i64, i64>,
     last_highlight_refresh: std::time::Instant,
-    /// Per-view list of folder names the user has hidden from the
-    /// Folders view. Persisted as `hidden_channels_<view>` in the
-    /// settings table. Applied AFTER the all-buffers merge so a
-    /// hidden channel disappears entirely.
-    current_hidden_channels: Vec<String>,
+    /// Per-view list of muted (hidden) channels. Each carries a mode
+    /// (resurface on any new message vs only on a mention/highlight)
+    /// and the mute timestamp. Applied AFTER the all-buffers merge: a
+    /// muted channel stays hidden until activity newer than the mute
+    /// time matches its mode. Persisted as `hidden_channels_<view>`.
+    current_hidden_channels: Vec<HiddenChannel>,
 
     // Background poller
     poller: Option<poller::Poller>,
@@ -1687,9 +1717,9 @@ impl App {
 
         match key {
             // Navigation
-            "j" | "DOWN" => { self.move_down(); }
-            "k" | "UP" => { self.move_up(); }
-            "h" | "LEFT" => {
+            "DOWN" => { self.move_down(); }
+            "UP" => { self.move_up(); }
+            "LEFT" => {
                 if self.show_threaded { self.collapse_current(); }
             }
             "RIGHT" => {
@@ -1721,7 +1751,6 @@ impl App {
             "{" | "C-UP" => { self.move_section(-1); }
             "}" | "C-DOWN" => { self.move_section(1); }
             "C-HOME" => { self.reset_section_order(); }
-            "C-K" => { self.hide_current_channel(); }
             "C-U" => { self.unhide_all_channels(); }
             "C-N" => { self.pick_nick_to_clipboard(); }
             "C-G" => { self.pick_channel_to_clipboard(); }
@@ -1776,7 +1805,8 @@ impl App {
                     }
                 } else { self.render_bottom_bar(); }
             }
-            "m" => { self.compose_new(); }
+            "m" => { self.hide_current_channel(HideMode::UntilNew); }
+            "M" => { self.hide_current_channel(HideMode::UntilHighlight); }
             "E" => { self.edit_message(); }
 
             // Attachments / external
@@ -1797,8 +1827,8 @@ impl App {
             // Labels / save / misc
             "l" => { self.label_message(); }
             "s" => { self.file_message(); }
-            "+" => { self.external_react(false); }
-            "-" => { self.external_react(true); }
+            "+" => { self.compose_new(); }
+            "k" => { self.external_react(false); }
             "I" => { self.ai_assistant(); }
             "Z" => { self.open_in_tock(); }
             "z" => { self.triage_message(); }
@@ -3852,11 +3882,25 @@ impl App {
                     }
                 }
             });
-            // Apply hide list.
+            // Apply the mute list. A muted channel stays hidden unless
+            // it has a message *newer* than its mute timestamp matching
+            // its mode (any message for UntilNew, a highlight/mention
+            // for UntilHighlight). So a muted channel resurfaces on the
+            // right activity, then stays until re-muted.
             if !self.current_hidden_channels.is_empty() {
-                let hide: std::collections::HashSet<&str> = self.current_hidden_channels.iter()
-                    .map(|s| s.as_str()).collect();
-                sections.retain(|s| !hide.contains(s.name.as_str()));
+                let muted = &self.current_hidden_channels;
+                sections.retain(|s| {
+                    match muted.iter().find(|h| h.name == s.name) {
+                        None => true,
+                        Some(h) => s.messages.iter()
+                            .filter_map(|&i| filtered.get(i))
+                            .any(|m| m.timestamp > h.hidden_at && match h.mode {
+                                HideMode::UntilNew => true,
+                                HideMode::UntilHighlight => m.metadata
+                                    .get("highlight").and_then(|v| v.as_bool()) == Some(true),
+                            }),
+                    }
+                });
             }
         }
         let sections = sections;
@@ -4072,31 +4116,87 @@ impl App {
 
     /// Load the per-view list of channels to hide from the Folders
     /// view. Persisted as `hidden_channels_<key>` JSON array.
-    fn load_hidden_channels(&self, view_key: &str) -> Vec<String> {
+    fn load_hidden_channels(&self, view_key: &str) -> Vec<HiddenChannel> {
         let setting_key = format!("hidden_channels_{}", view_key);
         let Some(raw) = self.db.get_setting(&setting_key) else { return Vec::new() };
-        serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else { return Vec::new() };
+        let Some(arr) = val.as_array() else { return Vec::new() };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64).unwrap_or(0);
+        arr.iter().filter_map(|e| {
+            // Legacy format: bare "name" string (old permanent hide).
+            // Migrate to UntilNew muted as of load time, so it stays
+            // hidden until fresh activity rather than vanishing forever.
+            if let Some(name) = e.as_str() {
+                return Some(HiddenChannel { name: name.to_string(), mode: HideMode::UntilNew, hidden_at: now });
+            }
+            let name = e.get("name").and_then(|v| v.as_str())?.to_string();
+            let mode = HideMode::from_str(e.get("mode").and_then(|v| v.as_str()).unwrap_or("new"));
+            let hidden_at = e.get("at").and_then(|v| v.as_i64()).unwrap_or(now);
+            Some(HiddenChannel { name, mode, hidden_at })
+        }).collect()
     }
 
     fn save_hidden_channels(&self) {
         let setting_key = format!("hidden_channels_{}", self.current_view);
-        let json = serde_json::to_string(&self.current_hidden_channels).unwrap_or_else(|_| "[]".into());
+        let arr: Vec<serde_json::Value> = self.current_hidden_channels.iter()
+            .map(|h| serde_json::json!({ "name": h.name, "mode": h.mode.as_str(), "at": h.hidden_at }))
+            .collect();
+        let json = serde_json::to_string(&serde_json::Value::Array(arr)).unwrap_or_else(|_| "[]".into());
         self.db.set_setting(&setting_key, &json);
     }
 
-    /// Hide the section under the cursor from this view. Persists.
-    /// Bound to Ctrl+K. Use `unhide_all_channels` (Ctrl+U) to reset.
-    fn hide_current_channel(&mut self) {
-        if !self.group_by_folder { return; }
-        let Some(msg) = self.display_messages.get(self.index) else { return };
-        if !msg.is_header { return; }
-        let Some(section_name) = msg.thread_id.clone() else { return };
-        if !self.current_hidden_channels.contains(&section_name) {
-            self.current_hidden_channels.push(section_name.clone());
-            self.save_hidden_channels();
+    /// Mute the channel under the cursor. `m` → `UntilNew` (resurface
+    /// on any new message), `M` → `UntilHighlight` (resurface only on a
+    /// mention/highlight). Pressing the SAME mode key on an already-
+    /// muted channel un-mutes it; the OTHER mode key switches the mode
+    /// (and re-stamps the mute time). Persists per view. `unhide_all`
+    /// (Ctrl+U) clears every mute in the view.
+    fn hide_current_channel(&mut self, mode: HideMode) {
+        if !self.group_by_folder {
+            self.set_feedback("Mute works in the channel (folders) view",
+                self.config.theme_colors.feedback_info);
+            return;
         }
-        let label = section_name.rsplit_once('.').map(|(_, c)| c).unwrap_or(&section_name);
-        self.set_feedback(&format!("Hidden {}", label), self.config.theme_colors.feedback_ok);
+        let Some(msg) = self.display_messages.get(self.index) else { return };
+        if !msg.is_header {
+            self.set_feedback("Put the cursor on a channel header to mute it",
+                self.config.theme_colors.feedback_info);
+            return;
+        }
+        let Some(section_name) = msg.thread_id.clone() else { return };
+        let label = section_name.rsplit_once('.').map(|(_, c)| c).unwrap_or(&section_name).to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64).unwrap_or(0);
+        let feedback = match self.current_hidden_channels.iter_mut().find(|h| h.name == section_name) {
+            Some(existing) if existing.mode == mode => {
+                // Same key again → un-mute.
+                self.current_hidden_channels.retain(|h| h.name != section_name);
+                format!("Unmuted {}", label)
+            }
+            Some(existing) => {
+                // Other key → switch mode, re-stamp.
+                existing.mode = mode;
+                existing.hidden_at = now;
+                match mode {
+                    HideMode::UntilNew => format!("Muted {} until new message", label),
+                    HideMode::UntilHighlight => format!("Muted {} until mention", label),
+                }
+            }
+            None => {
+                self.current_hidden_channels.push(HiddenChannel {
+                    name: section_name.clone(), mode, hidden_at: now,
+                });
+                match mode {
+                    HideMode::UntilNew => format!("Muted {} until new message", label),
+                    HideMode::UntilHighlight => format!("Muted {} until mention", label),
+                }
+            }
+        };
+        self.save_hidden_channels();
+        self.set_feedback(&feedback, self.config.theme_colors.feedback_ok);
         self.rebuild_display();
         if self.index >= self.display_messages.len() {
             self.index = self.display_messages.len().saturating_sub(1);
@@ -4104,18 +4204,18 @@ impl App {
         self.render_all();
     }
 
-    /// Restore every hidden channel for this view. Bound to Ctrl+U.
+    /// Un-mute every channel in this view. Bound to Ctrl+U.
     fn unhide_all_channels(&mut self) {
         if !self.group_by_folder { return; }
         if self.current_hidden_channels.is_empty() {
-            self.set_feedback("No hidden channels for this view",
+            self.set_feedback("No muted channels in this view",
                 self.config.theme_colors.feedback_info);
             return;
         }
         let n = self.current_hidden_channels.len();
         self.current_hidden_channels.clear();
         self.save_hidden_channels();
-        self.set_feedback(&format!("Unhid {} channel(s)", n),
+        self.set_feedback(&format!("Unmuted {} channel(s)", n),
             self.config.theme_colors.feedback_ok);
         self.rebuild_display();
         self.render_all();
@@ -5247,8 +5347,8 @@ impl App {
     fn show_help(&mut self) {
         let help = format!("{}\n\n\
 {}\n\
-  j/k Up/Down    Navigate messages\n\
-  h/Left         Collapse thread\n\
+  Up/Down        Navigate messages\n\
+  Left/Right     Collapse / expand thread\n\
   Space          Toggle collapse\n\
   PgDn/PgUp      Page down/up\n\
   Home/End       First/last message\n\
@@ -5269,7 +5369,8 @@ impl App {
   K              Kill (close) view\n\n\
 {}\n\
   R              Toggle read/unread\n\
-  M              Mark all read\n\
+  a              Mark section read\n\
+  A              Mark all read\n\
   */-            Toggle star\n\
   t/T            Tag / tag all\n\
   Ctrl-T         Tag by regex\n\
@@ -5282,8 +5383,9 @@ impl App {
   e              Reply in editor\n\
   g              Reply-all\n\
   f              Forward\n\
-  m              Compose new\n\
-  E              Edit draft\n\n\
+  +              Compose new\n\
+  E              Edit draft\n\
+  k              Add emoji reaction (chat)\n\n\
 {}\n\
   v              View/save attachments\n\
   V              Inline image\n\
@@ -5295,7 +5397,8 @@ impl App {
   S              :search (claude → Filters → message list)\n\
   l              Label message\n\
   s              File/save message\n\
-  +              Add to favorites\n\
+  m / M          Mute channel: until new msg / until mention\n\
+  Ctrl-U         Un-mute all channels in view\n\
   I              AI assistant / plugins\n\
   c              :claude PROMPT (response in right pane)\n\
   C              :chat (suspend, claude w/ message context)\n\
