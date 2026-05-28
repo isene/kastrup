@@ -928,6 +928,12 @@ struct App {
 
     feedback_message: Option<(String, u8)>,
     feedback_expires: Option<std::time::Instant>,
+    /// When true, the current (non-expiring) feedback toast is cleared
+    /// on the next user keypress instead of after a timeout. Set by
+    /// `set_feedback_sticky` for send results, which must survive
+    /// until the user actually looks — but shouldn't linger once they
+    /// start interacting again.
+    feedback_clear_on_key: bool,
 
     showing_image: bool,
     right_pane_msg_id: Option<i64>,
@@ -1377,6 +1383,7 @@ fn main() {
         folder_count_cache: HashMap::new(),
         feedback_message: None,
         feedback_expires: None,
+        feedback_clear_on_key: false,
         showing_image: false,
         right_pane_msg_id: None,
             body_cache: None,
@@ -1549,7 +1556,18 @@ fn main() {
         let timeout_secs: u64 = if app.feedback_expires.is_some() || app.pending_send.is_some() { 1 } else { 10 };
         let key = Input::getchr(Some(timeout_secs));
         match key {
-            Some(k) => app.handle_key(&k),
+            Some(k) => {
+                // A sticky send-result toast clears on the first
+                // keypress after it appeared, so the user always gets
+                // to see it but it doesn't linger once they resume.
+                if app.feedback_clear_on_key {
+                    app.feedback_message = None;
+                    app.feedback_expires = None;
+                    app.feedback_clear_on_key = false;
+                    app.render_bottom_bar();
+                }
+                app.handle_key(&k);
+            }
             None => {
                 // Check for new messages from poller
                 let mut new_count = 0usize;
@@ -5344,22 +5362,22 @@ impl App {
         else if color == self.config.theme_colors.feedback_warn { log::warn(msg); }
         self.feedback_message = Some((msg.to_string(), color));
         self.feedback_expires = Some(std::time::Instant::now() + expires_in);
+        self.feedback_clear_on_key = false;
         self.render_bottom_bar();
     }
 
-    /// Feedback that never auto-expires — clears only when the user
-    /// presses a key (any key trips the bottom-bar repaint with the
-    /// next message, or the next `set_feedback` displaces it). Use
-    /// for results the user MUST see: failed sends, unrecoverable
-    /// errors, anything that demands attention before the user can
-    /// safely keep working. Counterpart to `set_feedback`, which
-    /// auto-clears after 3 seconds and is fine for confirmation
-    /// toasts.
+    /// Feedback that never auto-expires — stays put until the user's
+    /// next keypress clears it (see the main loop's key branch). Use
+    /// for results the user MUST see even if they glanced away: send
+    /// success/failure, unrecoverable errors. Counterpart to
+    /// `set_feedback`, which auto-clears after 3 seconds and is fine
+    /// for confirmation toasts the user is actively watching for.
     fn set_feedback_sticky(&mut self, msg: &str, color: u8) {
         if color == 196 { log::error(msg); }
         else if color == self.config.theme_colors.feedback_warn { log::warn(msg); }
         self.feedback_message = Some((msg.to_string(), color));
         self.feedback_expires = None;
+        self.feedback_clear_on_key = true;
         self.render_bottom_bar();
     }
 
@@ -8636,7 +8654,10 @@ impl App {
                 } else {
                     format!("Sent to {}", ps.to_display)
                 };
-                self.set_feedback(&toast, self.config.theme_colors.feedback_ok);
+                // Sticky: the user fired off a send and may have looked
+                // away while it completed. Both success and failure
+                // stay on the status bar until the next keypress.
+                self.set_feedback_sticky(&toast, self.config.theme_colors.feedback_ok);
                 // Restore the forward/reply book-keeping the synchronous
                 // path used to do inline.
                 if !ps.forward_ids.is_empty() {
