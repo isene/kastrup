@@ -12851,11 +12851,9 @@ fn source_info(source_type: &str, tc: &config::ThemeColors) -> (String, u8) {
         "web" | "webpage" => ("\u{25CE}", tc.src_web_icon, tc.src_web),
         "messenger" => ("\u{260E}", tc.src_messenger_icon, tc.src_messenger),
         "instagram" => ("\u{25C8}", tc.src_instagram_icon, tc.src_instagram),
-        // SMS (native) and Signal arrive via the phone gateway. No
-        // dedicated theme-colour field yet, so use distinct fixed
-        // colours: SMS green (40), Signal blue (33).
-        "sms"      => ("\u{260F}", 40, 40),
-        "signal"   => ("\u{25C7}", 33, 33),
+        // SMS (native) and Signal arrive via the phone gateway.
+        "sms"      => ("\u{260F}", tc.src_sms_icon, tc.src_sms),
+        "signal"   => ("\u{25C7}", tc.src_signal_icon, tc.src_signal),
         "weechat" | "workspace" => ("\u{2318}", tc.src_weechat_icon, tc.src_weechat),
         _ => ("\u{2022}", tc.src_default_icon, tc.src_default),
     };

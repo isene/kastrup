@@ -70,6 +70,10 @@ pub struct ThemeColors {
     pub src_instagram_icon: u8,
     pub src_weechat: u8,
     pub src_weechat_icon: u8,
+    pub src_sms: u8,
+    pub src_sms_icon: u8,
+    pub src_signal: u8,
+    pub src_signal_icon: u8,
     pub src_default: u8,
     pub src_default_icon: u8,
     pub content_fg: u8,
@@ -99,7 +103,11 @@ impl Default for ThemeColors {
             // Default row text colors per source (sender + subject).
             src_email: 39, src_discord: 99, src_slack: 35, src_telegram: 51,
             src_whatsapp: 40, src_reddit: 202, src_rss: 226, src_web: 208,
-            src_messenger: 33, src_instagram: 205, src_weechat: 75, src_default: 15,
+            src_messenger: 33, src_instagram: 205, src_weechat: 75,
+            // SMS (phone gateway, native) green-cyan; Signal blue. Kept
+            // distinct from src_whatsapp (40) and src_messenger (33),
+            // which they otherwise visually collided with.
+            src_sms: 48, src_signal: 27, src_default: 15,
             // Icon colors. Default each icon to the same as the row
             // color so behaviour is unchanged from earlier builds —
             // the only outlier is email, where `@` reads better as
@@ -109,7 +117,9 @@ impl Default for ThemeColors {
             src_discord_icon: 99, src_slack_icon: 35, src_telegram_icon: 51,
             src_whatsapp_icon: 40, src_reddit_icon: 202, src_rss_icon: 226,
             src_web_icon: 208, src_messenger_icon: 33, src_instagram_icon: 205,
-            src_weechat_icon: 75, src_default_icon: 15,
+            src_weechat_icon: 75,
+            src_sms_icon: 48, src_signal_icon: 27,
+            src_default_icon: 15,
             content_fg: 252, content_bg: 0, list_fg: 252, list_bg: 0, border_fg: 238,
         }
     }
@@ -302,6 +312,10 @@ impl Config {
         put(&mut colors_map, "src_instagram_icon", tc.src_instagram_icon);
         put(&mut colors_map, "src_weechat", tc.src_weechat);
         put(&mut colors_map, "src_weechat_icon", tc.src_weechat_icon);
+        put(&mut colors_map, "src_sms", tc.src_sms);
+        put(&mut colors_map, "src_sms_icon", tc.src_sms_icon);
+        put(&mut colors_map, "src_signal", tc.src_signal);
+        put(&mut colors_map, "src_signal_icon", tc.src_signal_icon);
         put(&mut colors_map, "src_default", tc.src_default);
         put(&mut colors_map, "src_default_icon", tc.src_default_icon);
         put(&mut colors_map, "content_fg", tc.content_fg);
@@ -456,6 +470,10 @@ impl Config {
             if let Some(v) = colors.get("src_instagram_icon").and_then(|v| v.as_u64()) { tc.src_instagram_icon = v as u8; }
             if let Some(v) = colors.get("src_weechat").and_then(|v| v.as_u64()) { tc.src_weechat = v as u8; }
             if let Some(v) = colors.get("src_weechat_icon").and_then(|v| v.as_u64()) { tc.src_weechat_icon = v as u8; }
+            if let Some(v) = colors.get("src_sms").and_then(|v| v.as_u64()) { tc.src_sms = v as u8; }
+            if let Some(v) = colors.get("src_sms_icon").and_then(|v| v.as_u64()) { tc.src_sms_icon = v as u8; }
+            if let Some(v) = colors.get("src_signal").and_then(|v| v.as_u64()) { tc.src_signal = v as u8; }
+            if let Some(v) = colors.get("src_signal_icon").and_then(|v| v.as_u64()) { tc.src_signal_icon = v as u8; }
             if let Some(v) = colors.get("src_default").and_then(|v| v.as_u64()) { tc.src_default = v as u8; }
             if let Some(v) = colors.get("src_default_icon").and_then(|v| v.as_u64()) { tc.src_default_icon = v as u8; }
             if let Some(v) = colors.get("content_fg").and_then(|v| v.as_u64()) { tc.content_fg = v as u8; }
