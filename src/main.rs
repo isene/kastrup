@@ -4406,18 +4406,41 @@ impl App {
     }
 
     fn toggle_tag(&mut self) {
-        if let Some(msg) = self.filtered_messages.get(self.index) {
-            let id = msg.id;
-            if self.tagged.contains(&id) {
-                self.tagged.remove(&id);
-            } else {
-                self.tagged.insert(id);
+        // Threaded views (e.g. View 4) index `display_messages`, which
+        // includes synthetic section headers; flat views index
+        // `filtered_messages` directly. Reading filtered_messages by
+        // self.index unconditionally tagged the wrong row (or nothing)
+        // in threaded views. Resolve the real id from the right list
+        // and skip header rows.
+        let len = if self.show_threaded {
+            self.display_messages.len()
+        } else {
+            self.filtered_messages.len()
+        };
+        let (selected_id, is_header) = if self.show_threaded {
+            match self.display_messages.get(self.index) {
+                Some(m) if m.is_header => (None, true),
+                Some(m) => (Some(m.id), false),
+                None => (None, false),
             }
-            if self.index < self.filtered_messages.len().saturating_sub(1) {
-                self.index += 1;
+        } else {
+            (self.filtered_messages.get(self.index).map(|m| m.id), false)
+        };
+        if let Some(id) = selected_id {
+            if !is_header {
+                if self.tagged.contains(&id) {
+                    self.tagged.remove(&id);
+                } else {
+                    self.tagged.insert(id);
+                }
             }
-            self.render_all();
         }
+        // Advance past the current row (real or header) so repeated `t`
+        // walks the list, matching flat-view behaviour.
+        if self.index + 1 < len {
+            self.index += 1;
+        }
+        self.render_all();
     }
 
     fn tag_all_toggle(&mut self) {
@@ -8613,9 +8636,11 @@ impl App {
     /// responsive and `pump_pending_send` finishes the transaction
     /// when the worker's result lands on the mpsc channel.
     ///
-    /// Calls into `email_send::send_email_gmail` directly — no shell
-    /// subprocess, no Ruby `gmail_smtp`, no Python `oauth2.py`. The
-    /// XOAUTH2 + SMTP path lives in `src/email_send.rs`.
+    /// Calls into `email_send` directly — no shell subprocess, no Ruby
+    /// `gmail_smtp` / `dmail_smtp`, no Python `oauth2.py`. The transport
+    /// is chosen from `smtp_spec` (the resolved identity's `smtp`
+    /// value): `smtp://host:port` → native plain relay, anything else
+    /// → Gmail XOAUTH2. Both paths live in `src/email_send.rs`.
     ///
     /// Returns `true` when the send was queued; `false` if another
     /// send is already in flight (caller should leave the tempfile
@@ -8627,6 +8652,7 @@ impl App {
         to_display: String,
         tmpfile: String,
         rfc_msg: String,
+        smtp_spec: String,
         forward_ids: Vec<i64>,
         reply_id: Option<i64>,
         attachment_count: Option<usize>,
@@ -8642,8 +8668,9 @@ impl App {
         let worker_rfc = rfc_msg.clone();
         std::thread::spawn(move || {
             let safedir = email_send::default_safedir();
-            let outcome = email_send::send_email_gmail(
-                &safedir, &from_email, &recipients, worker_rfc.as_bytes(),
+            let transport = email_send::transport_for(&smtp_spec);
+            let outcome = email_send::send_email(
+                &safedir, &from_email, &recipients, worker_rfc.as_bytes(), &transport,
             );
             // Receiver may have been dropped if kastrup is shutting
             // down mid-send; that's fine, the user has bigger
@@ -8753,12 +8780,16 @@ impl App {
             self.set_feedback("Cancelled (empty To or body)", self.config.theme_colors.feedback_warn);
             return;
         }
-        // Per-identity SMTP: check From header against identities
-        let smtp = self.config.identities.iter()
+        // Per-identity SMTP: match the From header to an identity to
+        // pick its transport spec (e.g. dualog → smtp://relay). Owned
+        // String so the borrow of self.config ends before the later
+        // &mut self spawn call.
+        let smtp_spec: String = self.config.identities.iter()
             .find(|(_, id)| from.contains(&id.email))
             .and_then(|(_, id)| id.smtp.as_ref())
-            .unwrap_or(&self.config.smtp_command);
-        if smtp.is_empty() {
+            .unwrap_or(&self.config.smtp_command)
+            .clone();
+        if smtp_spec.is_empty() {
             self.set_feedback("No SMTP command configured (set in Preferences)", self.config.theme_colors.feedback_warn);
             return;
         }
@@ -8812,14 +8843,14 @@ impl App {
             if email.contains('@') { recipients.push(email); }
         }
         log::info(&format!("SMTP (with attachments): {} -> {} ({} att)", from_email, recipients.join(", "), attachments.len()));
-        // Hand off to the worker thread — native SMTP+XOAUTH2 to
-        // Gmail; main loop stays interactive while the worker does
-        // the oauth refresh + TLS handshake + DATA upload.
+        // Hand off to the worker thread — native SMTP; main loop stays
+        // interactive while the worker does the transport (oauth +
+        // TLS for Gmail, or a plain relay connect for smtp:// specs).
         let forward_ids = std::mem::take(&mut self.pending_forward_ids);
         let reply_id = self.pending_reply_id.take();
         let att_n = attachments.len();
         self.spawn_smtp_send(
-            from_email, recipients, to, smtp_tmpfile, rfc_msg,
+            from_email, recipients, to, smtp_tmpfile, rfc_msg, smtp_spec,
             forward_ids, reply_id, Some(att_n),
         );
     }
@@ -8865,14 +8896,17 @@ impl App {
             return;
         }
 
-        // Per-identity SMTP: check From header against identities
-        let smtp = self.config.identities.iter()
+        // Per-identity SMTP: match the From header to an identity to
+        // pick its transport spec. Owned String so the self.config
+        // borrow ends before the later &mut self spawn call.
+        let smtp_spec: String = self.config.identities.iter()
             .find(|(_, id)| from.contains(&id.email))
             .and_then(|(_, id)| id.smtp.as_ref())
-            .unwrap_or(&self.config.smtp_command);
+            .unwrap_or(&self.config.smtp_command)
+            .clone();
 
         // Build RFC822-style message for SMTP
-        if smtp.is_empty() {
+        if smtp_spec.is_empty() {
             self.set_feedback(
                 "No SMTP command configured (set in Preferences)",
                 self.config.theme_colors.feedback_warn,
@@ -8925,7 +8959,7 @@ impl App {
         let forward_ids = std::mem::take(&mut self.pending_forward_ids);
         let reply_id = self.pending_reply_id.take();
         self.spawn_smtp_send(
-            from_email, recipients, to, smtp_tmpfile, rfc_msg,
+            from_email, recipients, to, smtp_tmpfile, rfc_msg, smtp_spec,
             forward_ids, reply_id, None,
         );
     }
