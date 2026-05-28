@@ -971,6 +971,9 @@ fn is_uninteresting_buffer(full_name: &str) -> bool {
         || full_name.starts_with("fset.")
         || full_name.starts_with("irc.server.")
         || full_name == "irc.bitlbee.&bitlbee"
+        // Discord now arrives via the phone relay gateway (source 11),
+        // so drop the weechat discord-bridge mirror to avoid duplicates.
+        || full_name.starts_with("irc.discord-bridge.")
     {
         return true;
     }

@@ -167,11 +167,18 @@ pub fn organize_by_folder(
     let mut sections: Vec<Section> = folder_map.into_iter().map(|(folder, indices)| {
         let unread = indices.iter().filter(|&&i| !messages[i].read).count();
         let display_name = pretty_folder_name(&folder);
+        // Derive the section's source_type from its most-recent message so
+        // the "source" sort groups conversations by platform and section
+        // headers can be coloured/iconed per source (whatsapp, sms, slack…).
+        let source_type = indices.iter()
+            .max_by_key(|&&i| messages[i].timestamp)
+            .map(|&i| messages[i].source_type.clone())
+            .unwrap_or_else(|| "folder".to_string());
         Section {
             section_type: "channel".to_string(),
             name: folder,
             display_name,
-            source_type: "folder".to_string(),
+            source_type,
             messages: indices,
             unread_count: unread,
         }

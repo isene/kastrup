@@ -1954,9 +1954,7 @@ impl App {
                     filters.source_id = Some(sid);
                     self.filtered_messages = self.db.get_messages(&filters, 500, 0);
                     for msg in &mut self.filtered_messages {
-                        if let Some(st) = self.source_type_map.get(&msg.source_id) {
-                            msg.source_type = st.clone();
-                        }
+                        resolve_source_type(&self.source_type_map, msg);
                     }
                     self.current_view = "S".to_string();
                     self.index = 0;
@@ -2303,9 +2301,14 @@ impl App {
         // fall through to tc.thread.
         let chat_source = chat_source_type_for_display(subject);
         let (icon, _row) = source_info(chat_source.unwrap_or(&msg.source_type), tc);
+        // For weechat-relay folders the source type lives in the display
+        // name (chat_source). For gateway folders the section already
+        // carries the resolved platform in source_type, so colour the
+        // channel name with that source's fg too (whatsapp/sms/etc.);
+        // genuinely unknown sources fall back to tc.thread via source_info.
         let channel_color = match chat_source {
             Some(st) => source_info(st, tc).1,
-            None => tc.thread,
+            None => source_info(&msg.source_type, tc).1,
         };
 
         // Split the display name at the LAST `.` — everything up to
@@ -3233,9 +3236,7 @@ impl App {
         self.filtered_messages = self.db.get_messages(&filters, limit, 0);
         // Populate source_type for each message
         for msg in &mut self.filtered_messages {
-            if let Some(st) = self.source_type_map.get(&msg.source_id) {
-                msg.source_type = st.clone();
-            }
+            resolve_source_type(&self.source_type_map, msg);
         }
         self.sort_messages();
         self.rebuild_display();
@@ -3259,9 +3260,7 @@ impl App {
             let limit = self.config.load_limit;
             self.filtered_messages = self.db.get_messages(f, limit, 0);
             for msg in &mut self.filtered_messages {
-                if let Some(st) = self.source_type_map.get(&msg.source_id) {
-                    msg.source_type = st.clone();
-                }
+                resolve_source_type(&self.source_type_map, msg);
             }
             // Newly arrived unread messages get put in unseen_ids so the
             // background refresh tick can't auto-mark them read just because
@@ -3316,9 +3315,7 @@ impl App {
         let limit = self.config.load_limit;
         self.filtered_messages = self.db.get_messages(&filters, limit, 0);
         for msg in &mut self.filtered_messages {
-            if let Some(st) = self.source_type_map.get(&msg.source_id) {
-                msg.source_type = st.clone();
-            }
+            resolve_source_type(&self.source_type_map, msg);
         }
         // Only re-sort when the id set actually changed (new messages
         // arrived or some were purged). If only read-state flipped, keep
@@ -3711,9 +3708,7 @@ impl App {
         filters.folder = Some(folder.to_string());
         self.filtered_messages = self.db.get_messages(&filters, 500, 0);
         for msg in &mut self.filtered_messages {
-            if let Some(st) = self.source_type_map.get(&msg.source_id) {
-                msg.source_type = st.clone();
-            }
+            resolve_source_type(&self.source_type_map, msg);
         }
         self.sort_messages();
         self.rebuild_display();
@@ -3899,6 +3894,10 @@ impl App {
             let pin_rank: std::collections::HashMap<&str, usize> = self.current_section_order.iter()
                 .enumerate().map(|(i, s)| (s.as_str(), i)).collect();
             let filtered = &self.filtered_messages;
+            // When the view asks to sort by source (e.g. the phone gateway
+            // view), group the unpinned tier by platform first, then by
+            // latest activity within each platform.
+            let by_source = self.sort_order == "source";
             sections.sort_by(|a, b| {
                 let ra = pin_rank.get(a.name.as_str()).copied();
                 let rb = pin_rank.get(b.name.as_str()).copied();
@@ -3909,7 +3908,11 @@ impl App {
                     (None, None) => {
                         let la = a.messages.iter().map(|&i| filtered[i].timestamp).max().unwrap_or(0);
                         let lb = b.messages.iter().map(|&i| filtered[i].timestamp).max().unwrap_or(0);
-                        lb.cmp(&la)
+                        if by_source {
+                            a.source_type.cmp(&b.source_type).then(lb.cmp(&la))
+                        } else {
+                            lb.cmp(&la)
+                        }
                     }
                 }
             });
@@ -5695,9 +5698,7 @@ impl App {
         } else {
             let count = more.len();
             for mut msg in more {
-                if let Some(st) = self.source_type_map.get(&msg.source_id) {
-                    msg.source_type = st.clone();
-                }
+                resolve_source_type(&self.source_type_map, &mut msg);
                 self.filtered_messages.push(msg);
             }
             self.sort_messages();
@@ -5783,9 +5784,7 @@ impl App {
         filters.content_pattern = Some(format!("%{}%", query));
         self.filtered_messages = self.db.get_messages(&filters, 500, 0);
         for msg in &mut self.filtered_messages {
-            if let Some(st) = self.source_type_map.get(&msg.source_id) {
-                msg.source_type = st.clone();
-            }
+            resolve_source_type(&self.source_type_map, msg);
         }
         self.index = 0;
         let n = self.filtered_messages.len();
@@ -10618,9 +10617,7 @@ impl App {
         // Apply + persist so the 5s refresh doesn't blank the results.
         self.filtered_messages = self.db.get_messages(&filters, 500, 0);
         for msg in &mut self.filtered_messages {
-            if let Some(st) = self.source_type_map.get(&msg.source_id) {
-                msg.source_type = st.clone();
-            }
+            resolve_source_type(&self.source_type_map, msg);
         }
         self.index = 0;
         let n = self.filtered_messages.len();
@@ -12824,6 +12821,22 @@ fn chat_source_type_for_display(display: &str) -> Option<&'static str> {
     None
 }
 
+/// Resolve a message's display source-type. Usually the source's
+/// plugin_type, but gateway (phone relay) messages carry the real
+/// platform in metadata — surface that (whatsapp/instagram/messenger/
+/// telegram/signal/sms) so per-platform colour, icon, and the "source"
+/// sort work in the Phone view instead of everything reading as
+/// "gateway".
+fn resolve_source_type(map: &std::collections::HashMap<i64, String>, msg: &mut Message) {
+    let Some(st) = map.get(&msg.source_id) else { return };
+    if st == "gateway" {
+        if let Some(p) = msg.metadata.get("platform").and_then(|v| v.as_str()) {
+            if !p.is_empty() { msg.source_type = p.to_string(); return; }
+        }
+    }
+    msg.source_type = st.clone();
+}
+
 fn source_info(source_type: &str, tc: &config::ThemeColors) -> (String, u8) {
     let (glyph, icon_color, row_color) = match source_type {
         "discord"  => ("\u{25C6}", tc.src_discord_icon,  tc.src_discord),
@@ -12838,6 +12851,11 @@ fn source_info(source_type: &str, tc: &config::ThemeColors) -> (String, u8) {
         "web" | "webpage" => ("\u{25CE}", tc.src_web_icon, tc.src_web),
         "messenger" => ("\u{260E}", tc.src_messenger_icon, tc.src_messenger),
         "instagram" => ("\u{25C8}", tc.src_instagram_icon, tc.src_instagram),
+        // SMS (native) and Signal arrive via the phone gateway. No
+        // dedicated theme-colour field yet, so use distinct fixed
+        // colours: SMS green (40), Signal blue (33).
+        "sms"      => ("\u{260F}", 40, 40),
+        "signal"   => ("\u{25C7}", 33, 33),
         "weechat" | "workspace" => ("\u{2318}", tc.src_weechat_icon, tc.src_weechat),
         _ => ("\u{2022}", tc.src_default_icon, tc.src_default),
     };
