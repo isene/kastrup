@@ -861,6 +861,36 @@ impl Database {
         out
     }
 
+    /// Per-source unread counts: source_id -> unread. Lean companion to
+    /// `unread_count_by_folder` for the inactive-view badges — source-
+    /// scoped views (e.g. Messenger = source_id 5) carry no folder
+    /// filter, so the folder cache alone can't tell whether THAT source
+    /// has unread. Same `read = 0` / no-archived-filter semantics as the
+    /// folder query so the two caches agree.
+    pub fn unread_count_by_source(&self) -> std::collections::HashMap<i64, i64> {
+        let conn = self.conn.lock().unwrap();
+        let mut out = std::collections::HashMap::new();
+        let mut stmt = match conn.prepare(
+            "SELECT source_id, COUNT(*) FROM messages \
+             WHERE read = 0 \
+             GROUP BY source_id"
+        ) {
+            Ok(s) => s,
+            Err(_) => return out,
+        };
+        let rows = stmt.query_map([], |r| {
+            let sid: i64   = r.get(0)?;
+            let count: i64 = r.get(1)?;
+            Ok((sid, count))
+        });
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                out.insert(row.0, row.1);
+            }
+        }
+        out
+    }
+
     /// Get a setting value
     pub fn get_setting(&self, key: &str) -> Option<String> {
         let conn = self.conn.lock().unwrap();
