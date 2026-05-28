@@ -64,6 +64,7 @@ pub fn sync_gateway(config: &serde_json::Value, known_ids: &HashSet<String>) -> 
             "whatsapp" => "WhatsApp",
             "telegram" => "Telegram",
             "signal" => "Signal",
+            "sms" => "SMS",
             other => other,
         };
 
