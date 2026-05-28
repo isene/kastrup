@@ -4177,53 +4177,50 @@ impl App {
     /// view filter.
     fn mark_section_read(&mut self) {
         if !self.show_threaded { return; }
-        // Walk back from cursor to find the section header.
+        // Walk back from cursor to the section header.
         let mut ix = self.index;
         while ix > 0 && !self.display_messages[ix].is_header { ix -= 1; }
         let Some(header) = self.display_messages.get(ix).filter(|m| m.is_header) else { return };
-        let Some(section_name) = header.thread_id.clone() else { return };
+        let label = header.thread_id.clone()
+            .map(|s| s.rsplit_once('.').map(|(_, c)| c.to_string()).unwrap_or(s))
+            .unwrap_or_else(|| "section".to_string());
 
-        // Only Folders mode gives us a real folder name to scope on.
-        // For Threaded mode the section_name is a subject/thread label
-        // that doesn't map cleanly to a SQL filter, so bail out with a
-        // hint instead of marking the whole view by accident.
-        if !self.group_by_folder {
+        // Collect the unread message ids in this display section
+        // (header+1 until the next header). Works in any threaded
+        // view — folder-grouped or thread/subject-grouped — because
+        // it operates on what's actually on screen, not a SQL folder
+        // predicate. (The old folder-filter path bailed in non-folder
+        // threaded views like RSS, so `a` did nothing there.)
+        let mut ids: Vec<i64> = Vec::new();
+        let mut j = ix + 1;
+        while j < self.display_messages.len() && !self.display_messages[j].is_header {
+            let m = &self.display_messages[j];
+            if !m.read { ids.push(m.id); }
+            j += 1;
+        }
+        if ids.is_empty() {
             self.set_feedback(
-                "Mark-section-read only works in Folder-grouped view (press G)",
+                &format!("Nothing unread in {}", label),
                 self.config.theme_colors.feedback_warn,
             );
             return;
         }
-
-        let mut filters = self.build_current_filters();
-        filters.folder = Some(section_name.clone());
-        filters.folder_pattern = None;  // exact match on this channel
-
-        let maildir_source_ids: Vec<i64> = self.source_type_map.iter()
-            .filter_map(|(id, t)| if t == "maildir" { Some(*id) } else { None })
-            .collect();
-
-        let _ = self.write_tx.send(DbWriteOp::MarkAllReadBulk {
-            filters: Some(filters),
-            maildir_source_ids,
-        });
-
-        // In-memory flip so the UI reflects the new state immediately.
-        let mut flipped = 0usize;
+        let n = ids.len();
+        let idset: std::collections::HashSet<i64> = ids.iter().copied().collect();
+        let _ = self.write_tx.send(DbWriteOp::MarkReadByIds(ids));
+        // Flip BOTH stores: filtered_messages is canonical, but the
+        // threaded view renders from display_messages.
         for msg in &mut self.filtered_messages {
-            if msg.folder.as_deref() == Some(section_name.as_str()) && !msg.read {
-                msg.read = true;
-                flipped += 1;
-            }
+            if idset.contains(&msg.id) { msg.read = true; }
         }
-        let label = section_name
-            .rsplit_once('.').map(|(_, c)| c).unwrap_or(section_name.as_str());
+        for msg in &mut self.display_messages {
+            if idset.contains(&msg.id) { msg.read = true; }
+        }
         self.set_feedback(
-            &format!("Marked {} as read in {}", flipped, label),
+            &format!("Marked {} as read in {}", n, label),
             self.config.theme_colors.feedback_ok,
         );
         self.sync_mail_count();
-        self.rebuild_display();
         self.render_all();
     }
 }
@@ -4350,6 +4347,13 @@ impl App {
         // waiting on the writer.
         let _ = self.write_tx.send(DbWriteOp::MarkReadByIds(ids));
         for msg in &mut self.filtered_messages {
+            msg.read = true;
+        }
+        // Threaded view renders from display_messages (clones), so the
+        // unread markers won't clear until these are updated too —
+        // otherwise the `N` flags linger until the next rebuild (which
+        // a cursor move triggers, hence "only clears when I move").
+        for msg in &mut self.display_messages {
             msg.read = true;
         }
         self.set_feedback(&format!("Marked {} as read", n), okcol);
