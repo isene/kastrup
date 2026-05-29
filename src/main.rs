@@ -10040,7 +10040,10 @@ for part in msg.walk():
             return;
         }
 
-        let default = format!("{}/Downloads", std::env::var("HOME").unwrap_or_default());
+        // Honour the configured download folder (e.g. ~/Dl) instead of a
+        // hardcoded ~/Downloads. Matches the single-attachment save path.
+        let default = self.config.download_folder.replace(
+            '~', &std::env::var("HOME").unwrap_or_default());
         let dest_input = self.prompt("Save images to: ", &default);
         if dest_input.is_empty() {
             self.set_feedback("Cancelled", self.config.theme_colors.feedback_info);
