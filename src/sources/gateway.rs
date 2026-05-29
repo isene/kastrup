@@ -49,12 +49,37 @@ pub fn sync_gateway(config: &serde_json::Value, known_ids: &HashSet<String>) -> 
         let ts = v.get("timestamp").and_then(|x| x.as_i64()).unwrap_or_else(now_secs);
         let group = v.get("group").and_then(|x| x.as_bool()).unwrap_or(false);
 
-        // Drain the file regardless (consumed). A crash between this delete and
-        // the poller's DB insert would drop one message; acceptable for the
-        // drop-folder pattern (same as tock incoming/).
+        // Optional media: array of {file, mime}. `file` is relative to
+        // <gateway_dir>/inbound/. The relay writes the bitmap pulled off
+        // the phone notification (still images / photo previews only —
+        // see the gateway contract). Syncthing carries the file alongside
+        // the JSON, but the two can arrive out of order: if a referenced
+        // media file hasn't synced yet, treat the WHOLE message as
+        // not-ready and leave the JSON for the next pass (do NOT drain).
+        let media_refs: Vec<(PathBuf, String)> = v.get("media")
+            .and_then(|m| m.as_array())
+            .map(|arr| arr.iter().filter_map(|m| {
+                let file = m.get("file").and_then(|x| x.as_str())?;
+                let mime = m.get("mime").and_then(|x| x.as_str()).unwrap_or("image/jpeg");
+                Some((inbound.join(file), mime.to_string()))
+            }).collect())
+            .unwrap_or_default();
+        if media_refs.iter().any(|(p, _)| !p.exists()) {
+            // Media still in flight — retry next tick without consuming.
+            continue;
+        }
+
+        // Drain the JSON now that any media has landed. A crash between this
+        // delete and the poller's DB insert would drop one message;
+        // acceptable for the drop-folder pattern (same as tock incoming/).
         let _ = std::fs::remove_file(&path);
 
-        if platform.is_empty() || thread_key.is_empty() || body.is_empty() {
+        // Allow media-only messages through (e.g. a photo with empty text):
+        // require text OR at least one media file.
+        if platform.is_empty() || thread_key.is_empty()
+            || (body.is_empty() && media_refs.is_empty())
+        {
+            for (p, _) in &media_refs { let _ = std::fs::remove_file(p); }
             continue;
         }
 
@@ -70,7 +95,31 @@ pub fn sync_gateway(config: &serde_json::Value, known_ids: &HashSet<String>) -> 
 
         let ext_id = format!("gw_{}_{}_{}", platform, thread_key, ts);
         if known_ids.contains(&ext_id) {
+            for (p, _) in &media_refs { let _ = std::fs::remove_file(p); }
             continue;
+        }
+
+        // Move each synced media file out of the volatile inbound/ dir into
+        // a stable store kastrup owns (OUTSIDE the synced gateway/ folder so
+        // the move doesn't just re-sync), and describe it as a local-path
+        // attachment so the existing inline-image display path renders it.
+        let media_dir = home_dir().join(".kastrup").join("gateway_media");
+        let _ = std::fs::create_dir_all(&media_dir);
+        let mut attachments: Vec<serde_json::Value> = Vec::new();
+        for (i, (src, mime)) in media_refs.iter().enumerate() {
+            let ext = mime.rsplit('/').next().unwrap_or("jpg");
+            let name = format!("{}_{}.{}", ext_id, i, ext);
+            let dest = media_dir.join(&name);
+            if std::fs::rename(src, &dest).is_err()
+                && std::fs::copy(src, &dest).map(|_| { let _ = std::fs::remove_file(src); }).is_err()
+            {
+                continue;
+            }
+            attachments.push(serde_json::json!({
+                "name": name,
+                "content_type": mime,
+                "path": dest.to_string_lossy().to_string(),
+            }));
         }
 
         messages.push(MessageData {
@@ -85,7 +134,7 @@ pub fn sync_gateway(config: &serde_json::Value, known_ids: &HashSet<String>) -> 
             html_content: None,
             timestamp: ts,
             labels: vec![label.to_string()],
-            attachments: Vec::new(),
+            attachments,
             metadata: serde_json::json!({
                 "thread_key": thread_key,
                 "platform": platform,
