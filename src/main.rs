@@ -9716,6 +9716,14 @@ impl App {
                 if url.starts_with("http") && is_image_attachment(att) {
                     urls.push(url.to_string());
                 }
+            } else if is_image_attachment(att) {
+                // Local-file attachment (e.g. phone-gateway media synced to
+                // disk): render straight from the path, no download.
+                if let Some(p) = att.get("path").and_then(|v| v.as_str()) {
+                    if std::path::Path::new(p).exists() {
+                        urls.push(format!("file://{}", p));
+                    }
+                }
             }
         }
 
@@ -9981,6 +9989,14 @@ for part in msg.walk():
             if let Some(url) = url {
                 if url.starts_with("http") && is_image_attachment(att) {
                     urls.push(url.to_string());
+                }
+            } else if is_image_attachment(att) {
+                // Local-file attachment (e.g. phone-gateway media synced to
+                // disk): render straight from the path, no download.
+                if let Some(p) = att.get("path").and_then(|v| v.as_str()) {
+                    if std::path::Path::new(p).exists() {
+                        urls.push(format!("file://{}", p));
+                    }
                 }
             }
         }
