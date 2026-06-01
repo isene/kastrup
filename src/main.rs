@@ -9721,45 +9721,15 @@ impl App {
             }
         }
 
-        // From MIME image parts (inline embedded images)
+        // From MIME image parts (inline embedded images). Use the same
+        // in-memory extractor as the image COUNT (extract_mime_attachments)
+        // so "N images" and what V/save collect can never disagree. The old
+        // path shelled python at the on-disk maildir file, which failed
+        // whenever that pointer was stale (message moved new/→cur/) even
+        // though the count — reading msg.content — still saw the images.
+        // Bonus: no python3 subprocess on every press.
         if urls.is_empty() && msg.content.contains("image/") {
-            let maildir_file = msg.metadata.get("maildir_file").and_then(|v| v.as_str()).map(String::from);
-            if let Some(ref mf) = maildir_file {
-                if std::path::Path::new(mf).exists() {
-                    let cache_dir = home_dir().join(".kastrup/image_cache");
-                    let _ = std::fs::create_dir_all(&cache_dir);
-                    let py = format!(r#"
-import email, sys, os
-with open(sys.argv[1], 'rb') as f:
-    msg = email.message_from_binary_file(f)
-dest = sys.argv[2]
-i = 0
-for part in msg.walk():
-    ct = part.get_content_type()
-    if ct.startswith('image/'):
-        data = part.get_payload(decode=True)
-        if data:
-            ext = ct.split('/')[-1].split(';')[0]
-            path = os.path.join(dest, f'mime_img_{{i}}.{{ext}}')
-            with open(path, 'wb') as out:
-                out.write(data)
-            print(path)
-            i += 1
-"#);
-                    if let Ok(output) = std::process::Command::new("python3")
-                        .arg("-c").arg(&py)
-                        .arg(mf).arg(cache_dir.to_string_lossy().as_ref())
-                        .output()
-                    {
-                        for line in String::from_utf8_lossy(&output.stdout).lines() {
-                            let path = line.trim();
-                            if !path.is_empty() {
-                                urls.push(format!("file://{}", path));
-                            }
-                        }
-                    }
-                }
-            }
+            urls.extend(mime_image_file_urls(&msg.content, msg.id));
         }
 
         urls.dedup();
@@ -9961,45 +9931,12 @@ for part in msg.walk():
             }
         }
 
+        // Inline embedded images — same in-memory extractor as the count
+        // and as toggle_inline_image (see mime_image_file_urls). Replaces
+        // the old python-on-maildir-file path that broke on stale new/→cur/
+        // pointers and disagreed with the displayed "N images" count.
         if urls.is_empty() && msg.content.contains("image/") {
-            let maildir_file = msg.metadata.get("maildir_file").and_then(|v| v.as_str()).map(String::from);
-            if let Some(ref mf) = maildir_file {
-                if std::path::Path::new(mf).exists() {
-                    let cache_dir = home_dir().join(".kastrup/image_cache");
-                    let _ = std::fs::create_dir_all(&cache_dir);
-                    let py = r#"
-import email, sys, os
-with open(sys.argv[1], 'rb') as f:
-    msg = email.message_from_binary_file(f)
-dest = sys.argv[2]
-i = 0
-for part in msg.walk():
-    ct = part.get_content_type()
-    if ct.startswith('image/'):
-        data = part.get_payload(decode=True)
-        if data:
-            ext = ct.split('/')[-1].split(';')[0]
-            fname = part.get_filename() or f'mime_img_{i}.{ext}'
-            path = os.path.join(dest, fname)
-            with open(path, 'wb') as out:
-                out.write(data)
-            print(path)
-            i += 1
-"#;
-                    if let Ok(output) = std::process::Command::new("python3")
-                        .arg("-c").arg(py)
-                        .arg(mf).arg(cache_dir.to_string_lossy().as_ref())
-                        .output()
-                    {
-                        for line in String::from_utf8_lossy(&output.stdout).lines() {
-                            let path = line.trim();
-                            if !path.is_empty() {
-                                urls.push(format!("file://{}", path));
-                            }
-                        }
-                    }
-                }
-            }
+            urls.extend(mime_image_file_urls(&msg.content, msg.id));
         }
 
         urls.dedup();
@@ -12057,6 +11994,36 @@ fn utf8_char_len(first_byte: u8) -> usize {
     else if first_byte < 0xE0 { 2 }
     else if first_byte < 0xF0 { 3 }
     else { 4 }
+}
+
+/// Extract inline MIME image parts from a raw message `content` and
+/// materialise them into the image cache, returning `file://` URLs.
+/// Shared by the `V`-key inline display and the image-save collector so
+/// both always agree with the rendered "N images" count — all three now
+/// read the same in-memory `extract_mime_attachments`. Pure parse: no
+/// python subprocess and no dependence on the on-disk maildir-file path
+/// (which goes stale when a message moves new/→cur/).
+fn mime_image_file_urls(content: &str, msg_id: i64) -> Vec<String> {
+    let cache_dir = home_dir().join(".kastrup/image_cache");
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let mut out = Vec::new();
+    for (i, att) in extract_mime_attachments(content, msg_id).into_iter().enumerate() {
+        if !att["is_image"].as_bool().unwrap_or(false) { continue; }
+        let Some(src) = att["source_file"].as_str() else { continue };
+        // Give the cache copy an extension from the content-type so glow
+        // selects the right decoder (the extracted tmp file is often
+        // extension-less for Content-ID inline images).
+        let ext = att["content_type"].as_str().unwrap_or("image/png")
+            .rsplit('/').next().unwrap_or("png")
+            .split([';', ' ']).next().unwrap_or("png")
+            .trim();
+        let ext = if ext.is_empty() { "png" } else { ext };
+        let dest = cache_dir.join(format!("mime_{}_{}.{}", msg_id, i, ext));
+        if std::fs::copy(src, &dest).is_ok() {
+            out.push(format!("file://{}", dest.display()));
+        }
+    }
+    out
 }
 
 fn extract_mime_attachments(content: &str, msg_id: i64) -> Vec<serde_json::Value> {
