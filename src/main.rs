@@ -4644,9 +4644,6 @@ impl App {
     fn purge_deleted(&mut self) {
         if self.delete_marked.is_empty() { return; }
 
-        // Remember current message to restore position after purge
-        let current_id = self.filtered_messages.get(self.index).map(|m| m.id);
-
         let ids: Vec<i64> = self.delete_marked.iter().copied().collect();
         let id_set: std::collections::HashSet<i64> = ids.iter().copied().collect();
 
@@ -4704,50 +4701,64 @@ impl App {
         let count = ids.len();
         self.delete_marked.clear();
 
-        // Lowest position of a deleted message in the ACTIVE list. In
-        // threaded view the cursor indexes display_messages (headers +
-        // expanded section), not filtered_messages — clamping against the
-        // wrong list left the cursor past-the-end, visible as "no left-pane
-        // selection + blank right pane" after purge.
-        let min_deleted_pos = if self.show_threaded {
-            ids.iter().filter_map(|id| {
-                self.display_messages.iter().position(|m| m.id == *id)
-            }).min().unwrap_or(0)
-        } else {
-            ids.iter().filter_map(|id| {
-                self.filtered_messages.iter().position(|m| m.id == *id)
-            }).min().unwrap_or(0)
-        };
-
-        self.filtered_messages.retain(|m| !ids.contains(&m.id));
-        if self.show_threaded {
-            self.display_messages.retain(|m| !ids.contains(&m.id));
-        }
-
-        // Land on the item now at the first deleted position in the
-        // active list. Skip synthetic section headers — they aren't
-        // selectable targets.
-        let active_len = if self.show_threaded {
-            self.display_messages.len()
-        } else {
-            self.filtered_messages.len()
-        };
-        let mut new_index = min_deleted_pos.min(active_len.saturating_sub(1));
-        if self.show_threaded {
-            while new_index < self.display_messages.len()
-                && self.display_messages[new_index].is_header
+        // Capture cursor anchors BEFORE mutating. In threaded/folders view
+        // the cursor indexes display_messages (section headers + expanded
+        // rows). Section headers are synthetic (id 0), so we anchor by the
+        // section *name* (thread_id), which survives a rebuild:
+        //   * own_section  — the thread the deleted rows belong to. If it
+        //     still has messages after the purge (partial delete) we land
+        //     back on it.
+        //   * prev_section — the thread directly above it. If the deleted
+        //     thread is now empty (whole-thread delete) we land here, so the
+        //     cursor ends up on the thread above — what the user expects.
+        let (own_section, prev_section): (Option<String>, Option<String>) = if self.show_threaded {
+            match ids.iter()
+                .filter_map(|id| self.display_messages.iter().position(|m| m.id == *id))
+                .min()
             {
-                new_index += 1;
-            }
-            if new_index >= self.display_messages.len() {
-                // Walk back past any trailing headers.
-                new_index = self.display_messages.len().saturating_sub(1);
-                while new_index > 0 && self.display_messages[new_index].is_header {
-                    new_index -= 1;
+                Some(p) => {
+                    let mut h = p;
+                    while h > 0 && !self.display_messages[h].is_header { h -= 1; }
+                    let own = self.display_messages.get(h)
+                        .filter(|m| m.is_header)
+                        .and_then(|m| m.thread_id.clone());
+                    let mut prev = None;
+                    let mut a = h;
+                    while a > 0 {
+                        a -= 1;
+                        if self.display_messages[a].is_header {
+                            prev = self.display_messages[a].thread_id.clone();
+                            break;
+                        }
+                    }
+                    (own, prev)
                 }
+                None => (None, None),
             }
+        } else { (None, None) };
+        let min_deleted_pos = ids.iter()
+            .filter_map(|id| self.filtered_messages.iter().position(|m| m.id == *id))
+            .min().unwrap_or(0);
+
+        self.filtered_messages.retain(|m| !id_set.contains(&m.id));
+
+        if self.show_threaded {
+            // Rebuild so the emptied section's header is dropped immediately
+            // (a manual retain left an orphan header that lingered until the
+            // next keypress), then restore the cursor near the removed thread.
+            self.rebuild_display();
+            let pos_of = |name: &str, dm: &[Message]| -> Option<usize> {
+                dm.iter().position(|m| m.is_header && m.thread_id.as_deref() == Some(name))
+            };
+            let len = self.display_messages.len();
+            self.index = own_section.as_deref().and_then(|n| pos_of(n, &self.display_messages))
+                .or_else(|| prev_section.as_deref().and_then(|n| pos_of(n, &self.display_messages)))
+                .unwrap_or(0)
+                .min(len.saturating_sub(1));
+        } else {
+            let len = self.filtered_messages.len();
+            self.index = min_deleted_pos.min(len.saturating_sub(1));
         }
-        self.index = new_index;
 
         self.set_feedback(&format!("Purged {} messages", count), self.config.theme_colors.feedback_ok);
         self.render_all();
