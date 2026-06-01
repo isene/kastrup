@@ -164,6 +164,19 @@ impl Database {
         Ok(Self { conn: Mutex::new(conn) })
     }
 
+    /// Open an independent connection to the same DB file. WAL mode lets
+    /// it read concurrently without taking the shared `conn` Mutex, so a
+    /// slow background scan (the startup stuck-maildir reconcile, which on
+    /// a cold 2.4 GB DB took ~90 s) can never block the UI's message-load
+    /// on the main connection. busy_timeout so it waits politely on the
+    /// rare checkpoint.
+    pub fn open_aux_connection(&self) -> Result<Connection, String> {
+        let conn = Connection::open(db_path())
+            .map_err(|e| format!("aux connection open: {}", e))?;
+        let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+        Ok(conn)
+    }
+
     /// Returns true if the database was just created (no messages)
     pub fn is_empty(&self) -> bool {
         let conn = self.conn.lock().unwrap();

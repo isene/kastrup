@@ -1476,10 +1476,26 @@ fn main() {
                 // without sync_maildir_seen_flag; the paired-write fix
                 // in v0.1.129 keeps new occurrences from piling up).
                 let t = std::time::Instant::now();
-                let conn = db.conn.lock().unwrap();
+                // Use a dedicated connection (NOT the shared db.conn Mutex):
+                // this scan reads the metadata of every recently-ingested
+                // message, and on a cold 2.4 GB DB that took ~90 s while
+                // holding the lock — which froze the UI's startup message
+                // load. WAL mode lets an independent reader run alongside.
+                let conn = match db.open_aux_connection() {
+                    Ok(c) => c,
+                    Err(e) => { log::info(&format!("reconcile: aux conn failed: {}", e)); return; }
+                };
+                // Bound the scan to recently-ingested rows (high rowids).
+                // A stuck file only arises right after a message is read,
+                // and the v0.1.129 paired-write fix stops new ones piling
+                // up, so anything stuck is recent. The rowid range uses the
+                // primary key, so this is sub-second even cold — vs a full
+                // 256k-row metadata scan. Old pre-fix strays were already
+                // reconciled in earlier runs.
                 let mut stmt = conn.prepare(
                     "SELECT id, metadata FROM messages \
-                     WHERE read = 1 AND metadata IS NOT NULL \
+                     WHERE id > (SELECT COALESCE(MAX(id),0) FROM messages) - 20000 \
+                       AND read = 1 AND metadata IS NOT NULL \
                        AND instr(metadata, '\"maildir_file\":') > 0 \
                        AND instr(metadata, '/new/') > 0"
                 ).ok();
