@@ -4406,6 +4406,11 @@ impl App {
                     self.db.mark_as_read(msg.id);
                     msg.read = true;
                     became_read = true;
+                    // Pair the maildir move new/→cur/+Seen with the read
+                    // flip, like the auto-read path does. Without this the
+                    // file lingers in new/ and gmail-idle keeps counting it,
+                    // so the asmite shows phantom unread until next restart.
+                    let _ = self.write_tx.send(DbWriteOp::SyncMaildirFlag(msg.metadata.clone(), msg.id));
                     // Also mark in filtered_messages
                     if let Some(fm) = self.filtered_messages.iter_mut().find(|m| m.id == msg.id) {
                         fm.read = true;
@@ -4425,6 +4430,8 @@ impl App {
                 self.db.mark_as_read(msg.id);
                 msg.read = true;
                 became_read = true;
+                // Pair the maildir move with the read flip (see above).
+                let _ = self.write_tx.send(DbWriteOp::SyncMaildirFlag(msg.metadata.clone(), msg.id));
             }
             if !msg.full_loaded {
                 if let Some((content, html)) = self.db.get_message_content(msg.id) {
@@ -4462,6 +4469,18 @@ impl App {
             for m in &mut self.filtered_messages {
                 if tagged_set.contains(&m.id) { m.read = new_state; }
             }
+            // When marking read, pair the maildir move new/→cur/+Seen so
+            // the asmite (gmail-idle) count clears too. No-op for non-maildir
+            // (chat) messages — rename_maildir_add_seen returns None.
+            if new_state {
+                let to_sync: Vec<(serde_json::Value, i64)> = self.filtered_messages.iter()
+                    .filter(|m| tagged_set.contains(&m.id))
+                    .map(|m| (m.metadata.clone(), m.id))
+                    .collect();
+                for (meta, id) in to_sync {
+                    let _ = self.write_tx.send(DbWriteOp::SyncMaildirFlag(meta, id));
+                }
+            }
             let label = if new_state { "read" } else { "unread" };
             self.set_feedback(
                 &format!("Marked {} tagged as {}", tagged_ids.len(), label),
@@ -4473,6 +4492,9 @@ impl App {
         if let Some(msg) = self.filtered_messages.get_mut(self.index) {
             let new_state = self.db.toggle_read(msg.id);
             msg.read = new_state;
+            if new_state {
+                let _ = self.write_tx.send(DbWriteOp::SyncMaildirFlag(msg.metadata.clone(), msg.id));
+            }
             self.sync_mail_count();
             self.render_all();
         }
