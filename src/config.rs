@@ -74,6 +74,8 @@ pub struct ThemeColors {
     pub src_sms_icon: u8,
     pub src_signal: u8,
     pub src_signal_icon: u8,
+    pub src_linkedin: u8,
+    pub src_linkedin_icon: u8,
     pub src_default: u8,
     pub src_default_icon: u8,
     pub content_fg: u8,
@@ -107,7 +109,9 @@ impl Default for ThemeColors {
             // SMS (phone gateway, native) green-cyan; Signal blue. Kept
             // distinct from src_whatsapp (40) and src_messenger (33),
             // which they otherwise visually collided with.
-            src_sms: 48, src_signal: 27, src_default: 15,
+            // LinkedIn brand blue (25), distinct from messenger (33) /
+            // signal (27) / telegram (51). Reddit reuses src_reddit (202).
+            src_sms: 48, src_signal: 27, src_linkedin: 25, src_default: 15,
             // Icon colors. Default each icon to the same as the row
             // color so behaviour is unchanged from earlier builds —
             // the only outlier is email, where `@` reads better as
@@ -118,7 +122,7 @@ impl Default for ThemeColors {
             src_whatsapp_icon: 40, src_reddit_icon: 202, src_rss_icon: 226,
             src_web_icon: 208, src_messenger_icon: 33, src_instagram_icon: 205,
             src_weechat_icon: 75,
-            src_sms_icon: 48, src_signal_icon: 27,
+            src_sms_icon: 48, src_signal_icon: 27, src_linkedin_icon: 25,
             src_default_icon: 15,
             content_fg: 252, content_bg: 0, list_fg: 252, list_bg: 0, border_fg: 238,
         }
@@ -316,6 +320,8 @@ impl Config {
         put(&mut colors_map, "src_sms_icon", tc.src_sms_icon);
         put(&mut colors_map, "src_signal", tc.src_signal);
         put(&mut colors_map, "src_signal_icon", tc.src_signal_icon);
+        put(&mut colors_map, "src_linkedin", tc.src_linkedin);
+        put(&mut colors_map, "src_linkedin_icon", tc.src_linkedin_icon);
         put(&mut colors_map, "src_default", tc.src_default);
         put(&mut colors_map, "src_default_icon", tc.src_default_icon);
         put(&mut colors_map, "content_fg", tc.content_fg);
@@ -474,6 +480,8 @@ impl Config {
             if let Some(v) = colors.get("src_sms_icon").and_then(|v| v.as_u64()) { tc.src_sms_icon = v as u8; }
             if let Some(v) = colors.get("src_signal").and_then(|v| v.as_u64()) { tc.src_signal = v as u8; }
             if let Some(v) = colors.get("src_signal_icon").and_then(|v| v.as_u64()) { tc.src_signal_icon = v as u8; }
+            if let Some(v) = colors.get("src_linkedin").and_then(|v| v.as_u64()) { tc.src_linkedin = v as u8; }
+            if let Some(v) = colors.get("src_linkedin_icon").and_then(|v| v.as_u64()) { tc.src_linkedin_icon = v as u8; }
             if let Some(v) = colors.get("src_default").and_then(|v| v.as_u64()) { tc.src_default = v as u8; }
             if let Some(v) = colors.get("src_default_icon").and_then(|v| v.as_u64()) { tc.src_default_icon = v as u8; }
             if let Some(v) = colors.get("content_fg").and_then(|v| v.as_u64()) { tc.content_fg = v as u8; }
