@@ -386,36 +386,6 @@ fn parse_view_filters_json(f: &serde_json::Value) -> Filters {
     filters
 }
 
-/// Map a wee-slack relay folder name to a Slack Web API target
-/// string suitable for the `.slack` draft `Channel:` header. Used to
-/// route Slack replies through the API (always reaches the workspace)
-/// instead of the relay (which silently drops messages to closed DM
-/// buffers). Returns None for non-Slack folders so the caller keeps
-/// using the relay for IRC / Discord-bridge / Matrix.
-///
-/// Folder layout from wee-slack: `python.slack.<workspace>.<chan>`
-/// where `<chan>` is one of:
-///   - `#name`  → public/private channel (pass through unchanged)
-///   - `&name`  → wee-slack private channel; API treats as `#name`
-///   - `Name`   → DM with a single user → `@Name`
-///   - `a,b,c`  → multi-party DM → `mpdm:a,b,c` (resolved into a
-///                conversation by `slack_resolve_channel`)
-fn slack_target_from_weechat_folder(folder: &str) -> Option<String> {
-    let rest = folder.strip_prefix("python.slack.")?;
-    let (_workspace, chan) = rest.split_once('.')?;
-    if chan.is_empty() { return None; }
-    if let Some(name) = chan.strip_prefix('#') {
-        return Some(format!("#{}", name));
-    }
-    if let Some(name) = chan.strip_prefix('&') {
-        return Some(format!("#{}", name));
-    }
-    if chan.contains(',') {
-        return Some(format!("mpdm:{}", chan));
-    }
-    Some(format!("@{}", chan))
-}
-
 /// Pull every Slack file CDN URL out of a message body. Wee-slack
 /// formats attachments as bare `https://files.slack.com/files-pri/...`
 /// URLs or wrapped `<URL|displayed-name>` mrkdwn links. Both shapes
@@ -7050,36 +7020,22 @@ impl App {
         self.compose_source_type = Some(msg.source_type.clone());
         self.pending_reply_id = Some(msg.id);
 
-        // Weechat-relay reply. We split by transport based on the
-        // folder prefix:
+        // Weechat-relay reply: route EVERY relay buffer (Slack, IRC,
+        // Discord-bridge, Matrix, WhatsApp, …) through the relay's
+        // `input` command (kind=Weechat). weechat posts the line under
+        // its own identity, so a Slack reply appears AS THE USER with
+        // no "via wee-slack" app badge — exactly like typing in weechat.
         //
-        // * `python.slack.*` → Slack Web API (kind=Slack). wee-slack
-        //   auto-closes inactive DM buffers, and the relay's `input`
-        //   command silently drops messages to non-existent buffers.
-        //   The Web API works against the workspace regardless of
-        //   which buffers are open in weechat.
+        // (We used to send `python.slack.*` via the Slack Web API, but
+        // an xoxp token stamps a bot-style "via wee-slack" attribution
+        // and the clean xoxc/xoxd browser pair rotates every few hours.
+        // The relay path sidesteps both: weechat owns the auth.)
         //
-        // * IRC / Discord-bridge / Matrix / WhatsApp etc. → relay
-        //   `input` (kind=Weechat). These transports keep their
-        //   buffers persistently in weechat, so the relay path is
-        //   the right one.
+        // Caveat: if wee-slack has auto-closed an inactive Slack DM
+        // buffer, the relay drops input to it silently — the same limit
+        // weechat itself has (you'd reopen the DM there too).
         if msg.source_type == "weechat-relay" {
             if let Some(folder) = msg.folder.clone() {
-                if let Some(slack_target) = slack_target_from_weechat_folder(&folder) {
-                    // Surface the resolved target so a glance at the
-                    // status line confirms "reply to #it-ops" before
-                    // the editor opens — easy to spot if you actually
-                    // wanted to reply to a different message.
-                    self.set_feedback(
-                        &format!("Reply target: {} (Slack API)", slack_target),
-                        self.config.theme_colors.feedback_info,
-                    );
-                    self.compose_kind = DraftKind::Slack;
-                    let template = format!("Channel: {}\n\n", slack_target);
-                    self.run_editor_compose_at_full(&template, Some(3), Some(1), true);
-                    self.compose_kind = DraftKind::Email;
-                    return;
-                }
                 self.set_feedback(
                     &format!("Reply target: {} (relay)", folder),
                     self.config.theme_colors.feedback_info,
@@ -7720,18 +7676,12 @@ impl App {
             None => Some("email".to_string())
         };
 
-        // Weechat-relay compose: same split as reply() — Slack channels
-        // route through the Web API (kind=Slack), IRC / Discord-bridge /
-        // Matrix stay on the relay (kind=Weechat).
+        // Weechat-relay compose: route every relay buffer (Slack, IRC,
+        // Discord-bridge, Matrix, …) through the relay `input` command
+        // so weechat posts under the user's own identity — Slack lines
+        // appear as the user, no "via wee-slack" badge (see reply()).
         let weechat_target = self.compose_weechat_target_from_context();
         if let Some(channel) = weechat_target {
-            if let Some(slack_target) = slack_target_from_weechat_folder(&channel) {
-                self.compose_kind = DraftKind::Slack;
-                let template = format!("Channel: {}\n\n", slack_target);
-                self.run_editor_compose_at_full(&template, Some(3), Some(1), true);
-                self.compose_kind = DraftKind::Email;
-                return;
-            }
             self.compose_kind = DraftKind::Weechat;
             let template = format!("Channel: {}\n\n", channel);
             self.run_editor_compose_at_full(&template, Some(3), Some(1), true);
