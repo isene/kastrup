@@ -3112,24 +3112,107 @@ impl App {
     }
 
     fn next_unread(&mut self) {
-        let start = self.index + 1;
-        for i in start..self.filtered_messages.len() {
-            if !self.filtered_messages[i].read {
-                self.index = i;
-                self.render_all();
-                return;
+        if !self.show_threaded {
+            for i in (self.index + 1)..self.filtered_messages.len() {
+                if !self.filtered_messages[i].read {
+                    self.index = i;
+                    self.render_all();
+                    return;
+                }
             }
+            self.set_feedback("No more unread messages", self.config.theme_colors.feedback_info);
+            return;
+        }
+        // Threaded/folders: the cursor indexes display_messages, and unread
+        // messages inside a COLLAPSED thread aren't present as rows (only the
+        // header is). So when we meet a collapsed header that still has unread
+        // (header.read == false), expand it and land on its first unread
+        // message. Start on the current row if it's a header (so pressing the
+        // key while sitting on a collapsed unread thread dives into it);
+        // otherwise start just past the current message.
+        let on_header = self.display_messages.get(self.index)
+            .map(|m| m.is_header).unwrap_or(false);
+        let mut i = if on_header { self.index } else { self.index + 1 };
+        while i < self.display_messages.len() {
+            let (is_header, read, name) = {
+                let m = &self.display_messages[i];
+                (m.is_header, m.read, m.thread_id.clone())
+            };
+            if !is_header {
+                if !read { self.index = i; self.render_all(); return; }
+            } else if !read {
+                let name = name.unwrap_or_default();
+                let collapsed = self.section_collapsed.get(&name)
+                    .copied().unwrap_or(self.group_by_folder);
+                if collapsed {
+                    self.section_collapsed.insert(name.clone(), false);
+                    self.rebuild_display();
+                    if let Some(h) = self.display_messages.iter()
+                        .position(|m| m.is_header && m.thread_id.as_deref() == Some(name.as_str()))
+                    {
+                        for j in (h + 1)..self.display_messages.len() {
+                            if self.display_messages[j].is_header { break; }
+                            if !self.display_messages[j].read {
+                                self.index = j; self.render_all(); return;
+                            }
+                        }
+                        self.index = h; // fallback (header said unread)
+                    }
+                    self.render_all();
+                    return;
+                }
+                // Expanded unread section: its unread rows follow — keep scanning.
+            }
+            i += 1;
         }
         self.set_feedback("No more unread messages", self.config.theme_colors.feedback_info);
     }
 
     fn prev_unread(&mut self) {
-        if self.index == 0 { return; }
-        for i in (0..self.index).rev() {
-            if !self.filtered_messages[i].read {
-                self.index = i;
-                self.render_all();
-                return;
+        if !self.show_threaded {
+            for i in (0..self.index).rev() {
+                if !self.filtered_messages[i].read {
+                    self.index = i;
+                    self.render_all();
+                    return;
+                }
+            }
+            self.set_feedback("No previous unread message", self.config.theme_colors.feedback_info);
+            return;
+        }
+        let mut i = self.index;
+        while i > 0 {
+            i -= 1;
+            let (is_header, read, name) = {
+                let m = &self.display_messages[i];
+                (m.is_header, m.read, m.thread_id.clone())
+            };
+            if !is_header {
+                if !read { self.index = i; self.render_all(); return; }
+            } else if !read {
+                let name = name.unwrap_or_default();
+                let collapsed = self.section_collapsed.get(&name)
+                    .copied().unwrap_or(self.group_by_folder);
+                if collapsed {
+                    // Expand and land on the LAST unread message in the
+                    // section (closest above the cursor).
+                    self.section_collapsed.insert(name.clone(), false);
+                    self.rebuild_display();
+                    if let Some(h) = self.display_messages.iter()
+                        .position(|m| m.is_header && m.thread_id.as_deref() == Some(name.as_str()))
+                    {
+                        let mut target = h;
+                        for j in (h + 1)..self.display_messages.len() {
+                            if self.display_messages[j].is_header { break; }
+                            if !self.display_messages[j].read { target = j; }
+                        }
+                        self.index = target;
+                    }
+                    self.render_all();
+                    return;
+                }
+                // Expanded unread section's unread rows sit BELOW this header
+                // (already scanned if they were above the cursor) — skip.
             }
         }
         self.set_feedback("No previous unread message", self.config.theme_colors.feedback_info);
