@@ -896,6 +896,10 @@ struct App {
     // Stats cache with TTL
     stats_cache: Option<(std::time::Instant, (i64, i64, i64))>,
     last_db_refresh: std::time::Instant,
+    /// Last time the periodic stuck-maildir reconcile ran (see the main
+    /// loop). Throttles it to ~once every 2 min on the loop's existing
+    /// wake — no new timer thread.
+    last_reconcile: std::time::Instant,
 
     // State
     running: bool,
@@ -1375,6 +1379,7 @@ fn main() {
         source_type_map,
         stats_cache: None,
         last_db_refresh: std::time::Instant::now(),
+        last_reconcile: std::time::Instant::now(),
         running: true,
         current_view: "A".to_string(),
         active_folder: None,
@@ -1470,65 +1475,15 @@ fn main() {
                     t.elapsed().as_millis()
                 ));
 
-                // Stuck-maildir reconcile — same logic as before, just
-                // off the boot path. Mismatch is: DB says read=1 but
-                // metadata's maildir_file still points at a new/ subdir
-                // (older mark_browsed_as_read paths flipped read=1
-                // without sync_maildir_seen_flag; the paired-write fix
-                // in v0.1.129 keeps new occurrences from piling up).
+                // Stuck-maildir reconcile: DB read=1 but metadata's
+                // maildir_file still points into a new/ subdir (a read
+                // whose new/→cur/ move slipped through, e.g. a rename that
+                // lost a race). Runs on a dedicated aux connection so it
+                // never blocks the UI. The same function also fires
+                // periodically from the main loop, so a stray clears within
+                // a couple minutes instead of lingering until next restart.
                 let t = std::time::Instant::now();
-                // Use a dedicated connection (NOT the shared db.conn Mutex):
-                // this scan reads the metadata of every recently-ingested
-                // message, and on a cold 2.4 GB DB that took ~90 s while
-                // holding the lock — which froze the UI's startup message
-                // load. WAL mode lets an independent reader run alongside.
-                let conn = match db.open_aux_connection() {
-                    Ok(c) => c,
-                    Err(e) => { log::info(&format!("reconcile: aux conn failed: {}", e)); return; }
-                };
-                // Bound the scan to recently-ingested rows (high rowids).
-                // A stuck file only arises right after a message is read,
-                // and the v0.1.129 paired-write fix stops new ones piling
-                // up, so anything stuck is recent. The rowid range uses the
-                // primary key, so this is sub-second even cold — vs a full
-                // 256k-row metadata scan. Old pre-fix strays were already
-                // reconciled in earlier runs.
-                let mut stmt = conn.prepare(
-                    "SELECT id, metadata FROM messages \
-                     WHERE id > (SELECT COALESCE(MAX(id),0) FROM messages) - 20000 \
-                       AND read = 1 AND metadata IS NOT NULL \
-                       AND instr(metadata, '\"maildir_file\":') > 0 \
-                       AND instr(metadata, '/new/') > 0"
-                ).ok();
-                let mut stuck: Vec<(serde_json::Value, i64)> = Vec::new();
-                if let Some(stmt) = stmt.as_mut() {
-                    let rows = stmt.query_map([], |r| {
-                        Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
-                    });
-                    if let Ok(rows) = rows {
-                        for row in rows.flatten() {
-                            let (id, meta_opt) = row;
-                            let Some(meta_str) = meta_opt else { continue };
-                            let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) else { continue };
-                            if let Some(p) = meta.get("maildir_file").and_then(|v| v.as_str()) {
-                                if p.contains("/new/") {
-                                    stuck.push((meta.clone(), id));
-                                }
-                            }
-                        }
-                    }
-                }
-                drop(stmt);
-                drop(conn);
-                if !stuck.is_empty() {
-                    log::info(&format!(
-                        "background: reconciling {} stuck maildir file(s) (read=1 in DB, still in new/)",
-                        stuck.len()
-                    ));
-                    for (meta, id) in stuck {
-                        let _ = write_tx.send(DbWriteOp::SyncMaildirFlag(meta, id));
-                    }
-                }
+                reconcile_stuck_maildir(&db, &write_tx);
                 log::info(&format!(
                     "background: stuck-maildir reconcile took {} ms",
                     t.elapsed().as_millis()
@@ -1638,6 +1593,18 @@ fn main() {
                     app.unread_cache = app.db.unread_count_by_folder();
                     app.source_unread_cache = app.db.unread_count_by_source();
                     app.render_top_bar();
+                }
+                // Periodic stuck-maildir reconcile. A read whose new/→cur/
+                // move slipped through leaves the asmite counting a phantom
+                // unread until restart; re-run the cheap scan every ~2 min on
+                // a short-lived thread so a stray self-clears. Piggybacks on
+                // this existing loop wake — no new timer — and runs off the
+                // UI thread so even a cold scan can't stall input.
+                if app.last_reconcile.elapsed().as_secs() >= 120 {
+                    app.last_reconcile = std::time::Instant::now();
+                    let db = app.db.clone();
+                    let wtx = app.write_tx.clone();
+                    std::thread::spawn(move || reconcile_stuck_maildir(&db, &wtx));
                 }
             }
         }
@@ -5364,10 +5331,22 @@ impl App {
     }
 
     fn copy_message_id(&mut self) {
-        if let Some(msg) = self.filtered_messages.get(self.index) {
-            let id_str = format!("kastrup:{}", msg.id);
-            crust::clipboard_copy(&id_str, "clipboard");
-            self.set_feedback(&format!("Copied: {}", id_str), self.config.theme_colors.feedback_ok);
+        // Resolve the current message via current_filtered_index so threaded/
+        // folders view (where self.index points into display_messages, which
+        // includes section-header rows) yields the right id — not a row N
+        // positions off in filtered_messages.
+        let id = self.current_filtered_index()
+            .and_then(|i| self.filtered_messages.get(i))
+            .map(|m| m.id);
+        match id {
+            Some(id) => {
+                let id_str = format!("kastrup:{}", id);
+                crust::clipboard_copy(&id_str, "clipboard");
+                self.set_feedback(&format!("Copied: {}", id_str), self.config.theme_colors.feedback_ok);
+            }
+            None => self.set_feedback(
+                "Copy id needs a message — cursor is on a section header",
+                self.config.theme_colors.feedback_warn),
         }
     }
 
@@ -7109,7 +7088,10 @@ impl App {
     /// Prompt for an emoji and add/remove a reaction via external sender.
     fn external_react(&mut self, remove: bool) {
         if self.filtered_messages.is_empty() { return; }
-        let msg = &self.filtered_messages[self.index];
+        // Resolve via current_filtered_index so we react to the message under
+        // the cursor in threaded view, not a mis-indexed filtered_messages row.
+        let Some(idx) = self.current_filtered_index() else { return; };
+        let msg = &self.filtered_messages[idx];
         let plugin_type = msg.source_type.clone();
         let action = if remove { "unreact" } else { "react" };
         if !self.config.senders.get(&plugin_type).map(|m| m.contains_key(action)).unwrap_or(false) {
@@ -10379,7 +10361,7 @@ impl App {
 
     // Batch J: AI Assistant + plugins
     fn ai_assistant(&mut self) {
-        let (is_header, sender, subject, content) = match self.filtered_messages.get(self.index) {
+        let (is_header, sender, subject, content) = match self.current_filtered_index().and_then(|i| self.filtered_messages.get(i)) {
             Some(m) => (
                 m.is_header,
                 m.sender_name.as_deref().unwrap_or(&m.sender).to_string(),
@@ -10468,7 +10450,7 @@ impl App {
     /// through `claude -p`, show the response in the right pane. Used
     /// both by the `c` shortcut and by the `:` colon-command dispatch.
     fn run_claude_with_prompt(&mut self, user_prompt: &str) {
-        let (is_header, msg_id, thread_id, sender, subject, content) = match self.filtered_messages.get(self.index) {
+        let (is_header, msg_id, thread_id, sender, subject, content) = match self.current_filtered_index().and_then(|i| self.filtered_messages.get(i)) {
             Some(m) => (
                 m.is_header,
                 m.id,
@@ -10787,7 +10769,7 @@ impl App {
     /// an initial prompt that points at the snapshot. On exit, the
     /// terminal is handed back to kastrup and the snapshot is removed.
     fn chat_command(&mut self) {
-        let (is_header, msg_id, thread_id, sender, subject, content) = match self.filtered_messages.get(self.index) {
+        let (is_header, msg_id, thread_id, sender, subject, content) = match self.current_filtered_index().and_then(|i| self.filtered_messages.get(i)) {
             Some(m) => (
                 m.is_header,
                 m.id,
@@ -11075,7 +11057,7 @@ impl App {
 
     // Batch L: Calendar/Tock
     fn open_in_tock(&mut self) {
-        let msg = match self.filtered_messages.get(self.index) {
+        let msg = match self.current_filtered_index().and_then(|i| self.filtered_messages.get(i)) {
             Some(m) => m.clone(),
             None => return,
         };
@@ -12919,6 +12901,61 @@ fn resolve_source_type(map: &std::collections::HashMap<i64, String>, msg: &mut M
         }
     }
     msg.source_type = st.clone();
+}
+
+/// Reconcile "stuck" maildir files: messages that are read=1 in the DB
+/// but whose metadata `maildir_file` still points into a `new/` subdir
+/// (their new/→cur/ move slipped through — a rename that lost a race, or
+/// a read on an older build). gmail-idle counts `new/`, so each stray
+/// shows as a phantom unread in the asmite until it's moved. Sends a
+/// `SyncMaildirFlag` for each, which performs the rename + metadata fix.
+///
+/// Cheap and UI-safe: a dedicated aux connection (never the shared
+/// Mutex), bounded to recently-ingested rows by rowid (primary key), so
+/// it's sub-second even cold. Safe to call repeatedly.
+fn reconcile_stuck_maildir(
+    db: &database::Database,
+    write_tx: &std::sync::mpsc::Sender<DbWriteOp>,
+) {
+    let conn = match db.open_aux_connection() {
+        Ok(c) => c,
+        Err(e) => { log::info(&format!("reconcile: aux conn failed: {}", e)); return; }
+    };
+    let mut stmt = conn.prepare(
+        "SELECT id, metadata FROM messages \
+         WHERE id > (SELECT COALESCE(MAX(id),0) FROM messages) - 20000 \
+           AND read = 1 AND metadata IS NOT NULL \
+           AND instr(metadata, '\"maildir_file\":') > 0 \
+           AND instr(metadata, '/new/') > 0"
+    ).ok();
+    let mut stuck: Vec<(serde_json::Value, i64)> = Vec::new();
+    if let Some(stmt) = stmt.as_mut() {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        }) {
+            for row in rows.flatten() {
+                let (id, meta_opt) = row;
+                let Some(meta_str) = meta_opt else { continue };
+                let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) else { continue };
+                if meta.get("maildir_file").and_then(|v| v.as_str())
+                    .map(|p| p.contains("/new/")).unwrap_or(false)
+                {
+                    stuck.push((meta, id));
+                }
+            }
+        }
+    }
+    drop(stmt);
+    drop(conn);
+    if !stuck.is_empty() {
+        log::info(&format!(
+            "reconcile: {} stuck maildir file(s) (read=1, still in new/)",
+            stuck.len()
+        ));
+        for (meta, id) in stuck {
+            let _ = write_tx.send(DbWriteOp::SyncMaildirFlag(meta, id));
+        }
+    }
 }
 
 fn source_info(source_type: &str, tc: &config::ThemeColors) -> (String, u8) {
