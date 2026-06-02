@@ -351,6 +351,7 @@ fn apply_view_rules(rules: &[serde_json::Value], filters: &mut Filters) {
             "source_id" => { filters.source_id = value.as_i64(); }
             "sender" => { filters.sender_pattern = value.as_str().map(|s| s.to_string()); }
             "source_type" => { filters.source_type = value.as_str().map(|s| s.to_string()); }
+            "platform" => { filters.platform = value.as_str().map(|s| s.to_string()); }
             _ => {}
         }
     }
@@ -12921,6 +12922,15 @@ fn resolve_source_type(map: &std::collections::HashMap<i64, String>, msg: &mut M
 }
 
 fn source_info(source_type: &str, tc: &config::ThemeColors) -> (String, u8) {
+    // Config-driven per-platform override (config.yml `source_styles`).
+    // Lets any platform — including relay "Add app" slugs we deliberately
+    // keep out of the source tree — get a custom colour/icon. Empty glyph
+    // falls back to the default bullet.
+    if let Some((color, glyph)) = tc.source_styles.get(source_type) {
+        let g = if glyph.is_empty() { "\u{2022}" } else { glyph.as_str() };
+        let styled = format!("\x1b[38;5;{}m{}\x1b[39m", color, g);
+        return (styled, *color);
+    }
     let (glyph, icon_color, row_color) = match source_type {
         "discord"  => ("\u{25C6}", tc.src_discord_icon,  tc.src_discord),
         "slack"    => ("#",        tc.src_slack_icon,    tc.src_slack),
