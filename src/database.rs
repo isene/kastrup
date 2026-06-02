@@ -31,6 +31,10 @@ pub struct Filters {
     pub sender_pattern: Option<String>,
     pub source_type: Option<String>,
     pub content_pattern: Option<String>,
+    /// Match gateway/phone messages by their `metadata.platform` value
+    /// (e.g. whatsapp, sms, or a relay "Add app" slug). Lets a view scope
+    /// to one platform within the shared gateway source. `=` exact match.
+    pub platform: Option<String>,
     /// Optional OR-of-Filters. When present, takes precedence over
     /// the other fields of this struct — each branch is rendered as
     /// its own AND-group and combined with `OR`.
@@ -112,6 +116,10 @@ fn build_branch_where(filters: &Filters) -> (String, Vec<Box<dyn rusqlite::types
     if let Some(ref stype) = filters.source_type {
         parts.push("source_id IN (SELECT id FROM sources WHERE plugin_type = ?)".into());
         params.push(Box::new(stype.clone()));
+    }
+    if let Some(ref plat) = filters.platform {
+        parts.push("json_extract(metadata, '$.platform') = ?".into());
+        params.push(Box::new(plat.clone()));
     }
     if let Some(ref pattern) = filters.content_pattern {
         parts.push("(content LIKE ? OR subject LIKE ? OR sender LIKE ?)".into());

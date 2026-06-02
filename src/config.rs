@@ -78,6 +78,13 @@ pub struct ThemeColors {
     pub src_linkedin_icon: u8,
     pub src_default: u8,
     pub src_default_icon: u8,
+    /// Per-platform style overrides keyed by source_type / platform slug
+    /// (e.g. a relay "Add app" slug). Value: (color, glyph). source_info
+    /// consults this before its built-in matches, so any platform can get
+    /// a custom colour/icon from ~/.kastrup/config.yml with no code change
+    /// — and platform-specific names stay out of the source tree. Empty
+    /// glyph keeps the default bullet. Loaded from config.yml only.
+    pub source_styles: HashMap<String, (u8, String)>,
     pub content_fg: u8,
     pub content_bg: u8,
     pub list_fg: u8,
@@ -124,6 +131,7 @@ impl Default for ThemeColors {
             src_weechat_icon: 75,
             src_sms_icon: 48, src_signal_icon: 27, src_linkedin_icon: 25,
             src_default_icon: 15,
+            source_styles: HashMap::new(),
             content_fg: 252, content_bg: 0, list_fg: 252, list_bg: 0, border_fg: 238,
         }
     }
@@ -489,6 +497,20 @@ impl Config {
             if let Some(v) = colors.get("list_fg").and_then(|v| v.as_u64()) { tc.list_fg = v as u8; }
             if let Some(v) = colors.get("list_bg").and_then(|v| v.as_u64()) { tc.list_bg = v as u8; }
             if let Some(v) = colors.get("border_fg").and_then(|v| v.as_u64()) { tc.border_fg = v as u8; }
+        }
+
+        // Per-platform style overrides. Shape in config.yml:
+        //   source_styles:
+        //     <platform-slug>:
+        //       color: <0-255>
+        //       glyph: "<single glyph>"   # optional; empty → default bullet
+        if let Some(styles) = yaml.get("source_styles").and_then(|v| v.as_mapping()) {
+            for (k, v) in styles {
+                let Some(name) = k.as_str() else { continue };
+                let color = v.get("color").and_then(|c| c.as_u64()).unwrap_or(0) as u8;
+                let glyph = v.get("glyph").and_then(|g| g.as_str()).unwrap_or("").to_string();
+                self.theme_colors.source_styles.insert(name.to_string(), (color, glyph));
+            }
         }
     }
 
