@@ -912,6 +912,9 @@ struct App {
     /// `switch_to_view`, `refresh_view`, or pressing Esc.
     active_search_filter: Option<Filters>,
     active_search_label: String,
+    /// Last `\` find-in-view needle, so `\` then Enter (empty) jumps to the
+    /// next match without retyping.
+    last_find: String,
     in_source_view: bool,
     index: usize,
 
@@ -1385,6 +1388,7 @@ fn main() {
         active_folder: None,
         active_search_filter: None,
         active_search_label: String::new(),
+        last_find: String::new(),
         in_source_view: false,
         index: 0,
         filtered_messages: Vec::new(),
@@ -1781,6 +1785,7 @@ impl App {
 
             // Search / filter
             "/" => { self.search_prompt(); }
+            "\\" => { self.find_in_view(); }
             "@" => { self.address_book_menu(); }
 
             // Sort
@@ -5889,6 +5894,88 @@ impl App {
                 self.config.theme_colors.feedback_warn);
         }
         self.render_all();
+    }
+
+    /// Simple find-in-view: prompt for a string and jump the cursor to the
+    /// NEXT message in the current view whose sender / subject / preview
+    /// contains it (case-insensitive), wrapping around. Unlike `/` — which
+    /// FILTERS the view down to matches — this keeps the full view and only
+    /// moves the cursor, revealing a match hidden inside a collapsed thread.
+    /// Press `\` then Enter (empty input) to repeat the last find.
+    fn find_in_view(&mut self) {
+        let input = self.prompt("\\find: ", "");
+        self.render_bottom_bar();
+        let needle = if input.trim().is_empty() {
+            self.last_find.clone()
+        } else {
+            self.last_find = input.trim().to_string();
+            self.last_find.clone()
+        };
+        if needle.is_empty() { return; }
+        let n = self.filtered_messages.len();
+        if n == 0 {
+            self.set_feedback("No messages in view", self.config.theme_colors.feedback_warn);
+            return;
+        }
+        let needle_lc = needle.to_lowercase();
+        // Start just past the current message and wrap, so repeated `\`
+        // cycles through every match in the view.
+        let start = self.current_filtered_index().map(|i| i + 1).unwrap_or(0);
+        let mut hit: Option<i64> = None;
+        for off in 0..n {
+            let i = (start + off) % n;
+            if msg_matches(&self.filtered_messages[i], &needle_lc) {
+                hit = Some(self.filtered_messages[i].id);
+                break;
+            }
+        }
+        match hit {
+            Some(id) => {
+                self.reveal_message(id);
+                self.set_feedback(&format!("\\{}", needle), self.config.theme_colors.feedback_info);
+                self.render_all();
+            }
+            None => self.set_feedback(
+                &format!("Not found in view: {}", needle),
+                self.config.theme_colors.feedback_warn),
+        }
+    }
+
+    /// Move the cursor onto the message with `target_id`. In threaded/folders
+    /// view, if it's hidden inside a collapsed section, expand that section
+    /// first (folders mode: the section IS the message's folder) and rebuild.
+    fn reveal_message(&mut self, target_id: i64) {
+        if !self.show_threaded {
+            if let Some(pos) = self.filtered_messages.iter().position(|m| m.id == target_id) {
+                self.index = pos;
+            }
+            return;
+        }
+        if let Some(pos) = self.display_messages.iter()
+            .position(|m| !m.is_header && m.id == target_id)
+        {
+            self.index = pos;
+            return;
+        }
+        // Collapsed: expand the message's section, then re-locate.
+        let section = self.filtered_messages.iter().find(|m| m.id == target_id)
+            .map(|m| if self.group_by_folder {
+                m.folder.clone().unwrap_or_else(|| "INBOX".to_string())
+            } else {
+                m.thread_id.clone().or_else(|| m.folder.clone()).unwrap_or_default()
+            });
+        if let Some(name) = section {
+            if !name.is_empty() {
+                self.section_collapsed.insert(name, false);
+                self.rebuild_display();
+            }
+        }
+        if let Some(pos) = self.display_messages.iter()
+            .position(|m| !m.is_header && m.id == target_id)
+            .or_else(|| self.display_messages.iter().position(|m| m.id == target_id))
+        {
+            self.index = pos;
+        }
     }
 
     fn set_view_color(&mut self) {
@@ -12913,6 +13000,16 @@ fn resolve_source_type(map: &std::collections::HashMap<i64, String>, msg: &mut M
 /// Cheap and UI-safe: a dedicated aux connection (never the shared
 /// Mutex), bounded to recently-ingested rows by rowid (primary key), so
 /// it's sub-second even cold. Safe to call repeatedly.
+/// Case-insensitive substring match for find-in-view (`\`): tests the
+/// sender, sender name, subject and the loaded content preview. Cheap —
+/// all in-memory fields, no DB hit.
+fn msg_matches(m: &Message, needle_lc: &str) -> bool {
+    m.subject.as_deref().unwrap_or("").to_lowercase().contains(needle_lc)
+        || m.sender.to_lowercase().contains(needle_lc)
+        || m.sender_name.as_deref().unwrap_or("").to_lowercase().contains(needle_lc)
+        || m.content.to_lowercase().contains(needle_lc)
+}
+
 fn reconcile_stuck_maildir(
     db: &database::Database,
     write_tx: &std::sync::mpsc::Sender<DbWriteOp>,
