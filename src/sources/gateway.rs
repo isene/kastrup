@@ -185,28 +185,57 @@ pub fn queue_reply(
     Ok(id)
 }
 
-/// Drain delivery-status markers the relay wrote to
-/// `<gateway_dir>/outbox_status/`. Returns `(id, status, reason)` for every
-/// marker (status is `"sent"` or `"failed"`; reason is e.g.
-/// `"no_live_notification"`). Consumes (deletes) every marker file it reads,
-/// so the directory stays clean and a result is reported at most once.
+/// Drain delivery-status markers the relay wrote and return `(id, status,
+/// reason)` for each (status `"sent"`/`"failed"`; reason e.g.
+/// `"no_live_notification"`). Reads BOTH protocols the relay may use and
+/// consumes (deletes) every marker so a result is reported at most once:
+///   * `<gateway>/sent/<id>.json.ack`   `{request, ok, ts}` — the relay's
+///     long-standing per-request ack. `request` is the outbox filename, so
+///     the id is `request` minus `.json`; `ok` maps to sent/failed.
+///   * `<gateway>/outbox_status/<id>.json` `{id, status, reason}` — the newer
+///     richer shape.
 pub fn poll_reply_status(config: &serde_json::Value) -> Vec<(String, String, String)> {
-    let dir = gateway_base(config).join("outbox_status");
+    let base = gateway_base(config);
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(&dir) else { return out; };
-    for entry in rd.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                let id = v.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
-                let status = v.get("status").and_then(|x| x.as_str()).unwrap_or_default().to_string();
-                let reason = v.get("reason").and_then(|x| x.as_str()).unwrap_or_default().to_string();
-                if !id.is_empty() { out.push((id, status, reason)); }
+
+    // Legacy per-request ack the relay already writes.
+    if let Ok(rd) = std::fs::read_dir(base.join("sent")) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if !path.to_string_lossy().ends_with(".json.ack") { continue; }
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    let req = v.get("request").and_then(|x| x.as_str()).unwrap_or_default();
+                    let id = req.strip_suffix(".json").unwrap_or(req).to_string();
+                    let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+                    if !id.is_empty() {
+                        out.push((id,
+                            if ok { "sent".into() } else { "failed".into() },
+                            if ok { String::new() } else { "no_live_notification".into() }));
+                    }
+                }
             }
+            let _ = std::fs::remove_file(&path);
         }
-        let _ = std::fs::remove_file(&path);
     }
+
+    // Newer richer status shape.
+    if let Ok(rd) = std::fs::read_dir(base.join("outbox_status")) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    let id = v.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                    let status = v.get("status").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                    let reason = v.get("reason").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                    if !id.is_empty() { out.push((id, status, reason)); }
+                }
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
     out
 }
 
