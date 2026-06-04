@@ -7246,6 +7246,31 @@ impl App {
         out
     }
 
+    /// Index of the compose target matching the conversation under the
+    /// cursor — the selected message, or (folders/threaded mode) the channel
+    /// header it sits on. `None` when the cursor isn't on a reachable
+    /// external-compose target (e.g. a weechat-relay channel or a mail
+    /// folder), so the caller can defer to another compose path.
+    fn cursor_compose_target_ix(&self, targets: &[ComposeTarget]) -> Option<usize> {
+        let (sid, conv, folder): (i64, String, String) = match self.current_filtered_index() {
+            Some(idx) => {
+                let m = self.filtered_messages.get(idx)?;
+                (m.source_id,
+                 m.metadata.get("conversation_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                 m.folder.clone().unwrap_or_default())
+            }
+            None => {
+                // Header row: its section/folder name lives in thread_id.
+                let h = self.display_messages.get(self.index).filter(|m| m.is_header)?;
+                (h.source_id, String::new(), h.thread_id.clone().unwrap_or_default())
+            }
+        };
+        targets.iter().position(|t|
+            t.source_id == sid
+            && ((!conv.is_empty() && conv == t.conversation_id)
+                || (!folder.is_empty() && folder == t.folder)))
+    }
+
     /// Render the cross-source picker in the right pane and prompt for a choice.
     fn pick_compose_target(&mut self, targets: &[ComposeTarget], default_ix: usize) -> Option<usize> {
         let tc = self.config.theme_colors.clone();
@@ -7289,21 +7314,16 @@ impl App {
         let targets = self.collect_compose_targets();
         if targets.is_empty() { return false; }
 
-        // Default: the currently-selected message's channel if it's reachable,
-        // otherwise the first listed (most recent in the dominant source).
-        // current_filtered_index() handles threaded-view's display_messages
-        // mapping — using self.index directly into filtered_messages here
-        // landed the default on the wrong conversation in conversation view.
-        let default_ix = match self.current_filtered_index() {
-            Some(idx) => {
-                let selected = &self.filtered_messages[idx];
-                targets.iter().position(|t| {
-                    t.source_id == selected.source_id
-                        && selected.metadata.get("conversation_id").and_then(|v| v.as_str())
-                            .map_or(false, |c| c == t.conversation_id)
-                }).unwrap_or(0)
-            }
-            None => 0,
+        // Only handle `+` here when the cursor is actually on a conversation
+        // that is a reachable external-compose target (Workspace, gateway, …).
+        // The cursor may be on a selected message OR, in folders/threaded
+        // mode, the channel header it sits on. If it's on a weechat-relay
+        // channel (Slack, IRC) or a mail folder, none of these targets match,
+        // so defer to the weechat / email compose paths instead of defaulting
+        // to the first listed target — that default is what made `+` on a
+        // Slack channel header offer to compose to an unrelated Workspace DM.
+        let Some(default_ix) = self.cursor_compose_target_ix(&targets) else {
+            return false;
         };
 
         // Only the selected message's own source is reachable from this cursor?
@@ -8117,13 +8137,26 @@ impl App {
     /// (the value the relay's `input` command expects). Otherwise
     /// `None` so the caller falls through to the email compose path.
     fn compose_weechat_target_from_context(&self) -> Option<String> {
-        // Selected message wins — it's the most specific signal.
-        // Route through current_filtered_index() so threaded view
-        // resolves through display_messages.
-        let idx = self.current_filtered_index()?;
-        let msg = self.filtered_messages.get(idx)?;
-        if msg.source_type == "weechat-relay" {
-            if let Some(folder) = msg.folder.as_deref() {
+        // Selected message wins — it's the most specific signal. Route
+        // through current_filtered_index() so threaded view resolves through
+        // display_messages.
+        if let Some(idx) = self.current_filtered_index() {
+            let msg = self.filtered_messages.get(idx)?;
+            if msg.source_type == "weechat-relay" {
+                if let Some(folder) = msg.folder.as_deref() {
+                    if !folder.is_empty() { return Some(folder.to_string()); }
+                }
+            }
+            return None;
+        }
+        // No selected message — the cursor may be on a channel header
+        // (folders/threaded mode). Compose to that channel: a weechat-relay
+        // header carries its source_type and stashes the buffer full_name in
+        // thread_id. This is what lets `+` on a Slack channel header start a
+        // new message to the channel (not a reply to anyone).
+        let h = self.display_messages.get(self.index).filter(|m| m.is_header)?;
+        if h.source_type == "weechat-relay" {
+            if let Some(folder) = h.thread_id.as_deref() {
                 if !folder.is_empty() { return Some(folder.to_string()); }
             }
         }
