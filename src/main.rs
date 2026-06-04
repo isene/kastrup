@@ -331,6 +331,36 @@ fn folder_matches_filter(folder: &str, filters: &Filters) -> bool {
     true
 }
 
+/// Decide whether a subscribed weechat buffer (`buf`, a full_name like
+/// `irc.libera.#vim` or `python.slack.team.#chan`) should be merged into a
+/// folders-mode view as an empty section. Unlike `folder_matches_filter`
+/// this is SOURCE-aware: a branch admits a weechat buffer only when its
+/// source dimension permits weechat-relay (source_id maps to a
+/// weechat-relay source, source_type is "weechat-relay", or the branch
+/// carries no source constraint) AND its folder dimension (if any) matches.
+/// Without the source check, a branch like the Workspace `source_id=7` with
+/// no folder filter would admit every IRC/Slack buffer into the view.
+fn buffer_admitted_by_filter(
+    buf: &str,
+    f: &Filters,
+    source_type_map: &std::collections::HashMap<i64, String>,
+) -> bool {
+    if let Some(branches) = &f.branches {
+        return branches.iter().any(|b| buffer_admitted_by_filter(buf, b, source_type_map));
+    }
+    let source_ok = match (f.source_id, f.source_type.as_deref()) {
+        (Some(sid), _) => source_type_map.get(&sid).map(|t| t == "weechat-relay").unwrap_or(false),
+        (None, Some(st)) => st == "weechat-relay",
+        (None, None) => true,
+    };
+    if !source_ok { return false; }
+    if let Some(ref fold) = f.folder { return buf == fold; }
+    if let Some(ref pat) = f.folder_pattern {
+        return pat.split('|').map(|s| s.trim()).filter(|s| !s.is_empty()).any(|s| buf.contains(s));
+    }
+    true
+}
+
 /// Apply a JSON `rules` array onto a Filters. Each rule is
 /// `{field, op, value}`. Unknown fields are silently ignored.
 fn apply_view_rules(rules: &[serde_json::Value], filters: &mut Filters) {
@@ -3905,42 +3935,29 @@ impl App {
         // section alongside the mail folder.
         if self.group_by_folder && self.active_folder.is_none() {
             let view_filters = self.build_current_filters();
-            // Only merge empty weechat buffers into a view that actually
-            // admits weechat-relay messages. `folder_matches_filter`
-            // returns true for a source-scoped view that carries no
-            // folder filter (e.g. the phone gateway, source_id 11) — so
-            // without this gate every IRC/Slack/Discord channel gets
-            // dumped into such a view. A weechat buffer belongs only to
-            // a view whose source dimension is unset or points at the
-            // weechat-relay source.
-            let view_admits_weechat = {
-                let src_ok = match view_filters.source_id {
-                    Some(sid) => self.source_type_map.get(&sid)
-                        .map(|t| t == "weechat-relay").unwrap_or(false),
-                    None => true,
-                };
-                let stype_ok = match &view_filters.source_type {
-                    Some(st) => st == "weechat-relay",
-                    None => true,
-                };
-                src_ok && stype_ok
-            };
-            if view_admits_weechat {
-                let have_folder: std::collections::HashSet<String> = sections.iter()
-                    .map(|s| s.name.clone()).collect();
-                let bufs = self.subscribed_buffers.lock().unwrap().clone();
-                for buf in bufs {
-                    if have_folder.contains(&buf.full_name) { continue; }
-                    if !folder_matches_filter(&buf.full_name, &view_filters) { continue; }
-                    sections.push(organizer::Section {
-                        section_type: "channel".to_string(),
-                        display_name: organizer::pretty_folder_name_public(&buf.full_name),
-                        name: buf.full_name,
-                        source_type: "folder".to_string(),
-                        messages: Vec::new(),
-                        unread_count: 0,
-                    });
-                }
+            // Merge in every subscribed weechat buffer this view admits, so
+            // empty channels still render as sections (weechat-buflist
+            // parity). Admission is decided per buffer by
+            // `buffer_admitted_by_filter`, which (unlike the old
+            // `folder_matches_filter` gate) is source-aware: a branch that
+            // carries a non-weechat `source_id` (e.g. Workspace source_id=7)
+            // and no folder filter no longer matches every folder, so IRC /
+            // Slack buffers stop leaking into a view once it grows a
+            // non-weechat source branch.
+            let have_folder: std::collections::HashSet<String> = sections.iter()
+                .map(|s| s.name.clone()).collect();
+            let bufs = self.subscribed_buffers.lock().unwrap().clone();
+            for buf in bufs {
+                if have_folder.contains(&buf.full_name) { continue; }
+                if !buffer_admitted_by_filter(&buf.full_name, &view_filters, &self.source_type_map) { continue; }
+                sections.push(organizer::Section {
+                    section_type: "channel".to_string(),
+                    display_name: organizer::pretty_folder_name_public(&buf.full_name),
+                    name: buf.full_name,
+                    source_type: "folder".to_string(),
+                    messages: Vec::new(),
+                    unread_count: 0,
+                });
             }
             // Re-sort: pinned channels first (in section_order), then
             // the rest by latest message timestamp. Empty sections
