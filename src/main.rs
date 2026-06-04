@@ -986,6 +986,11 @@ struct App {
     /// loop). Throttles it to ~once every 2 min on the loop's existing
     /// wake — no new timer thread.
     last_reconcile: std::time::Instant,
+    /// Phone-gateway replies awaiting a delivery result from the relay:
+    /// (request id, "<platform>:<thread_key>" label, queued-at). The main
+    /// loop polls `outbox_status/` while this is non-empty and surfaces the
+    /// sent / couldn't-deliver outcome, then drops the entry.
+    pending_gateway_replies: Vec<(String, String, std::time::Instant)>,
 
     // State
     running: bool,
@@ -1479,6 +1484,7 @@ fn main() {
         stats_cache: None,
         last_db_refresh: std::time::Instant::now(),
         last_reconcile: std::time::Instant::now(),
+        pending_gateway_replies: Vec::new(),
         running: true,
         current_view: "A".to_string(),
         active_folder: None,
@@ -1705,6 +1711,12 @@ fn main() {
                     let db = app.db.clone();
                     let wtx = app.write_tx.clone();
                     std::thread::spawn(move || reconcile_stuck_maildir(&db, &wtx));
+                }
+                // Surface phone delivery results for queued gateway replies.
+                // Only touches the filesystem while a reply is outstanding, so
+                // it's cold once the phone has reported (or timed out).
+                if !app.pending_gateway_replies.is_empty() {
+                    app.poll_gateway_reply_status();
                 }
             }
         }
@@ -8728,13 +8740,13 @@ impl App {
     /// is the message text. The relay fires it against a live
     /// notification (chat apps) or via SmsManager (SMS). Returns the
     /// `<platform>:<thread_key>` target on success.
-    fn send_gateway_draft(&self, data: &str) -> Result<String, String> {
+    fn send_gateway_draft(&mut self, data: &str) -> Result<String, String> {
         let channel = parse_chat_channel(data)
             .ok_or_else(|| "missing Channel: header".to_string())?;
         let (platform, thread_key) = channel.split_once(':')
             .ok_or_else(|| "Channel must be <platform>:<thread_key>".to_string())?;
-        let platform = platform.trim();
-        let thread_key = thread_key.trim();
+        let platform = platform.trim().to_string();
+        let thread_key = thread_key.trim().to_string();
         if platform.is_empty() || thread_key.is_empty() {
             return Err("empty platform or thread_key".to_string());
         }
@@ -8743,23 +8755,57 @@ impl App {
             return Err("body is empty".to_string());
         }
         // If a native delivery route is configured for this gateway target,
-        // send it through the real chat API instead of the phone-drained
-        // outbox (the phone relay can't post to e.g. Discord). The route
-        // value is a chat_send target, so reuse the native discord send path
-        // (which also handles /me, webhooks and attachments).
+        // send it through the real chat API instead of the phone outbox. The
+        // route value is a chat_send target, so reuse the native discord send
+        // path (also handles /me, webhooks, attachments). This posts as the
+        // bot/app, not the user — opt-in only.
         let route_key = format!("{}:{}", platform, thread_key);
         if platform == "discord" {
-            if let Some(target) = self.config.gateway_routes.get(&route_key) {
+            if let Some(target) = self.config.gateway_routes.get(&route_key).cloned() {
                 let native = format!("Channel: {}\n\n{}", target, body);
                 return self.send_discord_draft(&native)
                     .map(|label| format!("Sent to discord {}", label));
             }
         }
 
-        // No native route → queue to the gateway outbox for the phone to send.
+        // Default: hand the reply to the phone. The relay fires the thread's
+        // cached notification reply action so it posts as the user, then
+        // reports the outcome back via outbox_status/. Track the request so
+        // the main loop can surface "delivered" / "couldn't deliver" rather
+        // than leaving a silent "queued".
         let cfg = self.gateway_source_config();
-        sources::gateway::queue_reply(&cfg, platform, thread_key, &body)?;
-        Ok(format!("Reply queued for {}:{}", platform, thread_key))
+        let id = sources::gateway::queue_reply(&cfg, &platform, &thread_key, &body)?;
+        let target = format!("{}:{}", platform, thread_key);
+        self.pending_gateway_replies.push((id, target.clone(), std::time::Instant::now()));
+        Ok(format!("Queued to phone: {}", target))
+    }
+
+    /// Drain delivery-status markers the relay wrote for our queued gateway
+    /// replies and surface the outcome. Called from the idle loop only while
+    /// `pending_gateway_replies` is non-empty (piggybacks the existing wake,
+    /// no new timer). Entries the phone never reports on are dropped after a
+    /// generous window so the poll goes cold again.
+    fn poll_gateway_reply_status(&mut self) {
+        let cfg = self.gateway_source_config();
+        for (id, status, reason) in sources::gateway::poll_reply_status(&cfg) {
+            let Some(pos) = self.pending_gateway_replies.iter().position(|(pid, _, _)| *pid == id)
+            else { continue };
+            let (_, target, _) = self.pending_gateway_replies.remove(pos);
+            if status == "sent" {
+                self.set_feedback(&format!("Phone delivered to {}", target),
+                    self.config.theme_colors.feedback_ok);
+            } else {
+                let why = if reason.is_empty() { "no live notification".to_string() }
+                          else { reason.replace('_', " ") };
+                self.set_feedback(
+                    &format!("Phone couldn't deliver to {} ({})", target, why),
+                    self.config.theme_colors.feedback_warn);
+            }
+        }
+        // Stop tracking replies the phone hasn't reported within 10 min so the
+        // status poll stops running. The relay may still send later via retry.
+        let now = std::time::Instant::now();
+        self.pending_gateway_replies.retain(|(_, _, queued)| now.duration_since(*queued).as_secs() < 600);
     }
 
     /// Recall-path entry: open a previously-saved draft. Forces the

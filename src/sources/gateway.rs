@@ -151,30 +151,63 @@ pub fn sync_gateway(config: &serde_json::Value, known_ids: &HashSet<String>) -> 
     messages
 }
 
+fn gateway_base(config: &serde_json::Value) -> std::path::PathBuf {
+    config
+        .get("gateway_dir")
+        .and_then(|v| v.as_str())
+        .map(expand_tilde)
+        .unwrap_or_else(default_dir)
+}
+
 /// Queue an outbound reply for the phone to fire. Writes a request file to
-/// `<gateway_dir>/outbox/`; the relay app matches it to a live notification's
-/// RemoteInput and sends. Works only for a thread with an active notification.
+/// `<gateway_dir>/outbox/<id>.json`; the relay app matches it to the thread's
+/// cached notification RemoteInput and sends (so it posts as the user). The
+/// relay reports the outcome back in `<gateway_dir>/outbox_status/<id>.json`.
+/// Returns the request `id` so the caller can correlate that status.
 pub fn queue_reply(
     config: &serde_json::Value,
     platform: &str,
     thread_key: &str,
     text: &str,
-) -> Result<(), String> {
-    let base = config
-        .get("gateway_dir")
-        .and_then(|v| v.as_str())
-        .map(expand_tilde)
-        .unwrap_or_else(default_dir);
-    let outbox = base.join("outbox");
+) -> Result<String, String> {
+    let outbox = gateway_base(config).join("outbox");
     std::fs::create_dir_all(&outbox).map_err(|e| format!("create outbox: {e}"))?;
+    let id = format!("{}-{}", now_secs(), rand_suffix());
     let req = serde_json::json!({
+        "id": id,
         "platform": platform,
         "thread_key": thread_key,
         "text": text,
+        "ts": now_secs(),
     });
-    let name = format!("{}-{}.json", now_secs(), rand_suffix());
-    std::fs::write(outbox.join(name), req.to_string())
-        .map_err(|e| format!("write reply request: {e}"))
+    std::fs::write(outbox.join(format!("{id}.json")), req.to_string())
+        .map_err(|e| format!("write reply request: {e}"))?;
+    Ok(id)
+}
+
+/// Drain delivery-status markers the relay wrote to
+/// `<gateway_dir>/outbox_status/`. Returns `(id, status, reason)` for every
+/// marker (status is `"sent"` or `"failed"`; reason is e.g.
+/// `"no_live_notification"`). Consumes (deletes) every marker file it reads,
+/// so the directory stays clean and a result is reported at most once.
+pub fn poll_reply_status(config: &serde_json::Value) -> Vec<(String, String, String)> {
+    let dir = gateway_base(config).join("outbox_status");
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(&dir) else { return out; };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                let id = v.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                let status = v.get("status").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                let reason = v.get("reason").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                if !id.is_empty() { out.push((id, status, reason)); }
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    out
 }
 
 fn rand_suffix() -> String {
