@@ -8742,9 +8742,24 @@ impl App {
         if body.is_empty() {
             return Err("body is empty".to_string());
         }
+        // If a native delivery route is configured for this gateway target,
+        // send it through the real chat API instead of the phone-drained
+        // outbox (the phone relay can't post to e.g. Discord). The route
+        // value is a chat_send target, so reuse the native discord send path
+        // (which also handles /me, webhooks and attachments).
+        let route_key = format!("{}:{}", platform, thread_key);
+        if platform == "discord" {
+            if let Some(target) = self.config.gateway_routes.get(&route_key) {
+                let native = format!("Channel: {}\n\n{}", target, body);
+                return self.send_discord_draft(&native)
+                    .map(|label| format!("Sent to discord {}", label));
+            }
+        }
+
+        // No native route → queue to the gateway outbox for the phone to send.
         let cfg = self.gateway_source_config();
         sources::gateway::queue_reply(&cfg, platform, thread_key, &body)?;
-        Ok(format!("{}:{}", platform, thread_key))
+        Ok(format!("Reply queued for {}:{}", platform, thread_key))
     }
 
     /// Recall-path entry: open a previously-saved draft. Forces the
@@ -8976,11 +8991,8 @@ impl App {
                                         }
                                         DraftKind::Gateway => {
                                             match self.send_gateway_draft(&final_content) {
-                                                Ok(target) => {
-                                                    self.set_feedback(
-                                                        &format!("Reply queued for {}", target),
-                                                        tc.feedback_ok,
-                                                    );
+                                                Ok(msg) => {
+                                                    self.set_feedback(&msg, tc.feedback_ok);
                                                     break;
                                                 }
                                                 Err(msg) => {

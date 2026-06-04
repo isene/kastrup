@@ -226,6 +226,12 @@ pub struct Config {
     ///       unreact: "ws-bridge unreact --conv @conv --msg @msg --emoji @emoji"
     ///       sync:    "ws-bridge sync"
     pub senders: HashMap<String, HashMap<String, String>>,
+    /// Deliver a phone-gateway reply for `<platform>:<thread_key>` through a
+    /// native chat target instead of the (phone-drained) gateway outbox.
+    /// Key = `<platform>:<thread_key>`, value = a chat_send target:
+    /// `channel:<id>` / `webhook:<name>` / `dm:<userId>` for discord, or a
+    /// Slack channel for slack. The IDs live only in the local config.yml.
+    pub gateway_routes: HashMap<String, String>,
     pub theme_colors: ThemeColors,
 }
 
@@ -252,6 +258,7 @@ impl Default for Config {
             channel_names: HashMap::new(),
             save_folders: HashMap::new(),
             senders: HashMap::new(),
+            gateway_routes: HashMap::new(),
             theme_colors: ThemeColors::default(),
         }
     }
@@ -510,6 +517,18 @@ impl Config {
                 let color = v.get("color").and_then(|c| c.as_u64()).unwrap_or(0) as u8;
                 let glyph = v.get("glyph").and_then(|g| g.as_str()).unwrap_or("").to_string();
                 self.theme_colors.source_styles.insert(name.to_string(), (color, glyph));
+            }
+        }
+
+        // Native delivery routes for phone-gateway replies. Shape:
+        //   gateway_routes:
+        //     "discord:Some Server #channel": "channel:123456789012345678"
+        //     "discord:Other #room":          "webhook:myhook"
+        if let Some(routes) = yaml.get("gateway_routes").and_then(|v| v.as_mapping()) {
+            for (k, v) in routes {
+                if let (Some(key), Some(val)) = (k.as_str(), v.as_str()) {
+                    self.gateway_routes.insert(key.to_string(), val.to_string());
+                }
             }
         }
     }
