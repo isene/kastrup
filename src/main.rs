@@ -1143,6 +1143,16 @@ fn main() {
             }
         }
     }
+    // An interactive TUI needs a real terminal on stdin to read keys.
+    // Without one (a pipe, /dev/null, or a stray `kastrup --help` from a
+    // diagnostic shell) Input::getchr returns None instantly on EOF and
+    // the main loop busy-spins at ~12% CPU forever, holding a core out of
+    // deep C-states. Bail out cheap — nothing useful runs headless past
+    // here. Costs one isatty() on the cold startup path, zero when idle.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        eprintln!("kastrup: no terminal on stdin — this is an interactive TUI, nothing to do.");
+        std::process::exit(0);
+    }
     log::info(&format!("Kastrup v{} starting", env!("CARGO_PKG_VERSION")));
     // Parse CLI args: --compose-to EMAIL --subject SUBJECT, or mailto:URL
     let args: Vec<String> = std::env::args().collect();
