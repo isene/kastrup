@@ -491,6 +491,33 @@ fn parse_slack_file_url(url: &str) -> Option<(String, String)> {
     Some((file_id, filename))
 }
 
+/// Pull every http(s) URL out of a message body for the "open in browser"
+/// fallback (chat / plain-text messages that carry no HTML or link
+/// metadata). Handles bare URLs and Slack/weechat mrkdwn `<url|label>`
+/// wraps, strips surrounding brackets and trailing punctuation, and dedups
+/// preserving first-seen order. Reads the FULL url, not the shortened
+/// display label, so the opened link is the real target.
+fn extract_message_urls(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for cap in body.split_whitespace() {
+        let t = cap.trim_matches(|c: char| !c.is_ascii_graphic());
+        // Unwrap mrkdwn `<url|name>` / `<url>` to the bare url.
+        let t = if let Some(rest) = t.strip_prefix('<') {
+            let rest = rest.trim_end_matches('>');
+            rest.split_once('|').map(|(u, _)| u).unwrap_or(rest)
+        } else { t };
+        let url = t.trim_start_matches(['(', '[', '{', '"', '\'', '<'])
+            .trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\'', '>']);
+        if (url.starts_with("https://") || url.starts_with("http://")) && url.len() > 9
+            && seen.insert(url.to_string())
+        {
+            out.push(url.to_string());
+        }
+    }
+    out
+}
+
 /// Extract `Attach:` headers (one per line, before the blank-line
 /// separator) from a chat draft. Values are file paths with `~/`
 /// and `$HOME/` expansion. Used by `.slack` and `.weechat` drafts
@@ -5786,29 +5813,93 @@ impl App {
     }
 
     fn open_html_in_external_browser(&mut self) {
-        // X key: open the message's HTML in the system default browser
-        // (xdg-open → typically Firefox). For messages with a "link"
-        // metadata field (RSS, web sources), opens that URL directly.
+        // X key: open the message in the system default browser (xdg-open →
+        // typically Firefox). In priority order: a "link" metadata field
+        // (RSS / web sources), then the message's HTML rendered to a temp
+        // file, then — for chat / plain-text messages with neither — the
+        // URL(s) found in the body. The last case is what lets you reach a
+        // Slack link whose on-screen label is truncated to `host.com/…`.
         self.ensure_full_loaded();
-        if let Some(msg) = self.filtered_messages.get(self.index) {
-            if let Some(link) = msg.metadata.get("link").and_then(|v| v.as_str()) {
-                let _ = std::process::Command::new("xdg-open").arg(link)
-                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
-                self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
-                return;
-            }
-            let html = match best_html_for_message(msg) {
-                Some(h) => h,
-                None => {
-                    self.set_feedback("No HTML content to open", self.config.theme_colors.feedback_warn);
-                    return;
-                }
-            };
-            let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
+        let Some(idx) = self.current_filtered_index() else {
+            self.set_feedback("No message selected", self.config.theme_colors.feedback_warn);
+            return;
+        };
+        // Pull everything out while the immutable borrow is alive.
+        let (link, html, mid, urls) = match self.filtered_messages.get(idx) {
+            Some(msg) => (
+                msg.metadata.get("link").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                best_html_for_message(msg),
+                msg.id,
+                extract_message_urls(&self.get_display_content(msg)),
+            ),
+            None => return,
+        };
+        let spawn = |target: &str| {
+            let _ = std::process::Command::new("xdg-open").arg(target)
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+        };
+        if let Some(link) = link {
+            spawn(&link);
+            self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
+            return;
+        }
+        if let Some(html) = html {
+            let path = format!("/tmp/kastrup_msg_{}.html", mid);
             if std::fs::write(&path, &html).is_ok() {
-                let _ = std::process::Command::new("xdg-open").arg(&path)
-                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+                spawn(&path);
                 self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
+            }
+            return;
+        }
+        match urls.len() {
+            0 => self.set_feedback("No HTML or link in this message", self.config.theme_colors.feedback_warn),
+            1 => {
+                spawn(&urls[0]);
+                self.set_feedback(&format!("Opened {}", shorten_url_label(&urls[0])),
+                    self.config.theme_colors.feedback_ok);
+            }
+            _ => {
+                if let Some(i) = self.pick_url(&urls) {
+                    spawn(&urls[i]);
+                    self.set_feedback(&format!("Opened {}", shorten_url_label(&urls[i])),
+                        self.config.theme_colors.feedback_ok);
+                }
+                // Restore the message view after the picker overlay.
+                self.render_message_content();
+            }
+        }
+    }
+
+    /// Numbered picker for the URLs in a message body. Renders the list in
+    /// the right pane and reads a digit (1-9, 0 = 10th). Returns the chosen
+    /// index, or None on ESC. The caller restores the message view.
+    fn pick_url(&mut self, urls: &[String]) -> Option<usize> {
+        let tc = self.config.theme_colors.clone();
+        let mut lines: Vec<String> = Vec::with_capacity(urls.len() + 3);
+        lines.push(style::bold(&style::fg(
+            &format!("{} links in this message", urls.len()), tc.view_custom)));
+        lines.push(String::new());
+        for (i, u) in urls.iter().enumerate().take(10) {
+            let label = if i == 9 { "0".to_string() } else { (i + 1).to_string() };
+            lines.push(format!("  {}  {}",
+                style::bold(&style::fg(&format!("[{}]", label), tc.unread)), u));
+        }
+        lines.push(String::new());
+        lines.push(style::fg("Press a digit to open in browser, ESC = cancel", tc.hint_fg));
+        self.right.set_text(&lines.join("\n"));
+        self.right.ix = 0;
+        self.right.full_refresh();
+        if self.right.border { self.right.border_refresh(); }
+        loop {
+            let Some(chr) = Input::getchr(None) else { continue };
+            match chr.as_str() {
+                "ESC" | "q" => return None,
+                d if d.len() == 1 && d.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) => {
+                    let n: usize = d.parse().unwrap_or(0);
+                    let i = if n == 0 { 9 } else { n - 1 };
+                    if i < urls.len() { return Some(i); }
+                }
+                _ => {}
             }
         }
     }
