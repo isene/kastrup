@@ -361,6 +361,35 @@ fn buffer_admitted_by_filter(
     true
 }
 
+/// True when a folders-mode section belongs to branch `f`. The section is
+/// identified by its folder `name` and the `source_id` of its newest message
+/// (`None` for an empty subscribed buffer). A branch admits the section when
+/// its source dimension matches (source_id equal, source_type matching via
+/// the source map, or no source constraint) AND its folder dimension (if any)
+/// matches the name. Used to group sections by branch order so a multi-source
+/// view stays grouped instead of interleaving by recency.
+fn section_in_branch(
+    name: &str,
+    source_id: Option<i64>,
+    f: &Filters,
+    source_type_map: &std::collections::HashMap<i64, String>,
+) -> bool {
+    if let Some(branches) = &f.branches {
+        return branches.iter().any(|b| section_in_branch(name, source_id, b, source_type_map));
+    }
+    let sid_ok = match f.source_id { Some(sid) => source_id == Some(sid), None => true };
+    let stype_ok = match &f.source_type {
+        Some(st) => source_id.and_then(|i| source_type_map.get(&i)).map(|t| t == st).unwrap_or(false),
+        None => true,
+    };
+    if !(sid_ok && stype_ok) { return false; }
+    if let Some(ref fold) = f.folder { return name == fold; }
+    if let Some(ref pat) = f.folder_pattern {
+        return pat.split('|').map(|s| s.trim()).filter(|s| !s.is_empty()).any(|s| name.contains(s));
+    }
+    true
+}
+
 /// Apply a JSON `rules` array onto a Filters. Each rule is
 /// `{field, op, value}`. Unknown fields are silently ignored.
 fn apply_view_rules(rules: &[serde_json::Value], filters: &mut Filters) {
@@ -3970,7 +3999,27 @@ impl App {
             // view), group the unpinned tier by platform first, then by
             // latest activity within each platform.
             let by_source = self.sort_order == "source";
+            // For a branches view, group sections by which branch they belong
+            // to, in branch order, so a multi-source view (e.g. Dualog: mail,
+            // then Workspace, then Slack) stays cleanly grouped instead of
+            // interleaving channels by recency. A section's branch is the
+            // first one whose source + folder dimensions admit it (matched on
+            // the source_id of its newest message); pins and recency then
+            // order within each group, and new channels land in their own
+            // branch's group automatically.
+            let view_branches = view_filters.branches.clone();
+            let stmap = &self.source_type_map;
+            let branch_idx = |s: &organizer::Section| -> usize {
+                let Some(bs) = view_branches.as_ref() else { return 0 };
+                let sid = s.messages.iter()
+                    .max_by_key(|&&i| filtered[i].timestamp)
+                    .map(|&i| filtered[i].source_id);
+                bs.iter().position(|b| section_in_branch(&s.name, sid, b, stmap)).unwrap_or(bs.len())
+            };
             sections.sort_by(|a, b| {
+                let gia = branch_idx(a);
+                let gib = branch_idx(b);
+                if gia != gib { return gia.cmp(&gib); }
                 let ra = pin_rank.get(a.name.as_str()).copied();
                 let rb = pin_rank.get(b.name.as_str()).copied();
                 match (ra, rb) {
