@@ -5885,7 +5885,7 @@ impl App {
                 style::bold(&style::fg(&format!("[{}]", label), tc.unread)), u));
         }
         lines.push(String::new());
-        lines.push(style::fg("Press a digit to open in browser, ESC = cancel", tc.hint_fg));
+        lines.push(style::fg("Press a digit to open the link, ESC = cancel", tc.hint_fg));
         self.right.set_text(&lines.join("\n"));
         self.right.ix = 0;
         self.right.full_refresh();
@@ -5905,29 +5905,49 @@ impl App {
     }
 
     fn open_html_in_scroll(&mut self) {
-        // x key: open the message's HTML in scroll (tier 1, no JS).
-        // Stays in the terminal — fast path through the renderer
-        // without any boa/Servo overhead.
+        // x key: open the message in scroll (tier 1, no JS) — stays in the
+        // terminal. Same source priority as X: link metadata, then HTML
+        // rendered to a temp file, then the URL(s) found in a chat / plain
+        // body (so a truncated Slack link is reachable here too).
         self.ensure_full_loaded();
-        if let Some(msg) = self.filtered_messages.get(self.index) {
-            let url = if let Some(link) = msg.metadata.get("link").and_then(|v| v.as_str()) {
-                Some(link.to_string())
-            } else {
-                best_html_for_message(msg).map(|h| {
-                    let path = format!("/tmp/kastrup_msg_{}.html", msg.id);
-                    let _ = std::fs::write(&path, &h);
-                    format!("file://{}", path)
-                })
-            };
-            if let Some(url) = url {
-                Crust::cleanup();
-                let _ = std::process::Command::new("scroll").arg(&url).status();
-                Crust::init();
-                Crust::clear_screen();
-                self.handle_resize();
-            } else {
-                self.set_feedback("No content to open", self.config.theme_colors.feedback_warn);
+        let Some(idx) = self.current_filtered_index() else {
+            self.set_feedback("No message selected", self.config.theme_colors.feedback_warn);
+            return;
+        };
+        let (link, html, mid, urls) = match self.filtered_messages.get(idx) {
+            Some(msg) => (
+                msg.metadata.get("link").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                best_html_for_message(msg),
+                msg.id,
+                extract_message_urls(&self.get_display_content(msg)),
+            ),
+            None => return,
+        };
+        let target = if let Some(link) = link {
+            Some(link)
+        } else if let Some(h) = html {
+            let path = format!("/tmp/kastrup_msg_{}.html", mid);
+            let _ = std::fs::write(&path, &h);
+            Some(format!("file://{}", path))
+        } else {
+            match urls.len() {
+                0 => None,
+                1 => Some(urls[0].clone()),
+                _ => {
+                    let chosen = self.pick_url(&urls).map(|i| urls[i].clone());
+                    self.render_message_content();
+                    chosen
+                }
             }
+        };
+        if let Some(target) = target {
+            Crust::cleanup();
+            let _ = std::process::Command::new("scroll").arg(&target).status();
+            Crust::init();
+            Crust::clear_screen();
+            self.handle_resize();
+        } else {
+            self.set_feedback("No content to open", self.config.theme_colors.feedback_warn);
         }
     }
 
