@@ -987,10 +987,12 @@ struct App {
     /// wake — no new timer thread.
     last_reconcile: std::time::Instant,
     /// Phone-gateway replies awaiting a delivery result from the relay:
-    /// (request id, "<platform>:<thread_key>" label, queued-at). The main
-    /// loop polls `outbox_status/` while this is non-empty and surfaces the
-    /// sent / couldn't-deliver outcome, then drops the entry.
-    pending_gateway_replies: Vec<(String, String, std::time::Instant)>,
+    /// (request id, "<platform>:<thread_key>" label, queued-at, warned). The
+    /// main loop polls the relay's status markers while this is non-empty and
+    /// surfaces sent / couldn't-deliver; if nothing comes back in time it
+    /// warns once that the reply is held (no live notification), then drops
+    /// the entry after a longer timeout.
+    pending_gateway_replies: Vec<(String, String, std::time::Instant, bool)>,
 
     // State
     running: bool,
@@ -8776,7 +8778,7 @@ impl App {
         let cfg = self.gateway_source_config();
         let id = sources::gateway::queue_reply(&cfg, &platform, &thread_key, &body)?;
         let target = format!("{}:{}", platform, thread_key);
-        self.pending_gateway_replies.push((id, target.clone(), std::time::Instant::now()));
+        self.pending_gateway_replies.push((id, target.clone(), std::time::Instant::now(), false));
         Ok(format!("Queued to phone: {}", target))
     }
 
@@ -8788,9 +8790,9 @@ impl App {
     fn poll_gateway_reply_status(&mut self) {
         let cfg = self.gateway_source_config();
         for (id, status, reason) in sources::gateway::poll_reply_status(&cfg) {
-            let Some(pos) = self.pending_gateway_replies.iter().position(|(pid, _, _)| *pid == id)
+            let Some(pos) = self.pending_gateway_replies.iter().position(|(pid, _, _, _)| *pid == id)
             else { continue };
-            let (_, target, _) = self.pending_gateway_replies.remove(pos);
+            let (_, target, _, _) = self.pending_gateway_replies.remove(pos);
             if status == "sent" {
                 self.set_feedback(&format!("Phone delivered to {}", target),
                     self.config.theme_colors.feedback_ok);
@@ -8802,10 +8804,25 @@ impl App {
                     self.config.theme_colors.feedback_warn);
             }
         }
-        // Stop tracking replies the phone hasn't reported within 10 min so the
-        // status poll stops running. The relay may still send later via retry.
+        // No result yet after ~2 min → the relay is holding the reply (no live
+        // notification for the thread; it retries when the thread next pings).
+        // Warn once so it isn't silent, but keep tracking in case it lands.
         let now = std::time::Instant::now();
-        self.pending_gateway_replies.retain(|(_, _, queued)| now.duration_since(*queued).as_secs() < 600);
+        let mut held: Vec<String> = Vec::new();
+        for p in self.pending_gateway_replies.iter_mut() {
+            if !p.3 && now.duration_since(p.2).as_secs() >= 120 {
+                p.3 = true;
+                held.push(p.1.clone());
+            }
+        }
+        for target in held {
+            self.set_feedback(
+                &format!("Held on phone for {} — no live notification yet; sends when the thread next pings", target),
+                self.config.theme_colors.feedback_warn);
+        }
+        // Stop tracking replies the phone hasn't resolved within 10 min so the
+        // status poll goes cold. The relay may still deliver later via retry.
+        self.pending_gateway_replies.retain(|(_, _, queued, _)| now.duration_since(*queued).as_secs() < 600);
     }
 
     /// Recall-path entry: open a previously-saved draft. Forces the
