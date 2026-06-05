@@ -941,7 +941,9 @@ fn pad_visible(s: &str, target: usize) -> String {
 /// How a muted (hidden) channel resurfaces. `m` mutes until any new
 /// message; `M` mutes until a mention/highlight. Stored per hidden
 /// channel alongside the mute timestamp so resurfacing is based on
-/// activity *newer* than the mute (re-pressing re-stamps it).
+/// activity *newer* than the mute (re-pressing re-stamps it). A
+/// resurfaced channel re-hides on its own once its new messages are
+/// read — the mute stays in force, the unread just stops surfacing it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HideMode {
     UntilNew,
@@ -1025,6 +1027,11 @@ struct App {
     delete_marked: HashSet<i64>,
     browsed_ids: HashSet<i64>,
     unseen_ids: HashSet<i64>,
+    /// A muted channel that resurfaced and whose last unread the user just
+    /// read. Holds the channel (folder) name. The view re-hides it once the
+    /// cursor leaves the channel (deferred so the message being read doesn't
+    /// vanish under the cursor). Cleared when honoured or invalidated.
+    mute_recheck_pending: Option<String>,
 
     /// Optional asmite count-file writer, mirrored from
     /// `~/.gmail.conf`. When present, every read-state mutation
@@ -1507,6 +1514,7 @@ fn main() {
         delete_marked: HashSet::new(),
         browsed_ids: HashSet::new(),
         unseen_ids: HashSet::new(),
+        mute_recheck_pending: None,
         mailfile_cfg: mailfile_cfg_main,
         folder_collapsed: HashMap::new(),
         folder_count_cache: HashMap::new(),
@@ -1663,6 +1671,9 @@ fn main() {
                     app.render_bottom_bar();
                 }
                 app.handle_key(&k);
+                // A muted channel the user just caught up on re-hides once
+                // they navigate off it (cheap no-op unless a recheck is armed).
+                app.honor_pending_mute_rehide();
             }
             None => {
                 // Check for new messages from poller
@@ -2546,6 +2557,7 @@ impl App {
             if !msg.read && !msg.is_header && msg.id > 0 && !self.unseen_ids.contains(&msg.id) {
                 let id = msg.id;
                 let metadata = msg.metadata.clone();
+                let folder = msg.folder.clone();
                 // Fire-and-forget: DB write + maildir flag sync on background thread
                 let _ = self.write_tx.send(DbWriteOp::MarkRead(id));
                 let _ = self.write_tx.send(DbWriteOp::SyncMaildirFlag(metadata, id));
@@ -2560,6 +2572,19 @@ impl App {
                     }
                 }
                 self.stats_cache = None; // Invalidate stats
+                // If this read happened inside a muted channel that had
+                // resurfaced, arm a deferred re-hide. We don't rebuild here:
+                // the rest of this function still draws the right pane from
+                // self.index, and hiding the channel now would yank the row
+                // out from under the message being read. The main loop honours
+                // the flag once the cursor leaves the channel.
+                if self.group_by_folder {
+                    if let Some(f) = folder.as_deref() {
+                        if self.current_hidden_channels.iter().any(|h| h.name == f) {
+                            self.mute_recheck_pending = Some(f.to_string());
+                        }
+                    }
+                }
                 // Update left pane and top bar to reflect read status
                 self.render_message_list();
                 self.render_top_bar();
@@ -4078,11 +4103,13 @@ impl App {
                     }
                 }
             });
-            // Apply the mute list. A muted channel stays hidden unless
-            // it has a message *newer* than its mute timestamp matching
-            // its mode (any message for UntilNew, a highlight/mention
-            // for UntilHighlight). So a muted channel resurfaces on the
-            // right activity, then stays until re-muted.
+            // Apply the mute list. A muted channel stays hidden unless it has
+            // an UNREAD message *newer* than its mute timestamp matching its
+            // mode (any message for UntilNew, a highlight/mention for
+            // UntilHighlight). So it resurfaces on the right new activity and
+            // re-hides on its own once the user has read it — no manual
+            // unmute+remute. (`mute_recheck_pending` triggers the rebuild that
+            // applies this once the cursor leaves the channel.)
             if !self.current_hidden_channels.is_empty() {
                 let muted = &self.current_hidden_channels;
                 sections.retain(|s| {
@@ -4090,7 +4117,7 @@ impl App {
                         None => true,
                         Some(h) => s.messages.iter()
                             .filter_map(|&i| filtered.get(i))
-                            .any(|m| m.timestamp > h.hidden_at && match h.mode {
+                            .any(|m| !m.read && m.timestamp > h.hidden_at && match h.mode {
                                 HideMode::UntilNew => true,
                                 HideMode::UntilHighlight => m.metadata
                                     .get("highlight").and_then(|v| v.as_bool()) == Some(true),
@@ -4415,6 +4442,51 @@ impl App {
             self.config.theme_colors.feedback_ok);
         self.rebuild_display();
         self.render_all();
+    }
+
+    /// Folder (section) name the cursor currently sits in, or None.
+    /// Folders view is always threaded, so the cursor indexes
+    /// `display_messages`; a header carries its section name in `thread_id`,
+    /// a message carries it in `folder`.
+    fn cursor_section_name(&self) -> Option<String> {
+        let m = self.display_messages.get(self.index)?;
+        if m.is_header { m.thread_id.clone() } else { m.folder.clone() }
+    }
+
+    /// Re-hide a muted channel that the user just caught up on, once the
+    /// cursor has left it. Armed by the auto-mark-read path; called by the
+    /// main loop after each key. Deferring until the cursor leaves keeps the
+    /// message being read from vanishing under the cursor. Self-corrects if
+    /// the channel was unmuted or the view changed in the meantime.
+    fn honor_pending_mute_rehide(&mut self) {
+        let Some(ch) = self.mute_recheck_pending.clone() else { return };
+        if !self.group_by_folder
+            || !self.current_hidden_channels.iter().any(|h| h.name == ch) {
+            self.mute_recheck_pending = None;
+            return;
+        }
+        // Still inside the channel — wait until the user moves off it.
+        if self.cursor_section_name().as_deref() == Some(ch.as_str()) {
+            return;
+        }
+        self.mute_recheck_pending = None;
+        // Preserve the cursor on the same row by id: hiding the channel
+        // removes rows, so the bare index would point at a different message.
+        // Headers carry id 0, so only restore real messages by id; otherwise
+        // fall back to the clamped index below.
+        let saved_id = self.display_messages.get(self.index)
+            .filter(|m| !m.is_header && m.id > 0).map(|m| m.id);
+        self.rebuild_display();
+        if let Some(id) = saved_id {
+            if let Some(pos) = self.display_messages.iter().position(|m| m.id == id) {
+                self.index = pos;
+            }
+        }
+        if self.index >= self.display_messages.len() {
+            self.index = self.display_messages.len().saturating_sub(1);
+        }
+        self.render_message_list();
+        self.render_top_bar();
     }
 
     /// Load the user's hand-pinned section order for `view_key`. Stored
