@@ -1124,6 +1124,12 @@ struct App {
     poller: Option<poller::Poller>,
     poller_rx: Option<std::sync::mpsc::Receiver<poller::PollerEvent>>,
     write_tx: std_mpsc::Sender<DbWriteOp>,
+    /// Request a message body from the DB read worker (by id); the body
+    /// returns on read_res_rx. Never read bodies on the render thread.
+    read_req_tx: std_mpsc::Sender<i64>,
+    read_res_rx: std_mpsc::Receiver<(i64, String, Option<String>)>,
+    /// Ids with a body load in flight, so render doesn't re-request each frame.
+    content_loading: HashSet<i64>,
     // Flipped to true whenever the DB writer thread mutates a message row.
     // The 5s periodic refresh skips its get_messages() query when this is false.
     messages_dirty: Arc<AtomicBool>,
@@ -1484,6 +1490,25 @@ fn main() {
             t.elapsed().as_millis()));
     });
 
+    // ── DB read worker ──────────────────────────────────────────────
+    // Message bodies are lazy-loaded on selection. Reading them on the
+    // render thread parks it in D-state for seconds when kastrup.db has a
+    // cold page under disk contention (kfreeze 2025-12-08). Serve those
+    // reads here: the render thread requests by id and never blocks; the
+    // body returns on read_res_rx, drained in the main loop. Cold when
+    // idle — the thread blocks on recv(), same shape as the writer.
+    let (read_req_tx, read_req_rx) = std_mpsc::channel::<i64>();
+    let (read_res_tx, read_res_rx) =
+        std_mpsc::channel::<(i64, String, Option<String>)>();
+    let reader_db = db.clone();
+    std::thread::spawn(move || {
+        while let Ok(id) = read_req_rx.recv() {
+            if let Some((content, html)) = reader_db.get_message_content(id) {
+                let _ = read_res_tx.send((id, content, html));
+            }
+        }
+    });
+
     let mut app = App {
         top, left, right, bottom,
         cols, rows,
@@ -1546,6 +1571,9 @@ fn main() {
         poller: None,
         poller_rx: None,
         write_tx,
+        read_req_tx,
+        read_res_rx,
+        content_loading: HashSet::new(),
         messages_dirty,
         showing_help: false,
         help_extended: false,
@@ -1642,6 +1670,13 @@ fn main() {
         // when nothing's queued.
         app.pump_pending_send();
 
+        // Apply any message bodies the DB read worker finished off-thread,
+        // and re-render the right pane if the open message just got its body.
+        // Cheap try_recv (no-op when nothing's loading).
+        if app.drain_loaded_bodies() {
+            app.render_message_content();
+        }
+
         // Check feedback expiry
         if let Some(expires) = app.feedback_expires {
             if std::time::Instant::now() >= expires {
@@ -1657,7 +1692,7 @@ fn main() {
         // succeeding). Otherwise sleep longer. New-mail toasts and DB
         // refreshes lag by up to this many seconds, which is fine for
         // a background-poll inbox.
-        let timeout_secs: u64 = if app.feedback_expires.is_some() || app.pending_send.is_some() { 1 } else { 10 };
+        let timeout_secs: u64 = if app.feedback_expires.is_some() || app.pending_send.is_some() || !app.content_loading.is_empty() { 1 } else { 10 };
         let key = Input::getchr(Some(timeout_secs));
         match key {
             Some(k) => {
@@ -2542,6 +2577,43 @@ impl App {
         }
     }
 
+    /// Store a body the DB read worker finished into the in-memory message
+    /// copies (display + filtered) and clear its in-flight marker. Clones the
+    /// body only in threaded mode, where both vecs hold a copy.
+    fn apply_loaded_body(&mut self, loaded: (i64, String, Option<String>)) -> i64 {
+        let (id, content, html) = loaded;
+        self.content_loading.remove(&id);
+        if self.show_threaded {
+            if let Some(m) = self.display_messages.iter_mut().find(|m| m.id == id) {
+                m.content = content.clone();
+                m.html_content = html.clone();
+                m.full_loaded = true;
+            }
+        }
+        if let Some(m) = self.filtered_messages.iter_mut().find(|m| m.id == id) {
+            m.content = content;
+            m.html_content = html;
+            m.full_loaded = true;
+        }
+        id
+    }
+
+    /// Drain every body the DB read worker has finished. Returns true if the
+    /// currently-selected message was among them, so the caller re-renders the
+    /// right pane. Cheap try_recv; never blocks.
+    fn drain_loaded_bodies(&mut self) -> bool {
+        let cur_id = {
+            let list = if self.show_threaded { &self.display_messages } else { &self.filtered_messages };
+            list.get(self.index).map(|m| m.id)
+        };
+        let mut redraw = false;
+        while let Ok(res) = self.read_res_rx.try_recv() {
+            let id = self.apply_loaded_body(res);
+            if Some(id) == cur_id { redraw = true; }
+        }
+        redraw
+    }
+
     fn render_message_content(&mut self) {
         // Auto-mark as read when displayed in right pane
         let msg_ref = if self.show_threaded {
@@ -2634,28 +2706,25 @@ impl App {
             }
         }
 
-        // Auto-load full content for selected message
-        // In threaded mode, display_messages are clones, so load into filtered_messages
-        // and re-clone if needed
-        if self.show_threaded {
-            if let Some(m) = self.display_messages.get(self.index) {
-                if !m.full_loaded && m.id != 0 {
-                    if let Some((content, html)) = self.db.get_message_content(m.id) {
-                        // Update the display copy
-                        if let Some(dm) = self.display_messages.get_mut(self.index) {
-                            dm.content = content;
-                            dm.html_content = html;
-                            dm.full_loaded = true;
-                        }
-                    }
-                }
+        // Lazy-load the full body OFF the render thread (see DB read worker).
+        // Request by id and return immediately. A warm read is caught right
+        // away by the short recv_timeout so the common case stays instant; a
+        // cold/contended read falls through to async — the main loop drains it
+        // on a later tick and re-renders, and the body shows "loading…" until
+        // then. This keeps a cold kastrup.db page from freezing the UI.
+        let need = (if self.show_threaded {
+            self.display_messages.get(self.index)
+        } else {
+            self.filtered_messages.get(self.index)
+        }).filter(|m| !m.full_loaded && m.id != 0).map(|m| m.id);
+        if let Some(id) = need {
+            if self.content_loading.insert(id) {
+                let _ = self.read_req_tx.send(id);
             }
-        } else if !self.filtered_messages[self.index].full_loaded {
-            let msg_id = self.filtered_messages[self.index].id;
-            if let Some((content, html)) = self.db.get_message_content(msg_id) {
-                self.filtered_messages[self.index].content = content;
-                self.filtered_messages[self.index].html_content = html;
-                self.filtered_messages[self.index].full_loaded = true;
+            if let Ok(res) =
+                self.read_res_rx.recv_timeout(std::time::Duration::from_millis(40))
+            {
+                self.apply_loaded_body(res);
             }
         }
 
@@ -2782,6 +2851,14 @@ impl App {
 
         // Separator
         lines.push(style::fg(&"\u{2500}".repeat(40), tc.separator));
+
+        // Body not loaded yet — the DB read worker is fetching it off-thread.
+        // Show a hint instead of a blank pane; the main loop re-renders the
+        // moment the body lands.
+        if !msg.full_loaded && msg.id != 0 {
+            lines.push(String::new());
+            lines.push(style::fg("  loading…", tc.hint_fg));
+        }
 
         // Fix 4: Attachments (separate images from regular attachments)
         if !msg.attachments.is_empty() {
