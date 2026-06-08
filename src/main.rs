@@ -2957,10 +2957,21 @@ impl App {
 
         // Content: extract from MIME, decode QP, detect HTML and parse
         let raw = &msg.content;
+        // Relay / chat / gateway / RSS bodies are plain UTF-8 and must NOT pass
+        // through email MIME/QP/base64 decoding. A Slack message whose URL
+        // carries `=D7`/`=47`-style query params (joinCode=…&leagueId=…) trips
+        // looks_quoted_printable (≥3 `=XX` hits) and gets QP-mangled — the
+        // kastrup:7953506 "encoding" bug. Only e-mail sources get decoded.
+        let is_email = matches!(
+            self.source_type_map.get(&msg.source_id).map(String::as_str).unwrap_or(""),
+            "email" | "maildir" | "imap" | "gmail"
+        );
         // Try MIME multipart extraction first
         let looks_mime = raw.contains("boundary=")
             || (raw.contains("Content-Type:") && raw.lines().any(|l| l.starts_with("--") && l.len() > 5));
-        let extracted = if looks_mime {
+        let extracted = if !is_email {
+            raw.clone()
+        } else if looks_mime {
             // If MIME parsing finds no readable body (e.g. attachment-only
             // message where text/html is empty), fall back to an empty
             // string rather than dumping the raw multipart envelope into
@@ -8339,10 +8350,19 @@ impl App {
     /// Get displayable text content from a message, converting HTML if needed.
     fn get_display_content(&self, msg: &Message) -> String {
         let raw = &msg.content;
-        // MIME extraction + QP/base64 decoding (same logic as render_message_content)
+        // MIME extraction + QP/base64 decoding (same logic as render_message_content).
+        // Only e-mail sources are decoded; relay/chat/gateway/RSS bodies are
+        // plain UTF-8 and would be corrupted (Slack `=D7`/`=47` URL params trip
+        // QP detection — kastrup:7953506).
+        let is_email = matches!(
+            self.source_type_map.get(&msg.source_id).map(String::as_str).unwrap_or(""),
+            "email" | "maildir" | "imap" | "gmail"
+        );
         let looks_mime = raw.contains("Content-Type:")
             || raw.lines().any(|l| l.starts_with("--") && l.len() > 5);
-        let extracted = if looks_mime {
+        let extracted = if !is_email {
+            raw.clone()
+        } else if looks_mime {
             // Same attachment-only fallback as render_message_content —
             // prefer an empty body over dumping raw MIME into yank/search.
             extract_mime_text(raw).unwrap_or_default()
