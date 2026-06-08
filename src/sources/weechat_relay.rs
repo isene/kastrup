@@ -468,8 +468,25 @@ impl Connection {
         if text.is_empty() {
             return Err("empty body".to_string());
         }
-        let cmd = format!("input {} {}\n", full_name, text);
-        self.send_cmd(&cmd)
+        // The relay protocol is newline-terminated: each command ends at the
+        // first `\n`. Sending a multi-line body in one `input` command would
+        // truncate it to line 1 (the bug this fixes). Send one `input` per
+        // non-blank line so every line posts — multi-line messages appear as
+        // consecutive lines in the channel, as documented above.
+        let mut sent = false;
+        for line in text.split('\n') {
+            if line.trim().is_empty() {
+                continue; // can't post an empty line; skip blank separators
+            }
+            self.send_cmd(&format!("input {} {}\n", full_name, line))?;
+            sent = true;
+        }
+        if !sent {
+            // Body was only blank lines — fall back to the raw send so the
+            // caller's non-empty contract still posts something.
+            self.send_cmd(&format!("input {} {}\n", full_name, text))?;
+        }
+        Ok(())
     }
 }
 

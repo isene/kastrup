@@ -1502,8 +1502,18 @@ fn main() {
         std_mpsc::channel::<(i64, String, Option<String>)>();
     let reader_db = db.clone();
     std::thread::spawn(move || {
+        // Read bodies on a PRIVATE WAL connection, not the shared `conn`
+        // mutex. A cold/large body read parks this thread in D-state, but it
+        // holds no lock the writer or render thread needs — so the UI no
+        // longer freezes behind it (see kfreeze: 27 s folio_wait under the
+        // shared lock). Fall back to the shared path if the aux open fails.
+        let aux = reader_db.open_aux_connection().ok();
         while let Ok(id) = read_req_rx.recv() {
-            if let Some((content, html)) = reader_db.get_message_content(id) {
+            let loaded = match aux.as_ref() {
+                Some(c) => crate::database::Database::get_message_content_conn(c, id),
+                None => reader_db.get_message_content(id),
+            };
+            if let Some((content, html)) = loaded {
                 let _ = read_res_tx.send((id, content, html));
             }
         }

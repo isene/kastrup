@@ -538,6 +538,16 @@ impl Database {
     /// Get only the full content and html_content for a message (light-to-full upgrade)
     pub fn get_message_content(&self, id: i64) -> Option<(String, Option<String>)> {
         let conn = self.conn.lock().unwrap();
+        Self::get_message_content_conn(&conn, id)
+    }
+
+    /// Read a message body on a caller-supplied connection. The async reader
+    /// thread passes its own `open_aux_connection()` handle so a cold or large
+    /// body read (D-state `folio_wait_bit_common`) stalls only that thread — it
+    /// never holds the shared `conn` mutex, so it can't freeze the writer or
+    /// the render thread. (kfreeze showed a 27 s UI freeze from exactly that
+    /// lock contention.)
+    pub fn get_message_content_conn(conn: &Connection, id: i64) -> Option<(String, Option<String>)> {
         conn.query_row(
             "SELECT content, html_content FROM messages WHERE id = ?",
             params![id],
