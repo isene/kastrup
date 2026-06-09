@@ -148,7 +148,7 @@ pub fn sync_discord(_config: &serde_json::Value, known_ids: &HashSet<String>) ->
 }
 
 fn fetch_self_id(auth: &str) -> Option<String> {
-    let resp = ureq::get(&format!("{}/users/@me", API))
+    let resp = super::http_agent().get(&format!("{}/users/@me", API))
         .set("Authorization", auth)
         .set("User-Agent", "kastrup (https://github.com/isene/kastrup, 0.1)")
         .call().ok()?
@@ -186,7 +186,7 @@ fn guess_content_type(filename: &str) -> String {
 }
 
 fn list_dm_channels(auth: &str) -> Option<Vec<serde_json::Value>> {
-    let resp = ureq::get(&format!("{}/users/@me/channels", API))
+    let resp = super::http_agent().get(&format!("{}/users/@me/channels", API))
         .set("Authorization", auth)
         .set("User-Agent", "kastrup (https://github.com/isene/kastrup, 0.1)")
         .call().ok()?
@@ -197,7 +197,7 @@ fn list_dm_channels(auth: &str) -> Option<Vec<serde_json::Value>> {
 
 fn fetch_messages(auth: &str, channel_id: &str, limit: u32) -> Option<Vec<serde_json::Value>> {
     let url = format!("{}/channels/{}/messages?limit={}", API, channel_id, limit);
-    let resp = ureq::get(&url)
+    let resp = super::http_agent().get(&url)
         .set("Authorization", auth)
         .set("User-Agent", "kastrup (https://github.com/isene/kastrup, 0.1)")
         .call().ok()?

@@ -148,7 +148,7 @@ pub fn sync_slack(config: &serde_json::Value, known_ids: &HashSet<String>) -> Ve
 // --- API helpers -----------------------------------------------------------
 
 fn auth_test(bearer: &str) -> Option<String> {
-    let resp = ureq::post(&format!("{}/auth.test", API))
+    let resp = super::http_agent().post(&format!("{}/auth.test", API))
         .set("Authorization", bearer)
         .call().ok()?
         .into_string().ok()?;
@@ -168,7 +168,7 @@ fn list_dm_channels(bearer: &str) -> Vec<(String, String)> {
             url.push_str("&cursor=");
             url.push_str(c);
         }
-        let Ok(resp) = ureq::get(&url).set("Authorization", bearer).call() else { break };
+        let Ok(resp) = super::http_agent().get(&url).set("Authorization", bearer).call() else { break };
         let Ok(text) = resp.into_string() else { break };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { break };
         if !v["ok"].as_bool().unwrap_or(false) { break; }
@@ -231,7 +231,7 @@ fn resolve_channels(bearer: &str, items: &[String]) -> Vec<(String, String)> {
             url.push_str("&cursor=");
             url.push_str(c);
         }
-        let Ok(resp) = ureq::get(&url).set("Authorization", bearer).call() else { break };
+        let Ok(resp) = super::http_agent().get(&url).set("Authorization", bearer).call() else { break };
         let Ok(text) = resp.into_string() else { break };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { break };
         if !v["ok"].as_bool().unwrap_or(false) { break; }
@@ -257,7 +257,7 @@ fn resolve_channels(bearer: &str, items: &[String]) -> Vec<(String, String)> {
 
 fn fetch_history(bearer: &str, channel_id: &str, limit: u32) -> Option<Vec<serde_json::Value>> {
     let url = format!("{}/conversations.history?channel={}&limit={}", API, channel_id, limit);
-    let resp = ureq::get(&url)
+    let resp = super::http_agent().get(&url)
         .set("Authorization", bearer)
         .call().ok()?
         .into_string().ok()?;
@@ -274,7 +274,7 @@ fn fetch_history(bearer: &str, channel_id: &str, limit: u32) -> Option<Vec<serde
 fn lookup_user_name(bearer: &str, user_id: &str) -> String {
     if user_id.is_empty() { return String::new(); }
     let url = format!("{}/users.info?user={}", API, user_id);
-    let Ok(resp) = ureq::get(&url).set("Authorization", bearer).call() else {
+    let Ok(resp) = super::http_agent().get(&url).set("Authorization", bearer).call() else {
         return user_id.to_string();
     };
     let Ok(text) = resp.into_string() else { return user_id.to_string() };
