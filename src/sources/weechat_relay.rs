@@ -745,6 +745,7 @@ fn run_persistent(
     messages_dirty: &Arc<AtomicBool>,
     nick_lists: &NickLists,
     subscribed: &SubscribedBuffers,
+    kill_switch: &Arc<Mutex<Option<TcpStream>>>,
 ) -> Result<(), String> {
     let secrets = load_relay_secrets();
     let host = secrets.host.ok_or("WEECHAT_RELAY_HOST missing")?;
@@ -753,6 +754,13 @@ fn run_persistent(
 
     crate::log::info(&format!("weechat-relay: connecting to {}:{}", host, port));
     let mut conn = Connection::connect_for_push(&host, port)?;
+    // Publish a clone of the socket so the main loop's resume watchdog can
+    // shut it down after a suspend. A half-open relay socket survives TCP
+    // keepalive (the peer keeps ACKing), so the blocking read never returns
+    // on its own — shutdown() unblocks it and this supervisor reconnects.
+    if let Ok(c) = conn.stream.try_clone() {
+        if let Ok(mut slot) = kill_switch.lock() { *slot = Some(c); }
+    }
     conn.handshake()?;
     conn.init_plain(&pass)?;
 
@@ -943,6 +951,7 @@ pub fn spawn_supervisor(
     messages_dirty: Arc<AtomicBool>,
     nick_lists: NickLists,
     subscribed: SubscribedBuffers,
+    kill_switch: Arc<Mutex<Option<TcpStream>>>,
 ) {
     std::thread::Builder::new()
         .name("weechat-relay-supervisor".to_string())
@@ -953,7 +962,7 @@ pub fn spawn_supervisor(
             loop {
                 let started = std::time::Instant::now();
                 let err = run_persistent(
-                    &db, source_id, &messages_dirty, &nick_lists, &subscribed,
+                    &db, source_id, &messages_dirty, &nick_lists, &subscribed, &kill_switch,
                 ).err();
                 let ran_for = started.elapsed();
                 if ran_for > Duration::from_secs(60) {
