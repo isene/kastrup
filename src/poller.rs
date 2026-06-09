@@ -63,6 +63,20 @@ impl Poller {
         Self { wake, thread: Some(thread), inotify_thread }
     }
 
+    /// Force an immediate scan (same Wake the inotify watcher uses). Used by
+    /// the main loop's resume watchdog: after a suspend, the poller's parked
+    /// condvar timeout is on CLOCK_MONOTONIC (which doesn't count suspend) and
+    /// can leave maildir un-synced long past resume — this kicks it awake.
+    pub fn wake(&self) {
+        let (lock, cvar) = &*self.wake;
+        if let Ok(mut g) = lock.lock() {
+            if *g == WakeState::Idle {
+                *g = WakeState::Wake;
+                cvar.notify_one();
+            }
+        }
+    }
+
     pub fn stop(&mut self) {
         let (lock, cvar) = &*self.wake;
         *lock.lock().unwrap() = WakeState::Stop;

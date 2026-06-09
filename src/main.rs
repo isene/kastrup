@@ -1357,10 +1357,14 @@ fn main() {
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let subscribed_buffers: sources::weechat_relay::SubscribedBuffers =
         Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Shared handle to the live relay socket so the resume watchdog (main
+    // loop) can shut it down after a suspend and force a reconnect.
+    let relay_kill: Arc<std::sync::Mutex<Option<std::net::TcpStream>>> =
+        Arc::new(std::sync::Mutex::new(None));
     if let Some(sid) = weechat_relay_source_id {
         sources::weechat_relay::spawn_supervisor(
             db.clone(), sid, messages_dirty.clone(),
-            nick_lists.clone(), subscribed_buffers.clone(),
+            nick_lists.clone(), subscribed_buffers.clone(), relay_kill.clone(),
         );
     }
     // Editor completion socket at ~/.kastrup/completion.sock.
@@ -1675,6 +1679,9 @@ fn main() {
         app.compose_to(&to, &subj);
     }
 
+    // Resume watchdog state: wall-clock at the previous loop turn.
+    let mut last_wall = std::time::SystemTime::now();
+
     while app.running {
         // Pick up any completed background SMTP send. Cheap try_recv
         // when nothing's queued.
@@ -1704,6 +1711,24 @@ fn main() {
         // a background-poll inbox.
         let timeout_secs: u64 = if app.feedback_expires.is_some() || app.pending_send.is_some() || !app.content_loading.is_empty() { 1 } else { 10 };
         let key = Input::getchr(Some(timeout_secs));
+
+        // Resume watchdog. Battery-free: one vDSO clock read per turn, no new
+        // timer or wakeup. The loop wakes at most every `timeout_secs` (≤10s),
+        // so a wall-clock gap ≥30s means the machine was suspended. On resume,
+        // threads parked across the suspend don't reliably self-heal — the
+        // poller's CLOCK_MONOTONIC condvar timeout under-counts suspend, and
+        // the relay's blocking read sits on a half-open socket TCP keepalive
+        // can't kill. Kick both so mail + chat re-sync immediately.
+        let wall_now = std::time::SystemTime::now();
+        if wall_now.duration_since(last_wall).map(|g| g.as_secs() >= 30).unwrap_or(false) {
+            crate::log::info("resume: suspend gap detected — waking poller + recycling relay");
+            if let Some(p) = app.poller.as_ref() { p.wake(); }
+            if let Ok(slot) = relay_kill.lock() {
+                if let Some(s) = slot.as_ref() { let _ = s.shutdown(std::net::Shutdown::Both); }
+            }
+        }
+        last_wall = wall_now;
+
         match key {
             Some(k) => {
                 // A sticky send-result toast clears on the first
