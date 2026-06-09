@@ -124,7 +124,13 @@ fn poller_loop(
             let _ = conn.execute_batch("PRAGMA incremental_vacuum(1024);");
             drop(conn);
         }
-        let sources_list = db.get_sources(true);
+        let mut sources_list = db.get_sources(true);
+        // Sync local maildir before network sources each cycle. Maildir is
+        // fast and never blocks on the network, so it always gets its turn
+        // even when a (now timeout-bounded) network source is slow this
+        // cycle — defence-in-depth against the "network hang freezes mail
+        // sync" class of bug, on top of the per-request HTTP timeouts.
+        sources_list.sort_by_key(|s| s.plugin_type != "maildir");
         let now = crate::database::now_secs();
 
         for source in &sources_list {
