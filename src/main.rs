@@ -1119,6 +1119,9 @@ struct App {
     /// muted channel stays hidden until activity newer than the mute
     /// time matches its mode. Persisted as `hidden_channels_<view>`.
     current_hidden_channels: Vec<HiddenChannel>,
+    /// Ctrl+U peek: when true, muted channels show too (dim muted tag).
+    /// Session-only view state, never persisted.
+    show_muted: bool,
 
     // Background poller
     poller: Option<poller::Poller>,
@@ -1582,6 +1585,7 @@ fn main() {
         source_unread_cache: std::collections::HashMap::new(),
         last_highlight_refresh: std::time::Instant::now() - std::time::Duration::from_secs(60),
         current_hidden_channels: Vec::new(),
+        show_muted: false,
         poller: None,
         poller_rx: None,
         write_tx,
@@ -1909,7 +1913,7 @@ impl App {
             "{" | "C-UP" => { self.move_section(-1); }
             "}" | "C-DOWN" => { self.move_section(1); }
             "C-HOME" => { self.reset_section_order(); }
-            "C-U" => { self.unhide_all_channels(); }
+            "C-U" => { self.toggle_show_muted(); }
             "C-N" => { self.pick_nick_to_clipboard(); }
             "C-G" => { self.pick_channel_to_clipboard(); }
 
@@ -2485,7 +2489,22 @@ impl App {
 
         let lead = style::bold(&style::fg(&format!("{} {} ", arrow, icon), tc.thread));
         let suffix = style::fg(&format!(" [{}]", msg.content), tc.hint_fg);
-        let content = format!("{}{}{}{}{}", lead, dim_styled, chan_styled, suffix, unread_mark);
+        // During a Ctrl+U peek, tag the channels that are only visible
+        // because of the peek. The tag shows the mute mode via the key that
+        // set it — [m] until-new, [M] until-mention — which is also the key
+        // that unmutes it (same key on the header toggles off).
+        let muted_tag = if self.show_muted {
+            msg.thread_id.as_ref()
+                .and_then(|n| self.current_hidden_channels.iter().find(|h| &h.name == n))
+                .map(|h| match h.mode {
+                    HideMode::UntilNew => style::fg(" [m]", tc.hint_fg),
+                    HideMode::UntilHighlight => style::fg(" [M]", tc.hint_fg),
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let content = format!("{}{}{}{}{}{}", lead, dim_styled, chan_styled, suffix, muted_tag, unread_mark);
 
         // Trailing pad so the row bg fills the pane width; padding is not
         // underlined so the underline hugs just the subject.
@@ -4233,7 +4252,7 @@ impl App {
             // re-hides on its own once the user has read it — no manual
             // unmute+remute. (`mute_recheck_pending` triggers the rebuild that
             // applies this once the cursor leaves the channel.)
-            if !self.current_hidden_channels.is_empty() {
+            if !self.show_muted && !self.current_hidden_channels.is_empty() {
                 let muted = &self.current_hidden_channels;
                 sections.retain(|s| {
                     match muted.iter().find(|h| h.name == s.name) {
@@ -4497,8 +4516,8 @@ impl App {
     /// on any new message), `M` → `UntilHighlight` (resurface only on a
     /// mention/highlight). Pressing the SAME mode key on an already-
     /// muted channel un-mutes it; the OTHER mode key switches the mode
-    /// (and re-stamps the mute time). Persists per view. `unhide_all`
-    /// (Ctrl+U) clears every mute in the view.
+    /// (and re-stamps the mute time). Persists per view. Ctrl+U toggles a
+    /// non-destructive peek that shows muted channels alongside the rest.
     fn hide_current_channel(&mut self, mode: HideMode) {
         if !self.group_by_folder {
             self.set_feedback("Mute works in the channel (folders) view",
@@ -4551,18 +4570,21 @@ impl App {
     }
 
     /// Un-mute every channel in this view. Bound to Ctrl+U.
-    fn unhide_all_channels(&mut self) {
+    /// Ctrl+U — toggle between "all channels" (muted included, shown with a
+    /// dim muted tag) and the normal unmuted-only view. Non-destructive: the
+    /// mute list is untouched; to actually unmute one, peek with Ctrl+U and
+    /// press `m` on its header.
+    fn toggle_show_muted(&mut self) {
         if !self.group_by_folder { return; }
-        if self.current_hidden_channels.is_empty() {
-            self.set_feedback("No muted channels in this view",
-                self.config.theme_colors.feedback_info);
-            return;
-        }
+        self.show_muted = !self.show_muted;
         let n = self.current_hidden_channels.len();
-        self.current_hidden_channels.clear();
-        self.save_hidden_channels();
-        self.set_feedback(&format!("Unmuted {} channel(s)", n),
-            self.config.theme_colors.feedback_ok);
+        if self.show_muted {
+            self.set_feedback(&format!("Showing all channels ({} muted)", n),
+                self.config.theme_colors.feedback_info);
+        } else {
+            self.set_feedback("Showing unmuted channels",
+                self.config.theme_colors.feedback_info);
+        }
         self.rebuild_display();
         self.render_all();
     }
@@ -5834,7 +5856,7 @@ impl App {
   l              Label message\n\
   s              File/save message\n\
   m / M          Mute channel: until new msg / until mention\n\
-  Ctrl-U         Un-mute all channels in view\n\
+  Ctrl-U         Toggle: all channels / unmuted only\n\
   I              AI assistant / plugins\n\
   c              :claude PROMPT (response in right pane)\n\
   C              :chat (suspend, claude w/ message context)\n\
