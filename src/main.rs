@@ -10369,22 +10369,27 @@ impl App {
             return;
         }
 
-        if self.filtered_messages.is_empty() { return; }
+        // In threaded (Folders) view self.index points into display_messages;
+        // resolve the message's position in filtered_messages like `v` does.
+        // Indexing filtered_messages[self.index] directly here made V inspect
+        // the WRONG message in Folders view → "No images found" while the
+        // count (rendered from the right message) said otherwise.
+        let Some(fidx) = self.current_filtered_index() else { return; };
 
         // Ensure full content loaded
-        if !self.filtered_messages[self.index].full_loaded {
-            let msg_id = self.filtered_messages[self.index].id;
+        if !self.filtered_messages[fidx].full_loaded {
+            let msg_id = self.filtered_messages[fidx].id;
             if let Some((content, html)) = self.db.get_message_content(msg_id) {
-                self.filtered_messages[self.index].content = content;
-                self.filtered_messages[self.index].html_content = html;
-                self.filtered_messages[self.index].full_loaded = true;
+                self.filtered_messages[fidx].content = content;
+                self.filtered_messages[fidx].html_content = html;
+                self.filtered_messages[fidx].full_loaded = true;
             }
         }
         // Same chat-URL → synthetic-attachment enrichment as `v`, so
         // a Slack image attachment is rendered inline by `V` exactly
         // like an email's image attachment.
         self.enrich_attachments_from_chat_urls();
-        let msg = &self.filtered_messages[self.index];
+        let msg = &self.filtered_messages[fidx];
 
         // Collect image URLs
         let mut urls: Vec<String> = Vec::new();
@@ -10438,7 +10443,7 @@ impl App {
                 }
             }
         }
-        let msg = &self.filtered_messages[self.index];
+        let msg = &self.filtered_messages[fidx];
 
         // From HTML content
         let html = msg.html_content.as_deref()
