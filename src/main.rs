@@ -7221,14 +7221,28 @@ impl App {
         self.current_view_folder()
     }
 
-    /// The folder the current view filters on (`view 'N', .., folder: 'X'`).
-    /// Used as the compose identity context when no message is selected,
-    /// so View 4 → `AA.Customers.Dualog` → the `dualog` folder_hook.
+    /// The folder the current view filters on, used as the compose
+    /// identity context when no message is selected (cursor on a section
+    /// header), so View 4 → `AA.Customers.Dualog` → the `dualog`
+    /// folder_hook. Filters are stored either flat (`{"rules":[…]}`) or
+    /// as a union (`{"branches":[{"rules":[…]},…]}`); return the first
+    /// `folder`-field rule's value.
     fn current_view_folder(&self) -> Option<String> {
         let vw = self.views.iter()
             .find(|v| v.key_binding.as_deref() == Some(&self.current_view))?;
         let f: serde_json::Value = serde_json::from_str(&vw.filters).ok()?;
-        f.get("folder").and_then(|x| x.as_str()).map(|s| s.to_string())
+        fn folder_in(rules: &serde_json::Value) -> Option<String> {
+            rules.as_array()?.iter().find_map(|r| {
+                if r.get("field").and_then(|x| x.as_str()) == Some("folder") {
+                    r.get("value").and_then(|x| x.as_str()).map(|s| s.to_string())
+                } else { None }
+            })
+        }
+        if let Some(folder) = f.get("rules").and_then(folder_in) {
+            return Some(folder);
+        }
+        f.get("branches")?.as_array()?.iter()
+            .find_map(|br| br.get("rules").and_then(folder_in))
     }
 
     /// Get the identity for the current context (folder-hook match).
