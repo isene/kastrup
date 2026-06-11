@@ -37,6 +37,19 @@ const PUSH_KEEPALIVE_IDLE:     Duration = Duration::from_secs(30);
 const PUSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const PUSH_KEEPALIVE_RETRIES:  u32      = 4;
 
+// Application-level heartbeat for the push listener. Kernel keepalive
+// (above) detects a dead *peer*; it can't detect a peer whose kernel
+// still ACKs while weechat itself has silently stopped pushing events
+// (relay subscription dropped after a buffer rebuild, relay thread
+// wedged). After HEARTBEAT_IDLE of total silence a parked side thread
+// sends one `ping`; weechat answers `_pong` at once. If nothing lands
+// within HEARTBEAT_TIMEOUT the link is wedged — drop the socket so the
+// supervisor reconnects and backfills. Battery: a busy connection
+// never goes idle long enough to ping, so the cost is one thread wake
+// per HEARTBEAT_IDLE (≈720/day) only while genuinely idle, no forks.
+const HEARTBEAT_IDLE:    Duration = Duration::from_secs(120);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Protocol object model
 // ---------------------------------------------------------------------------
@@ -739,6 +752,52 @@ fn apply_nicklist_item(
 /// backfills recent history, subscribes to push events, and reads
 /// forever. Returns `Err(...)` on any I/O failure so the supervisor
 /// can retry with backoff.
+/// Clears the heartbeat thread's `alive` flag whenever `run_persistent`
+/// returns (normal end or a `?` error), so the parked thread exits at
+/// its next wake instead of lingering on a dead socket.
+struct HeartbeatGuard(Arc<AtomicBool>);
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) { self.0.store(false, Ordering::Relaxed); }
+}
+
+/// Park a thread that proves the push link is still pushing. It sleeps
+/// HEARTBEAT_IDLE, and if no traffic arrived in that window it sends a
+/// single `ping`; weechat replies `_pong` immediately, which the read
+/// loop stamps into `last_activity`. If the answer doesn't land within
+/// HEARTBEAT_TIMEOUT the link is wedged at the application layer (TCP
+/// still up, weechat not pushing) — shut the socket down so the read
+/// loop's `read()` errors and the supervisor reconnects + backfills.
+fn spawn_heartbeat(
+    mut sock: TcpStream,
+    last_activity: Arc<Mutex<std::time::Instant>>,
+    alive: Arc<AtomicBool>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("weechat-relay-heartbeat".to_string())
+        .spawn(move || {
+            while alive.load(Ordering::Relaxed) {
+                std::thread::sleep(HEARTBEAT_IDLE);
+                if !alive.load(Ordering::Relaxed) { break; }
+                // Still seeing traffic? Then the link is obviously fine;
+                // skip the ping entirely (zero cost on a busy channel).
+                let idle = last_activity.lock().map(|t| t.elapsed()).unwrap_or_default();
+                if idle < HEARTBEAT_IDLE { continue; }
+                // Silent too long — make weechat prove it's there.
+                let ping_at = std::time::Instant::now();
+                if sock.write_all(b"ping kastrup-hb\n").is_err() { break; }
+                std::thread::sleep(HEARTBEAT_TIMEOUT);
+                if !alive.load(Ordering::Relaxed) { break; }
+                let last = last_activity.lock().map(|t| *t).unwrap_or(ping_at);
+                if last < ping_at {
+                    // Nothing came back after the ping → wedged.
+                    crate::log::info("weechat-relay: heartbeat timeout — recycling socket");
+                    let _ = sock.shutdown(std::net::Shutdown::Both);
+                    break;
+                }
+            }
+        });
+}
+
 fn run_persistent(
     db: &Arc<crate::database::Database>,
     source_id: i64,
@@ -856,8 +915,22 @@ fn run_persistent(
     conn.sync("*")?;
     crate::log::info("weechat-relay: sync * — listening");
 
+    // Heartbeat: a write-clone of the push socket plus a shared
+    // last-activity clock. The side thread pings only after a long
+    // silence and recycles the socket if the `_pong` never lands.
+    // `_hb_guard` clears the alive flag on every return path (incl. the
+    // `?` below) so the thread can't outlive this connection.
+    let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
+    let hb_alive = Arc::new(AtomicBool::new(true));
+    let _hb_guard = HeartbeatGuard(hb_alive.clone());
+    if let Ok(hb_sock) = conn.stream.try_clone() {
+        spawn_heartbeat(hb_sock, last_activity.clone(), hb_alive.clone());
+    }
+
     loop {
         let (id, objs) = conn.read_message()?;
+        // Any traffic — a real push or a `_pong` — proves the link live.
+        if let Ok(mut t) = last_activity.lock() { *t = std::time::Instant::now(); }
         match id.as_str() {
             "_buffer_line_added" => {
                 let mut pending: Vec<MessageData> = Vec::new();
