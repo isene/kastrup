@@ -10208,7 +10208,12 @@ impl App {
         // Covers non-maildir sources (e.g. workspace bridges) that resolve
         // attachments by server-side id.
         let file_id = att.get("file_id").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let plugin_type = self.filtered_messages.get(self.index)
+        // Resolve the source via the threaded display→filtered mapping. Using
+        // self.index raw read the wrong message in Folders view, so the
+        // workspace open_attachment template wasn't found and the download
+        // silently no-op'd (v0.1.181-class index bug).
+        let plugin_type = self.current_filtered_index()
+            .and_then(|i| self.filtered_messages.get(i))
             .map(|m| m.source_type.clone()).unwrap_or_default();
         let has_open_attachment = self.config.senders.get(&plugin_type)
             .map(|m| m.contains_key("open_attachment")).unwrap_or(false);
