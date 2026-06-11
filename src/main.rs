@@ -5982,11 +5982,21 @@ impl App {
     /// fact that kastrup is busy.
     fn set_feedback_for(&mut self, msg: &str, color: u8, expires_in: std::time::Duration) {
         // Auto-log errors and warnings
+        let is_error = color == 196 || color == self.config.theme_colors.feedback_warn;
         if color == 196 { log::error(msg); }
         else if color == self.config.theme_colors.feedback_warn { log::warn(msg); }
         self.feedback_message = Some((msg.to_string(), color));
-        self.feedback_expires = Some(std::time::Instant::now() + expires_in);
-        self.feedback_clear_on_key = false;
+        if is_error {
+            // Errors/warnings must stay readable: persist until the user's
+            // next keypress instead of silently expiring after a few seconds
+            // (a transient send/DNS error otherwise vanishes before it can be
+            // read). The keypress that dismisses it is swallowed, not acted on.
+            self.feedback_expires = None;
+            self.feedback_clear_on_key = true;
+        } else {
+            self.feedback_expires = Some(std::time::Instant::now() + expires_in);
+            self.feedback_clear_on_key = false;
+        }
         self.render_bottom_bar();
     }
 
@@ -10105,6 +10115,70 @@ impl App {
         self.render_all();
     }
 
+    /// Open a downloaded attachment file. If the desktop handler for the
+    /// file's MIME type is a terminal app (e.g. scribe for text/plain),
+    /// `xdg-open` launches it detached with no terminal and nothing shows —
+    /// run it in-terminal instead (suspend the TUI, run, restore). GUI
+    /// handlers (images, PDFs) still go through xdg-open, detached.
+    fn open_attachment_file(&mut self, path: &str, name: &str) {
+        if let Some(exec) = Self::terminal_handler_exec(path) {
+            let esc = crust::shell_escape(path);
+            let has_field = ["%f", "%F", "%u", "%U"].iter().any(|f| exec.contains(f));
+            let mut cmd = exec.replace("%f", &esc).replace("%F", &esc)
+                .replace("%u", &esc).replace("%U", &esc);
+            if !has_field { cmd = format!("{} {}", cmd, esc); }
+            Crust::cleanup();
+            let _ = std::process::Command::new("sh").arg("-c").arg(&cmd).status();
+            Crust::init();
+            Crust::set_app_identity("Kastrup");
+            Crust::clear_screen();
+            self.render_all();
+        } else {
+            let _ = std::process::Command::new("xdg-open").arg(path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+        self.set_feedback(&format!("Opened {}", name), self.config.theme_colors.feedback_ok);
+    }
+
+    /// If the default desktop handler for `path`'s MIME type is a terminal
+    /// app, return its `Exec` line; else `None` (caller should xdg-open).
+    fn terminal_handler_exec(path: &str) -> Option<String> {
+        let mime = Self::cmd_stdout("xdg-mime", &["query", "filetype", path])?;
+        let mime = mime.trim();
+        if mime.is_empty() { return None; }
+        let desktop = Self::cmd_stdout("xdg-mime", &["query", "default", mime])?;
+        let desktop = desktop.trim();
+        if desktop.is_empty() { return None; }
+        let home = std::env::var("HOME").unwrap_or_default();
+        let dirs = [
+            format!("{}/.local/share/applications", home),
+            "/usr/share/applications".to_string(),
+            "/usr/local/share/applications".to_string(),
+        ];
+        let content = dirs.iter()
+            .find_map(|d| std::fs::read_to_string(format!("{}/{}", d, desktop)).ok())?;
+        let mut terminal = false;
+        let mut exec = None;
+        for line in content.lines() {
+            let l = line.trim();
+            if let Some(v) = l.strip_prefix("Terminal=") {
+                terminal = v.trim().eq_ignore_ascii_case("true");
+            } else if let Some(v) = l.strip_prefix("Exec=") {
+                if exec.is_none() { exec = Some(v.trim().to_string()); }
+            }
+        }
+        if terminal { exec } else { None }
+    }
+
+    fn cmd_stdout(cmd: &str, args: &[&str]) -> Option<String> {
+        std::process::Command::new(cmd).args(args).output().ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+    }
+
     /// Extract an attachment from a maildir file and either open or save it.
     fn extract_and_open_attachment(
         &mut self,
@@ -10183,12 +10257,7 @@ impl App {
                 }
 
                 if open {
-                    let _ = std::process::Command::new("xdg-open").arg(&cached)
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn();
-                    self.set_feedback(&format!("Opened {}", name),
-                        self.config.theme_colors.feedback_ok);
+                    self.open_attachment_file(cached.to_string_lossy().as_ref(), name);
                 } else {
                     // Save → copy cached file to user-chosen dest above.
                     if let Err(e) = std::fs::copy(&cached, &dest) {
@@ -10225,13 +10294,7 @@ impl App {
             match res {
                 Ok(()) => {
                     if open {
-                        let _ = std::process::Command::new("xdg-open").arg(&dest)
-                            .stdin(std::process::Stdio::null())
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .spawn();
-                        self.set_feedback(&format!("Opened {}", name),
-                            self.config.theme_colors.feedback_ok);
+                        self.open_attachment_file(&dest, name);
                     } else {
                         self.set_feedback(&format!("Saved to {}", dest),
                             self.config.theme_colors.feedback_ok);
@@ -10262,12 +10325,7 @@ impl App {
                 return;
             }
             if open {
-                let _ = std::process::Command::new("xdg-open").arg(&dest)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-                self.set_feedback(&format!("Opened: {}", name),
-                    self.config.theme_colors.feedback_ok);
+                self.open_attachment_file(&dest, name);
             }
             return;
         }
@@ -12440,16 +12498,53 @@ fn best_html_for_message(msg: &Message) -> Option<String> {
         }
     }
     // Plain-text fallback. Wrap in a minimal HTML page so even a
-    // text-only newsletter renders as something the user can read.
+    // text-only newsletter renders as something the user can read. Bare
+    // http(s) URLs become real <a href> anchors so scroll (and a browser)
+    // can follow them — otherwise the obvious link is just dead text.
     if msg.content.trim().is_empty() { return None; }
-    let escaped = msg.content
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
+    let body = linkify_plain_to_html(&msg.content);
     Some(format!(
         "<html><head><meta charset=\"utf-8\"></head><body><pre>{}</pre></body></html>",
-        escaped
+        body
     ))
+}
+
+/// HTML-escape the three structural characters.
+fn html_escape_basic(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Escape plain text to HTML, wrapping bare http(s) URLs in <a href>
+/// anchors so scroll / a browser can follow them. One O(n) pass.
+fn linkify_plain_to_html(text: &str) -> String {
+    let mut out = String::new();
+    let mut last = 0;
+    let mut from = 0;
+    while let Some(rel) = text[from..].find("http") {
+        let pos = from + rel;
+        let slice = &text[pos..];
+        if slice.starts_with("http://") || slice.starts_with("https://") {
+            out.push_str(&html_escape_basic(&text[last..pos]));
+            let end = slice
+                .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '`'))
+                .unwrap_or(slice.len());
+            let mut url = &slice[..end];
+            // Drop trailing sentence punctuation that isn't part of the URL.
+            while let Some(c) = url.chars().last() {
+                if matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']') {
+                    url = &url[..url.len() - c.len_utf8()];
+                } else { break; }
+            }
+            let eu = html_escape_basic(url);
+            out.push_str(&format!("<a href=\"{}\">{}</a>", eu, eu));
+            last = pos + url.len();
+            from = last;
+        } else {
+            from = pos + 4;
+        }
+    }
+    out.push_str(&html_escape_basic(&text[last..]));
+    out
 }
 
 /// Extract raw HTML from MIME multipart content (for browser display).
