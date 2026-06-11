@@ -7207,8 +7207,28 @@ impl App {
 impl App {
     /// Get the current folder of the selected message (for identity resolution).
     fn current_folder(&self) -> Option<String> {
-        self.filtered_messages.get(self.index)
-            .and_then(|m| m.folder.clone())
+        // Resolve through the threaded display→filtered mapping so a
+        // section header or out-of-range display index doesn't yield the
+        // wrong message / None (the v0.1.181-class index bug). Then fall
+        // back to the current view's own folder filter, so composing a
+        // fresh mail in e.g. View 4 (Dualog) still picks the folder_hook
+        // identity even with no row selected or the cursor on a header.
+        if let Some(idx) = self.current_filtered_index() {
+            if let Some(folder) = self.filtered_messages.get(idx).and_then(|m| m.folder.clone()) {
+                return Some(folder);
+            }
+        }
+        self.current_view_folder()
+    }
+
+    /// The folder the current view filters on (`view 'N', .., folder: 'X'`).
+    /// Used as the compose identity context when no message is selected,
+    /// so View 4 → `AA.Customers.Dualog` → the `dualog` folder_hook.
+    fn current_view_folder(&self) -> Option<String> {
+        let vw = self.views.iter()
+            .find(|v| v.key_binding.as_deref() == Some(&self.current_view))?;
+        let f: serde_json::Value = serde_json::from_str(&vw.filters).ok()?;
+        f.get("folder").and_then(|x| x.as_str()).map(|s| s.to_string())
     }
 
     /// Get the identity for the current context (folder-hook match).
