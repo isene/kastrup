@@ -120,6 +120,11 @@ enum DraftKind {
     /// `<platform>:<thread_key>`; the reply is queued to the gateway
     /// `outbox/` for the phone to fire.
     Gateway,
+    /// A conversation reachable through the external `ws-bridge` CLI.
+    /// `Conv:` header carries the conversation UUID (the send target);
+    /// optional `Channel:` is a display label only; `Attach:` lines
+    /// upload files with the body as the caption.
+    Workspace,
 }
 
 impl DraftKind {
@@ -130,6 +135,7 @@ impl DraftKind {
             DraftKind::Discord => "discord",
             DraftKind::Weechat => "weechat",
             DraftKind::Gateway => "gateway",
+            DraftKind::Workspace => "workspace",
         }
     }
 
@@ -141,6 +147,7 @@ impl DraftKind {
             DraftKind::Discord => "Channel",
             DraftKind::Weechat => "Channel",
             DraftKind::Gateway => "Channel",
+            DraftKind::Workspace => "Channel",
         }
     }
 
@@ -152,6 +159,7 @@ impl DraftKind {
             Some("discord") => DraftKind::Discord,
             Some("weechat") => DraftKind::Weechat,
             Some("gateway") => DraftKind::Gateway,
+            Some("workspace") => DraftKind::Workspace,
             _               => DraftKind::Email,
         }
     }
@@ -222,6 +230,7 @@ fn parse_draft_preview(data: &str, kind: DraftKind) -> (String, String) {
             DraftKind::Discord => "(no channel)".to_string(),
             DraftKind::Weechat => "(no channel)".to_string(),
             DraftKind::Gateway => "(no chat target)".to_string(),
+            DraftKind::Workspace => "(no channel)".to_string(),
         };
     }
     (subject, body_preview)
@@ -235,6 +244,23 @@ fn parse_chat_channel(data: &str) -> Option<String> {
         if trimmed.is_empty() { break; }
         let lower = trimmed.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("channel:") {
+            let val_start = trimmed.len() - rest.len();
+            let v = trimmed[val_start..].trim();
+            if !v.is_empty() { return Some(v.to_string()); }
+        }
+    }
+    None
+}
+
+/// Extract the `Conv:` header value from a workspace draft (the
+/// conversation UUID, the send target). Same header-block scan as
+/// `parse_chat_channel`. Returns None if missing.
+fn parse_chat_conv(data: &str) -> Option<String> {
+    for line in data.lines() {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() { break; }
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("conv:") {
             let val_start = trimmed.len() - rest.len();
             let v = trimmed[val_start..].trim();
             if !v.is_empty() { return Some(v.to_string()); }
@@ -9052,6 +9078,81 @@ impl App {
         Ok(format!("Queued to phone: {}", target))
     }
 
+    /// Send a workspace-kind draft via the external `ws-bridge` CLI.
+    /// `Conv:` (required) is the conversation UUID — the send target.
+    /// `Channel:` is a display label only (ignored here). `Attach:`
+    /// lines upload files; the body becomes the caption on the FIRST
+    /// file only, so it isn't repeated under every attachment. With no
+    /// `Attach:` line it's a plain text send (body piped on stdin).
+    ///
+    /// ws-bridge is exec'd with an argv array, never a shell string,
+    /// so a multi-line caption and paths containing spaces survive
+    /// intact. Event-driven (runs only on user send), so no idle cost.
+    fn send_workspace_draft(&mut self, data: &str) -> Result<String, String> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let conv = parse_chat_conv(data)
+            .ok_or_else(|| "missing Conv: header (conversation UUID)".to_string())?;
+        let body = parse_chat_body(data);
+        let live: Vec<std::path::PathBuf> = parse_chat_attachments(data).into_iter()
+            .filter(|p| {
+                if p.exists() { true }
+                else { log::info(&format!("workspace: skipping attach (not found): {}", p.display())); false }
+            })
+            .collect();
+
+        if body.is_empty() && live.is_empty() {
+            return Err("body is empty".to_string());
+        }
+
+        // Text-only: `ws-bridge send --conv <UUID> --stdin` (body on stdin).
+        if live.is_empty() {
+            let mut child = Command::new("ws-bridge")
+                .args(["send", "--conv", &conv, "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("ws-bridge spawn failed: {}", e))?;
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(body.as_bytes());
+            }
+            let out = child.wait_with_output()
+                .map_err(|e| format!("ws-bridge wait failed: {}", e))?;
+            if !out.status.success() {
+                return Err(format!("ws-bridge send: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()));
+            }
+            return Ok("workspace: sent".to_string());
+        }
+
+        // With attachments: one `ws-bridge upload` per file. The caption
+        // rides the FIRST file only.
+        let n = live.len();
+        for (i, path) in live.iter().enumerate() {
+            let mut args: Vec<String> = vec![
+                "upload".into(), "--conv".into(), conv.clone(),
+                "--file".into(), path.to_string_lossy().into_owned(),
+            ];
+            if i == 0 && !body.is_empty() {
+                args.push("--caption".into());
+                args.push(body.clone());
+            }
+            let out = Command::new("ws-bridge")
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|e| format!("ws-bridge spawn failed: {}", e))?;
+            if !out.status.success() {
+                return Err(format!("ws-bridge upload {}: {}", path.display(),
+                    String::from_utf8_lossy(&out.stderr).trim()));
+            }
+        }
+        Ok(format!("workspace: sent +{} file(s)", n))
+    }
+
     /// Drain delivery-status markers the relay wrote for our queued gateway
     /// replies and surface the outcome. Called from the idle loop only while
     /// `pending_gateway_replies` is non-empty (piggybacks the existing wake,
@@ -9340,6 +9441,24 @@ impl App {
                                                 }
                                             }
                                         }
+                                        DraftKind::Workspace => {
+                                            match self.send_workspace_draft(&final_content) {
+                                                Ok(msg) => {
+                                                    self.set_feedback(&msg, tc.feedback_ok);
+                                                    break;
+                                                }
+                                                Err(msg) => {
+                                                    last_send_error = Some(
+                                                        format!("Workspace send failed: {}", msg)
+                                                    );
+                                                    self.set_feedback(
+                                                        last_send_error.as_deref().unwrap_or(""),
+                                                        tc.feedback_warn,
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                        }
                                         DraftKind::Email => {}
                                     }
                                     // Block sending if any recipient is a bare short
@@ -9418,7 +9537,7 @@ impl App {
                                 "p" => {
                                     let now = database::now_secs();
                                     match self.compose_kind {
-                                        DraftKind::Slack | DraftKind::Discord | DraftKind::Weechat | DraftKind::Gateway => {
+                                        DraftKind::Slack | DraftKind::Discord | DraftKind::Weechat | DraftKind::Gateway | DraftKind::Workspace => {
                                             // The `postponed` DB table is email-
                                             // shaped (data → editor template).
                                             // Non-email drafts round-trip through
@@ -9428,6 +9547,7 @@ impl App {
                                                 DraftKind::Discord => "discord",
                                                 DraftKind::Weechat => "weechat",
                                                 DraftKind::Gateway => "gateway",
+                                                DraftKind::Workspace => "workspace",
                                                 _ => "eml",
                                             };
                                             let dir = drafts_drop_dir();
