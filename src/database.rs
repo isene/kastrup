@@ -56,6 +56,41 @@ pub struct View {
 /// Thread-safe wrapper around the SQLite database
 pub struct Database {
     pub conn: Mutex<Connection>,
+    /// A small pool of independent connections used for *reads*. A
+    /// connection is checked out only for the duration of one query, so a
+    /// slow read (a cold-page `pread64` in D-state) holds nothing but its
+    /// own connection and can never block the UI's reads or the writer.
+    /// This is the fix for the "single SQLite mutex held across a slow read
+    /// freezes the whole UI" stall: more connections, not finer locking.
+    read_pool: Mutex<Vec<Connection>>,
+}
+
+/// A read connection checked out of `Database::read_pool`. Derefs to the
+/// underlying `Connection`, and returns it to the pool on drop. The `Shared`
+/// variant is the rare fallback to the writer connection.
+enum ReadConn<'a> {
+    Pooled { db: &'a Database, conn: Option<Connection> },
+    Shared(std::sync::MutexGuard<'a, Connection>),
+}
+
+impl std::ops::Deref for ReadConn<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        match self {
+            ReadConn::Pooled { conn, .. } => conn.as_ref().unwrap(),
+            ReadConn::Shared(g) => g,
+        }
+    }
+}
+
+impl Drop for ReadConn<'_> {
+    fn drop(&mut self) {
+        if let ReadConn::Pooled { db, conn } = self {
+            if let Some(c) = conn.take() {
+                db.read_pool.lock().unwrap().push(c);
+            }
+        }
+    }
 }
 
 /// Build a single AND-group's WHERE fragment from a Filters (ignoring
@@ -169,7 +204,7 @@ impl Database {
         if is_new {
             Self::create_schema(&conn)?;
         }
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self { conn: Mutex::new(conn), read_pool: Mutex::new(Vec::new()) })
     }
 
     /// Open an independent connection to the same DB file. WAL mode lets
@@ -181,13 +216,29 @@ impl Database {
     pub fn open_aux_connection(&self) -> Result<Connection, String> {
         let conn = Connection::open(db_path())
             .map_err(|e| format!("aux connection open: {}", e))?;
-        let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+        // query_only rejects accidental writes on a read connection; WAL is
+        // already on at the file level so reads see the latest snapshot.
+        let _ = conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA query_only=ON;");
         Ok(conn)
+    }
+
+    /// Check out an independent read connection from the pool (opening one
+    /// on demand). Returned to the pool when the guard drops. Read methods
+    /// use this instead of `self.conn.lock()` so a slow read holds only its
+    /// own connection, never the shared write mutex the UI is waiting on.
+    fn read(&self) -> ReadConn<'_> {
+        let pooled = self.read_pool.lock().unwrap().pop();
+        match pooled.or_else(|| self.open_aux_connection().ok()) {
+            Some(conn) => ReadConn::Pooled { db: self, conn: Some(conn) },
+            // Fallback (read connection couldn't be opened): use the shared
+            // one. Rare; keeps reads correct even if the pool can't grow.
+            None => ReadConn::Shared(self.conn.lock().unwrap()),
+        }
     }
 
     /// Returns true if the database was just created (no messages)
     pub fn is_empty(&self) -> bool {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read();
         conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
             .unwrap_or(0) == 0
     }
@@ -448,7 +499,7 @@ impl Database {
     /// Get messages matching filters with limit and offset.
     /// Uses light mode (substr content to 200 chars) for list display.
     pub fn get_messages(&self, filters: &Filters, limit: usize, offset: usize) -> Vec<Message> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read();
         let mut sql = String::from(
             "SELECT id, source_id, external_id, thread_id, parent_id, \
              sender, sender_name, recipients, cc, bcc, \
@@ -518,7 +569,7 @@ impl Database {
 
     /// Get a single message with full content
     pub fn get_message(&self, id: i64) -> Option<Message> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT id, source_id, external_id, thread_id, parent_id, \
              sender, sender_name, recipients, cc, bcc, \
@@ -537,7 +588,7 @@ impl Database {
 
     /// Get only the full content and html_content for a message (light-to-full upgrade)
     pub fn get_message_content(&self, id: i64) -> Option<(String, Option<String>)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read();
         Self::get_message_content_conn(&conn, id)
     }
 
@@ -607,7 +658,7 @@ impl Database {
         maildir_source_ids: &[i64],
     ) -> Vec<(serde_json::Value, i64)> {
         if maildir_source_ids.is_empty() { return Vec::new(); }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read();
         let ph: Vec<&str> = maildir_source_ids.iter().map(|_| "?").collect();
         let mut sql = format!(
             "SELECT id, metadata FROM messages \
@@ -693,7 +744,7 @@ impl Database {
         ids: &[i64],
     ) -> Vec<(serde_json::Value, i64)> {
         if ids.is_empty() { return Vec::new(); }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read();
         let ph: Vec<&str> = ids.iter().map(|_| "?").collect();
         let sql = format!(
             "SELECT id, metadata FROM messages \
@@ -756,7 +807,7 @@ impl Database {
 
     /// Get all sources, optionally enabled only
     pub fn get_sources(&self, enabled_only: bool) -> Vec<Source> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read();
         let sql = if enabled_only {
             "SELECT * FROM sources WHERE enabled = 1 ORDER BY id"
         } else {
@@ -777,7 +828,7 @@ impl Database {
 
     /// Get source stats: source_id -> (total, unread)
     pub fn get_source_stats(&self) -> HashMap<i64, (i64, i64)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read();
         let mut stmt = match conn.prepare(
             "SELECT source_id, COUNT(*) as cnt, \
              SUM(CASE WHEN read = 0 THEN 1 ELSE 0 END) as unread \
@@ -801,7 +852,7 @@ impl Database {
 
     /// Get source_id -> plugin_type map for all sources
     pub fn get_source_type_map(&self) -> HashMap<i64, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read();
         let mut stmt = match conn.prepare("SELECT id, plugin_type FROM sources") {
             Ok(s) => s,
             Err(_) => return HashMap::new(),
@@ -850,7 +901,7 @@ impl Database {
 
     /// Get overall stats: (total, unread, starred) in a single query
     pub fn get_stats(&self) -> (i64, i64, i64) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read();
         conn.query_row(
             "SELECT COUNT(*), SUM(CASE WHEN read=0 THEN 1 ELSE 0 END), \
              SUM(CASE WHEN starred=1 THEN 1 ELSE 0 END) FROM messages",
@@ -868,7 +919,7 @@ impl Database {
     /// where new messages have arrived. One query, no per-view loop
     /// on the call site.
     pub fn unread_count_by_folder(&self) -> std::collections::HashMap<String, i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read();
         let mut out = std::collections::HashMap::new();
         let mut stmt = match conn.prepare(
             "SELECT folder, COUNT(*) FROM messages \
@@ -899,7 +950,7 @@ impl Database {
     /// has unread. Same `read = 0` / no-archived-filter semantics as the
     /// folder query so the two caches agree.
     pub fn unread_count_by_source(&self) -> std::collections::HashMap<i64, i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read();
         let mut out = std::collections::HashMap::new();
         let mut stmt = match conn.prepare(
             "SELECT source_id, COUNT(*) FROM messages \
@@ -924,7 +975,7 @@ impl Database {
 
     /// Get a setting value
     pub fn get_setting(&self, key: &str) -> Option<String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read();
         conn.query_row(
             "SELECT value FROM settings WHERE key = ?", params![key], |r| r.get(0)
         ).ok()
@@ -958,7 +1009,7 @@ impl Database {
 
     /// Get folder message counts: (total, unread)
     pub fn folder_message_count(&self, folder: &str) -> (i64, i64) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read();
         conn.query_row(
             "SELECT COUNT(*), SUM(CASE WHEN read = 0 THEN 1 ELSE 0 END) FROM messages WHERE folder = ?",
             params![folder],
@@ -972,7 +1023,7 @@ impl Database {
     /// Get total+unread counts for all folders in a single grouped query.
     /// Much faster than calling folder_message_count per folder when browsing.
     pub fn all_folder_counts(&self) -> HashMap<String, (i64, i64)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read();
         let mut out = HashMap::new();
         if let Ok(mut stmt) = conn.prepare(
             "SELECT folder, COUNT(*), SUM(CASE WHEN read = 0 THEN 1 ELSE 0 END) \
@@ -1007,7 +1058,7 @@ impl Database {
 
     /// Get all views
     pub fn get_views(&self) -> Vec<View> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read();
         let mut stmt = match conn.prepare("SELECT * FROM views ORDER BY id") {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -1032,7 +1083,7 @@ impl Database {
 
     /// Get all known external_ids for a given source (used by poller to skip duplicates)
     pub fn get_known_external_ids(&self, source_id: i64) -> HashSet<String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read();
         let mut ids: HashSet<String> = HashSet::new();
         // Current messages
         if let Ok(mut stmt) = conn.prepare("SELECT external_id FROM messages WHERE source_id = ?") {
