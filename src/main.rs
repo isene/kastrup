@@ -1051,6 +1051,11 @@ struct App {
 
     tagged: HashSet<i64>,
     delete_marked: HashSet<i64>,
+    /// Ids whose deletion is queued to the async DB writer but maybe not yet
+    /// committed. A refresh that re-reads the DB filters these out so a poll
+    /// racing the write can't resurrect just-purged messages. Self-clears each
+    /// id once the DB stops returning it (delete committed).
+    pending_deletes: HashSet<i64>,
     browsed_ids: HashSet<i64>,
     unseen_ids: HashSet<i64>,
     /// A muted channel that resurfaced and whose last unread the user just
@@ -1580,6 +1585,7 @@ fn main() {
         border,
         tagged: HashSet::new(),
         delete_marked: HashSet::new(),
+        pending_deletes: HashSet::new(),
         browsed_ids: HashSet::new(),
         unseen_ids: HashSet::new(),
         mute_recheck_pending: None,
@@ -3594,6 +3600,18 @@ impl App {
     }
 
     /// Reload messages for current view without resetting cursor position.
+    /// Remove messages whose deletion is queued but not yet committed, so a
+    /// refresh racing the async writer can't resurrect them. Each id self-
+    /// clears once the DB no longer returns it (the delete committed).
+    fn drop_pending_deletes(&mut self) {
+        if self.pending_deletes.is_empty() { return; }
+        let present: HashSet<i64> = self.filtered_messages.iter().map(|m| m.id).collect();
+        self.pending_deletes.retain(|id| present.contains(id));
+        if !self.pending_deletes.is_empty() {
+            self.filtered_messages.retain(|m| !self.pending_deletes.contains(&m.id));
+        }
+    }
+
     fn refresh_current_view(&mut self) {
         let saved_id = self.filtered_messages.get(self.index).map(|m| m.id);
         let saved_index = self.index;
@@ -3607,6 +3625,7 @@ impl App {
         if let Some(ref f) = self.active_search_filter {
             let limit = self.config.load_limit;
             self.filtered_messages = self.db.get_messages(f, limit, 0);
+            self.drop_pending_deletes();
             for msg in &mut self.filtered_messages {
                 resolve_source_type(&self.source_type_map, msg);
             }
@@ -3662,6 +3681,7 @@ impl App {
 
         let limit = self.config.load_limit;
         self.filtered_messages = self.db.get_messages(&filters, limit, 0);
+        self.drop_pending_deletes();
         for msg in &mut self.filtered_messages {
             resolve_source_type(&self.source_type_map, msg);
         }
@@ -5117,6 +5137,9 @@ impl App {
         }
 
         let _ = self.write_tx.send(DbWriteOp::DeleteMessages(ids.clone()));
+        // Guard against an auto-refresh re-reading the DB before the writer
+        // commits and resurrecting these rows. Cleared per-id once gone.
+        self.pending_deletes.extend(ids.iter().copied());
         let count = ids.len();
         self.delete_marked.clear();
 
