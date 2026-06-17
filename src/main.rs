@@ -10336,7 +10336,7 @@ impl App {
             .or_else(|| att.get("filename"))
             .and_then(|v| v.as_str())
             .unwrap_or("unnamed");
-        let dest = format!("/tmp/kastrup_att_{}", name);
+        let dest = att_temp_path(name);
 
         // Remote-URL path: synthetic attachments injected by
         // `enrich_attachments_from_chat_urls` carry a `url` plus
@@ -10568,7 +10568,7 @@ sys.exit(2)
             .or_else(|| att.get("filename"))
             .and_then(|v| v.as_str())
             .unwrap_or("unnamed");
-        let tmp_dest = format!("/tmp/kastrup_att_{}", name);
+        let tmp_dest = att_temp_path(name);
 
         // Extract to tmp first
         self.extract_and_open_attachment(maildir_file, attachments, idx, false);
@@ -13118,6 +13118,22 @@ fn extract_mime_attachments(content: &str, msg_id: i64) -> Vec<serde_json::Value
         }
     }
     atts
+}
+
+/// Build a `/tmp/kastrup_att_*` path for an attachment, sanitising the
+/// filename. Attachment names can carry spaces and other shell-unsafe
+/// characters (e.g. `"202606 Workshop Agenda .pdf"`). Some sources resolve
+/// the download through an external command template, where an unquoted,
+/// space-laden path gets word-split by the shell: the file lands at the
+/// first token (extension lost) while kastrup then tries to open the full
+/// path that was never written. Collapse everything outside `[alnum].-_`
+/// to `_` so the written path and the opened path always agree, and the
+/// extension survives.
+fn att_temp_path(name: &str) -> String {
+    let safe: String = name.chars()
+        .map(|c| if c.is_alphanumeric() || ".-_".contains(c) { c } else { '_' })
+        .collect();
+    format!("/tmp/kastrup_att_{}", safe)
 }
 
 /// Quick HTML sniffer: returns true if `s` contains at least two
