@@ -9,6 +9,28 @@ pub enum PollerEvent {
     NewMessages(usize),
 }
 
+/// Hard wall-clock deadline for a single network source's sync. A healthy
+/// incremental sync finishes in a few seconds; this is the backstop for a
+/// connection that wedges after suspend/resume — half-open, where the TLS
+/// layer can swallow ureq's own read/write timeout — so one stuck source
+/// can't stall every source behind it in the sequential poll loop.
+const NETWORK_SYNC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Run `f` on a worker thread, waiting at most `deadline` for its result.
+/// Returns `None` on timeout; the orphaned worker keeps running and exits on
+/// its own once its blocking I/O finally errors (its result is discarded —
+/// `tx.send` just fails into the dropped receiver).
+fn run_with_timeout<F>(deadline: std::time::Duration, f: F) -> Option<Vec<sources::MessageData>>
+where
+    F: FnOnce() -> Vec<sources::MessageData> + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(deadline).ok()
+}
+
 /// Tri-state shared between the main poller thread and any
 /// thread that wants to wake or stop it. The poller's wait
 /// loop blocks on a condvar that observes this state:
@@ -182,26 +204,51 @@ fn poller_loop(
                     let eff_last_sync = if forced { 0 } else { last_sync };
                     sources::maildir::sync_maildir(&expanded, known, eff_last_sync)
                 }
-                "rss" => {
-                    let feeds = source.config.get("feeds")
-                        .and_then(|v| v.as_array())
-                        .cloned()
-                        .unwrap_or_default();
-                    sources::rss::sync_rss(&feeds, known)
-                }
-                "weechat" => sources::weechat::sync_weechat(&source.config, known),
-                "messenger" => sources::messenger::sync_messenger(&source.config, known),
-                "instagram" => sources::instagram::sync_instagram(&source.config, known),
-                // Phone-notification gateway (relay app) — drains inbound JSON;
-                // replaces the Marionette messenger/instagram scrapers.
-                "gateway" => sources::gateway::sync_gateway(&source.config, known),
-                "discord" => sources::discord::sync_discord(&source.config, known),
-                "slack" => sources::slack::sync_slack(&source.config, known),
-                // weechat-relay is driven by its own push
-                // supervisor (see weechat_relay::spawn_supervisor)
-                // — the poller path stays a no-op so we don't
-                // double-fetch over the network.
+                // weechat-relay is driven by its own push supervisor (see
+                // weechat_relay::spawn_supervisor) — the poller path stays a
+                // no-op so we don't double-fetch over the network.
                 "weechat-relay" => Vec::new(),
+                // Every network source runs under a hard wall-clock deadline on
+                // a worker thread. A connection that wedges after resume goes
+                // half-open and the TLS layer can swallow ureq's own read/write
+                // timeout, so without this one stuck source stalls every source
+                // behind it (Slack hangs → Gateway never polled). On deadline we
+                // abandon the worker and move on; it exits on its own once the
+                // socket finally errors, and `last_sync` is left untouched so
+                // the next cycle retries. (gateway drains local JSON and won't
+                // wedge, but the wrapper is harmless there.)
+                plugin @ ("rss" | "weechat" | "messenger" | "instagram"
+                          | "gateway" | "discord" | "slack") => {
+                    let cfg = source.config.clone();
+                    let known_snapshot = known.clone();
+                    let plugin = plugin.to_string();
+                    match run_with_timeout(NETWORK_SYNC_DEADLINE, move || {
+                        match plugin.as_str() {
+                            "rss" => {
+                                let feeds = cfg.get("feeds")
+                                    .and_then(|v| v.as_array())
+                                    .cloned()
+                                    .unwrap_or_default();
+                                sources::rss::sync_rss(&feeds, &known_snapshot)
+                            }
+                            "weechat" => sources::weechat::sync_weechat(&cfg, &known_snapshot),
+                            "messenger" => sources::messenger::sync_messenger(&cfg, &known_snapshot),
+                            "instagram" => sources::instagram::sync_instagram(&cfg, &known_snapshot),
+                            "gateway" => sources::gateway::sync_gateway(&cfg, &known_snapshot),
+                            "discord" => sources::discord::sync_discord(&cfg, &known_snapshot),
+                            "slack" => sources::slack::sync_slack(&cfg, &known_snapshot),
+                            _ => Vec::new(),
+                        }
+                    }) {
+                        Some(msgs) => msgs,
+                        None => {
+                            crate::log::info(&format!(
+                                "Poller: {} sync exceeded {}s deadline — skipping this cycle (wedged connection?)",
+                                source.name, NETWORK_SYNC_DEADLINE.as_secs()));
+                            continue;
+                        }
+                    }
+                }
                 _ => Vec::new(),
             };
 
