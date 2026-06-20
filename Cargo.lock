@@ -234,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-highlight"
-version = "0.1.6"
+version = "0.1.8"
 dependencies = [
  "fe2o3-crust",
  "regex",
@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "kastrup"
-version = "0.1.189"
+version = "0.1.191"
 dependencies = [
  "base64",
  "fe2o3-crust",
