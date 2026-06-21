@@ -194,7 +194,7 @@ pub fn queue_reply(
 ///     the id is `request` minus `.json`; `ok` maps to sent/failed.
 ///   * `<gateway>/outbox_status/<id>.json` `{id, status, reason}` — the newer
 ///     richer shape.
-pub fn poll_reply_status(config: &serde_json::Value) -> Vec<(String, String, String)> {
+pub fn poll_reply_status(config: &serde_json::Value) -> Vec<(String, String, String, String)> {
     let base = gateway_base(config);
     let mut out = Vec::new();
 
@@ -211,7 +211,8 @@ pub fn poll_reply_status(config: &serde_json::Value) -> Vec<(String, String, Str
                     if !id.is_empty() {
                         out.push((id,
                             if ok { "sent".into() } else { "failed".into() },
-                            if ok { String::new() } else { "no_live_notification".into() }));
+                            if ok { String::new() } else { "no_live_notification".into() },
+                            String::new()));
                     }
                 }
             }
@@ -229,7 +230,8 @@ pub fn poll_reply_status(config: &serde_json::Value) -> Vec<(String, String, Str
                     let id = v.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
                     let status = v.get("status").and_then(|x| x.as_str()).unwrap_or_default().to_string();
                     let reason = v.get("reason").and_then(|x| x.as_str()).unwrap_or_default().to_string();
-                    if !id.is_empty() { out.push((id, status, reason)); }
+                    let target = v.get("target").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                    if !id.is_empty() { out.push((id, status, reason, target)); }
                 }
             }
             let _ = std::fs::remove_file(&path);

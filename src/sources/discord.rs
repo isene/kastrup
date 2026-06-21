@@ -21,7 +21,7 @@ use crate::chat_send;
 /// Discord's REST API base for v10. Hardcoded to avoid a config knob.
 const API: &str = "https://discord.com/api/v10";
 
-pub fn sync_discord(_config: &serde_json::Value, known_ids: &HashSet<String>) -> Vec<MessageData> {
+pub fn sync_discord(config: &serde_json::Value, known_ids: &HashSet<String>) -> Vec<MessageData> {
     let secrets = chat_send::load_secrets();
     let Some(token) = secrets.discord_bot_token.as_ref() else {
         return Vec::new();
@@ -38,11 +38,26 @@ pub fn sync_discord(_config: &serde_json::Value, known_ids: &HashSet<String>) ->
         None => return Vec::new(),
     };
 
-    // List DM channels.
-    let channels = match list_dm_channels(&auth) {
-        Some(v) => v,
-        None => return Vec::new(),
-    };
+    // List DM channels the bot already knows. Bots can't actually enumerate
+    // their DMs (this returns empty in practice), so we also open the channel
+    // for each known peer — user IDs in ~/.kastrup/discord_dm_peers, seeded by
+    // hand and auto-appended whenever we send a bot DM. That's what lets a
+    // reply to the bot reach kastrup at all.
+    let mut channels = list_dm_channels(&auth).unwrap_or_default();
+    let mut seen_cids: HashSet<String> = channels.iter()
+        .filter_map(|c| c["id"].as_str().map(String::from)).collect();
+    for uid in load_dm_peers() {
+        if let Some(ch) = open_dm_channel(&auth, &uid) {
+            if let Some(cid) = ch["id"].as_str() {
+                if seen_cids.insert(cid.to_string()) { channels.push(ch); }
+            }
+        }
+    }
+
+    // Folder the DMs land in — defaults to PassionFruits so bot replies show in
+    // View 3 alongside the relayed Discord DMs. Override via the source config.
+    let folder = config.get("folder").and_then(|f| f.as_str())
+        .filter(|s| !s.is_empty()).unwrap_or("PassionFruits").to_string();
 
     let mut out: Vec<MessageData> = Vec::new();
     for ch in channels {
@@ -139,7 +154,7 @@ pub fn sync_discord(_config: &serde_json::Value, known_ids: &HashSet<String>) ->
                 labels: vec!["discord".to_string()],
                 attachments,
                 metadata,
-                folder: Some("Discord".to_string()),
+                folder: Some(folder.clone()),
                 thread_id: Some(cid.to_string()),
             });
         }
@@ -193,6 +208,50 @@ fn list_dm_channels(auth: &str) -> Option<Vec<serde_json::Value>> {
         .into_string().ok()?;
     let v: serde_json::Value = serde_json::from_str(&resp).ok()?;
     v.as_array().cloned()
+}
+
+/// Path to the peer file: Discord user IDs whose bot DMs we poll.
+pub fn dm_peers_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".kastrup/discord_dm_peers")
+}
+
+/// User IDs to poll for bot-DM replies. One id per line; first whitespace
+/// token wins (so `<id>  # inline note` works); blank and `#` lines skipped.
+fn load_dm_peers() -> Vec<String> {
+    std::fs::read_to_string(dm_peers_path()).ok().map(|s| {
+        s.lines().filter_map(|l| {
+            let t = l.trim();
+            if t.is_empty() || t.starts_with('#') { return None; }
+            t.split_whitespace().next().map(String::from)
+        }).collect()
+    }).unwrap_or_default()
+}
+
+/// Record a peer so its future bot-DM replies get polled. Idempotent;
+/// called from the send path on every `dm:<userId>` bot send.
+pub fn remember_dm_peer(user_id: &str) {
+    let uid = user_id.trim();
+    if uid.is_empty() || !uid.chars().all(|c| c.is_ascii_digit()) { return; }
+    if load_dm_peers().iter().any(|p| p == uid) { return; }
+    let path = dm_peers_path();
+    if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{}", uid);
+    }
+}
+
+/// Open (or fetch the existing) 1:1 DM channel for a recipient user id.
+fn open_dm_channel(auth: &str, recipient_id: &str) -> Option<serde_json::Value> {
+    let body = format!("{{\"recipient_id\":\"{}\"}}", recipient_id);
+    let resp = super::http_agent().post(&format!("{}/users/@me/channels", API))
+        .set("Authorization", auth)
+        .set("User-Agent", "kastrup (https://github.com/isene/kastrup, 0.1)")
+        .set("Content-Type", "application/json")
+        .send_string(&body).ok()?
+        .into_string().ok()?;
+    serde_json::from_str(&resp).ok()
 }
 
 fn fetch_messages(auth: &str, channel_id: &str, limit: u32) -> Option<Vec<serde_json::Value>> {

@@ -440,6 +440,8 @@ pub fn send_discord(
             .ok_or_else(|| "DISCORD_BOT_TOKEN not set".to_string())?;
         let cid = discord_create_dm(token, uid.trim())?;
         discord_post_bot_channel(token, &cid, text)?;
+        // Remember this peer so their replies to the bot get polled into View 3.
+        crate::sources::discord::remember_dm_peer(uid.trim());
         return Ok(format!("dm:{}", uid.trim()));
     }
     // Bare numeric → treat as channel id
