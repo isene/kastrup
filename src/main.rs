@@ -9085,7 +9085,7 @@ impl App {
             if let Some(target) = self.config.gateway_routes.get(&route_key).cloned() {
                 let native = format!("Channel: {}\n\n{}", target, body);
                 return self.send_discord_draft(&native)
-                    .map(|label| format!("Sent to discord {}", label));
+                    .map(|label| format!("Sent AS BOT to discord {} — not from your account; may land in their Message Requests", label));
             }
         }
 
@@ -9098,7 +9098,7 @@ impl App {
         let id = sources::gateway::queue_reply(&cfg, &platform, &thread_key, &body)?;
         let target = format!("{}:{}", platform, thread_key);
         self.pending_gateway_replies.push((id, target.clone(), std::time::Instant::now(), false));
-        Ok(format!("Queued to phone: {}", target))
+        Ok(format!("⏳ Queued to phone — awaiting delivery to {} (not sent yet)", target))
     }
 
     /// Send a workspace-kind draft via the external `ws-bridge` CLI.
@@ -9183,24 +9183,34 @@ impl App {
     /// generous window so the poll goes cold again.
     fn poll_gateway_reply_status(&mut self) {
         let cfg = self.gateway_source_config();
-        for (id, status, reason) in sources::gateway::poll_reply_status(&cfg) {
-            let Some(pos) = self.pending_gateway_replies.iter().position(|(pid, _, _, _)| *pid == id)
-            else { continue };
-            let (_, target, _, _) = self.pending_gateway_replies.remove(pos);
+        for (id, status, reason, st_target) in sources::gateway::poll_reply_status(&cfg) {
+            // Prefer the target we were tracking; fall back to the one the relay
+            // stamped on the status, so a manual send made hours later — after
+            // we stopped tracking — still reports accurately.
+            let label = match self.pending_gateway_replies.iter().position(|(pid, _, _, _)| *pid == id) {
+                Some(pos) => self.pending_gateway_replies.remove(pos).1,
+                None if !st_target.is_empty() => st_target.clone(),
+                None => continue,
+            };
             if status == "sent" {
-                self.set_feedback(&format!("Phone delivered to {}", target),
+                let how = if reason == "manual" { "you sent it manually" } else { "as you, via phone" };
+                self.set_feedback(&format!("✓ Sent to {} ({})", label, how),
                     self.config.theme_colors.feedback_ok);
             } else {
-                let why = if reason.is_empty() { "no live notification".to_string() }
-                          else { reason.replace('_', " ") };
+                let why = match reason.as_str() {
+                    "discarded" => "you discarded it".to_string(),
+                    "expired_unsent" => "expired unsent".to_string(),
+                    "" => "no live notification".to_string(),
+                    r => r.replace('_', " "),
+                };
                 self.set_feedback(
-                    &format!("Phone couldn't deliver to {} ({})", target, why),
+                    &format!("✗ NOT sent to {} ({}) — resend, or reply in the app", label, why),
                     self.config.theme_colors.feedback_warn);
             }
         }
         // No result yet after ~2 min → the relay is holding the reply (no live
-        // notification for the thread; it retries when the thread next pings).
-        // Warn once so it isn't silent, but keep tracking in case it lands.
+        // notification for the thread). Warn once (sticky, via feedback_warn) so
+        // the user knows it is NOT sent yet, but keep tracking in case it lands.
         let now = std::time::Instant::now();
         let mut held: Vec<String> = Vec::new();
         for p in self.pending_gateway_replies.iter_mut() {
@@ -9211,12 +9221,24 @@ impl App {
         }
         for target in held {
             self.set_feedback(
-                &format!("Held on phone for {} — no live notification yet; sends when the thread next pings", target),
+                &format!("⏳ Held on phone for {} — NOT sent yet (no live notification); resend or reply in the app", target),
                 self.config.theme_colors.feedback_warn);
         }
-        // Stop tracking replies the phone hasn't resolved within 10 min so the
-        // status poll goes cold. The relay may still deliver later via retry.
-        self.pending_gateway_replies.retain(|(_, _, queued, _)| now.duration_since(*queued).as_secs() < 600);
+        // A reply the phone never confirmed within the window has NO delivery
+        // receipt — treat it as NOT sent rather than silently forgetting it (the
+        // old behaviour let an undelivered reply look sent / queued forever).
+        // Report a durable failure for each so the user knows to resend, then
+        // stop tracking so the poll goes cold.
+        let expired: Vec<String> = self.pending_gateway_replies.iter()
+            .filter(|(_, _, queued, _)| now.duration_since(*queued).as_secs() >= 300)
+            .map(|(_, target, _, _)| target.clone())
+            .collect();
+        self.pending_gateway_replies.retain(|(_, _, queued, _)| now.duration_since(*queued).as_secs() < 300);
+        for target in expired {
+            self.set_feedback(
+                &format!("✗ NOT sent to {} — the phone never confirmed delivery. Resend, or reply in the app.", target),
+                self.config.theme_colors.feedback_warn);
+        }
     }
 
     /// Recall-path entry: open a previously-saved draft. Forces the
@@ -9408,7 +9430,7 @@ impl App {
                                             match self.send_discord_draft(&final_content) {
                                                 Ok(label) => {
                                                     self.set_feedback(
-                                                        &format!("Sent to discord {}", label),
+                                                        &format!("Sent AS BOT to discord {} — not from your account; may land in their Message Requests", label),
                                                         tc.feedback_ok,
                                                     );
                                                     break;
