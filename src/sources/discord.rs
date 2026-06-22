@@ -60,106 +60,172 @@ pub fn sync_discord(config: &serde_json::Value, known_ids: &HashSet<String>) -> 
         .filter(|s| !s.is_empty()).unwrap_or("PassionFruits").to_string();
 
     let mut out: Vec<MessageData> = Vec::new();
+
+    // 1:1 bot DMs (peers in ~/.kastrup/discord_dm_peers). Each peer gets its own
+    // sub-folder ("<folder>.<peer>") so it shows as a separate expandable in the
+    // view rather than merging into the base folder.
     for ch in channels {
-        let cid = match ch["id"].as_str() {
-            Some(s) => s,
-            None => continue,
-        };
-        // Build a human label for the channel (the other recipient's name).
+        let cid = match ch["id"].as_str() { Some(s) => s, None => continue };
         let peer_label = channel_peer_label(&ch, &bot_user_id);
-
-        let msgs = match fetch_messages(&auth, cid, 20) {
-            Some(v) => v,
-            None => continue,
-        };
-        for m in msgs {
+        // Fold a bot DM under the person's name (same as the phone-gateway DM
+        // folder) so the two paths for the same person merge into one thread.
+        let dm_folder = if peer_label.is_empty() { folder.clone() } else { peer_label.clone() };
+        let msgs = match fetch_messages(&auth, cid, 20) { Some(v) => v, None => continue };
+        for m in &msgs {
             let mid = m["id"].as_str().unwrap_or("");
-            if mid.is_empty() { continue; }
-            if known_ids.contains(mid) { continue; }
-
-            let author_id = m["author"]["id"].as_str().unwrap_or("").to_string();
-            // Skip messages the bot itself sent — they're already
-            // visible through the kastrup compose flow; mirroring them
-            // back into the inbox would double-count outgoing traffic.
-            if author_id == bot_user_id { continue; }
-
-            let author_name = m["author"]["global_name"].as_str()
-                .filter(|s| !s.is_empty())
-                .or_else(|| m["author"]["username"].as_str())
-                .unwrap_or("")
-                .to_string();
-            let content = m["content"].as_str().unwrap_or("").to_string();
-            let ts_iso = m["timestamp"].as_str().unwrap_or("");
-            let timestamp = parse_iso8601_to_unix(ts_iso).unwrap_or(0);
-
-            // attachments → JSON array of {filename, url, size, content_type,
-            // kastrup_remote, source_type}. kastrup_remote+source_type tell
-            // the V/v fetch path to download directly from Discord's CDN
-            // (no auth — URLs are pre-signed) instead of expecting a
-            // maildir on disk.
-            let attachments: Vec<serde_json::Value> = m["attachments"].as_array()
-                .map(|arr| arr.iter().enumerate().map(|(i, a)| {
-                    let filename = a["filename"].as_str().unwrap_or("");
-                    let ct = a["content_type"].as_str()
-                        .map(String::from)
-                        .unwrap_or_else(|| guess_content_type(filename));
-                    serde_json::json!({
-                        "filename":       filename,
-                        "url":            a["url"].as_str().unwrap_or(""),
-                        "size":           a["size"].as_i64().unwrap_or(0),
-                        "content_type":   ct,
-                        "file_id":        format!("{}_{}", mid, i),
-                        "kastrup_remote": true,
-                        "source_type":    "discord",
-                    })
-                }).collect())
-                .unwrap_or_default();
-
-            // Carry channel + author IDs in metadata so the reply
-            // path can construct a `.discord` template without
-            // re-querying Discord.
-            let metadata = serde_json::json!({
-                "discord_channel_id": cid,
-                "discord_author_id":  author_id,
-                "discord_message_id": mid,
-                "source_type":        "discord",
-            });
-
-            let subject = if content.is_empty() {
-                format!("DM from {}", author_name)
-            } else {
-                // First non-empty line of body, truncated, as a faux subject
-                let line = content.lines()
-                    .map(|l| l.trim())
-                    .find(|l| !l.is_empty())
-                    .unwrap_or(content.as_str());
-                let mut s: String = line.chars().take(80).collect();
-                if line.chars().count() > 80 { s.push('…'); }
-                s
-            };
-
-            out.push(MessageData {
-                external_id: mid.to_string(),
-                sender: author_id.clone(),
-                sender_name: Some(if author_name.is_empty() {
-                    "Discord user".to_string()
-                } else { author_name.clone() }),
-                recipients: peer_label.clone(),
-                cc: None,
-                bcc: None,
-                subject: Some(subject),
-                content,
-                html_content: None,
-                timestamp,
-                labels: vec!["discord".to_string()],
-                attachments,
-                metadata,
-                folder: Some(folder.clone()),
-                thread_id: Some(cid.to_string()),
-            });
+            if mid.is_empty() || known_ids.contains(mid) { continue; }
+            if let Some(md) = build_message(m, &bot_user_id, &peer_label, &dm_folder, cid, false) {
+                out.push(md);
+            }
         }
     }
+
+    // Configured guild channels — natively replaces the weechat / discord-irc
+    // bridge. Each line in ~/.kastrup/discord_channels is
+    // `<channel_id> <folder> [# name]`; poll each and file under its folder.
+    for (chan_id, chan_folder, chan_name) in load_channels() {
+        let msgs = match fetch_messages(&auth, &chan_id, 30) { Some(v) => v, None => continue };
+        for m in &msgs {
+            let mid = m["id"].as_str().unwrap_or("");
+            if mid.is_empty() || known_ids.contains(mid) { continue; }
+            if let Some(md) = build_message(m, &bot_user_id, &chan_name, &chan_folder, &chan_id, true) {
+                out.push(md);
+            }
+        }
+    }
+
     out
+}
+
+/// Turn one Discord message JSON into a kastrup MessageData, or None to skip
+/// (no id, or our own bot's post). `is_channel` switches the subject wording
+/// and tags metadata so the reply path posts back to the channel, not a DM.
+fn build_message(
+    m: &serde_json::Value,
+    bot_user_id: &str,
+    label: &str,
+    folder: &str,
+    cid: &str,
+    is_channel: bool,
+) -> Option<MessageData> {
+    let mid = m["id"].as_str().unwrap_or("");
+    if mid.is_empty() { return None; }
+    let author_id = m["author"]["id"].as_str().unwrap_or("").to_string();
+    // Skip our own bot's posts — they're outgoing, already shown on send.
+    if author_id == bot_user_id { return None; }
+
+    let author_name = m["author"]["global_name"].as_str()
+        .filter(|s| !s.is_empty())
+        .or_else(|| m["author"]["username"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let content = m["content"].as_str().unwrap_or("").to_string();
+    let timestamp = parse_iso8601_to_unix(m["timestamp"].as_str().unwrap_or("")).unwrap_or(0);
+
+    // attachments → JSON array; kastrup_remote+source_type tell the V/v fetch
+    // path to pull straight from Discord's CDN (pre-signed URLs).
+    let attachments: Vec<serde_json::Value> = m["attachments"].as_array()
+        .map(|arr| arr.iter().enumerate().map(|(i, a)| {
+            let filename = a["filename"].as_str().unwrap_or("");
+            let ct = a["content_type"].as_str().map(String::from)
+                .unwrap_or_else(|| guess_content_type(filename));
+            serde_json::json!({
+                "filename": filename,
+                "url": a["url"].as_str().unwrap_or(""),
+                "size": a["size"].as_i64().unwrap_or(0),
+                "content_type": ct,
+                "file_id": format!("{}_{}", mid, i),
+                "kastrup_remote": true,
+                "source_type": "discord",
+            })
+        }).collect())
+        .unwrap_or_default();
+
+    // Channel + author IDs let the reply path build a `.discord` template
+    // (channel:<id> for channels, dm:<author> for DMs) without re-querying.
+    let metadata = serde_json::json!({
+        "discord_channel_id": cid,
+        "discord_author_id": author_id.clone(),
+        "discord_message_id": mid,
+        "source_type": "discord",
+        "is_channel": is_channel,
+    });
+
+    let subject = if content.is_empty() {
+        if is_channel { format!("{} in {}", author_name, label) }
+        else { format!("DM from {}", author_name) }
+    } else {
+        let line = content.lines().map(|l| l.trim()).find(|l| !l.is_empty())
+            .unwrap_or(content.as_str());
+        let mut s: String = line.chars().take(80).collect();
+        if line.chars().count() > 80 { s.push('…'); }
+        s
+    };
+
+    Some(MessageData {
+        external_id: mid.to_string(),
+        sender: author_id.clone(),
+        sender_name: Some(if author_name.is_empty() { "Discord user".to_string() } else { author_name }),
+        recipients: label.to_string(),
+        cc: None,
+        bcc: None,
+        subject: Some(subject),
+        content,
+        html_content: None,
+        timestamp,
+        labels: vec!["discord".to_string()],
+        attachments,
+        metadata,
+        folder: Some(folder.to_string()),
+        thread_id: Some(cid.to_string()),
+    })
+}
+
+/// The folder a configured channel maps to — used to attach an outbound row
+/// (a message we just sent) to the right thread.
+pub fn folder_for_channel(channel_id: &str) -> Option<String> {
+    load_channels().into_iter().find(|(id, _, _)| id == channel_id).map(|(_, f, _)| f)
+}
+
+/// Best-effort display name for a Discord user id, for the folder of an
+/// outbound DM (so it lands in the same thread as the incoming DMs).
+pub fn peer_name(user_id: &str) -> Option<String> {
+    let secrets = crate::chat_send::load_secrets();
+    let token = secrets.discord_bot_token.as_ref()?;
+    let auth = if token.starts_with("Bot ") || token.starts_with("Bearer ") {
+        token.clone()
+    } else { format!("Bot {}", token) };
+    let resp = super::http_agent().get(&format!("{}/users/{}", API, user_id))
+        .set("Authorization", &auth)
+        .set("User-Agent", "kastrup (https://github.com/isene/kastrup, 0.1)")
+        .call().ok()?
+        .into_string().ok()?;
+    let v: serde_json::Value = serde_json::from_str(&resp).ok()?;
+    v["global_name"].as_str().filter(|s| !s.is_empty())
+        .or_else(|| v["username"].as_str())
+        .map(String::from)
+}
+
+/// Guild channels to mirror, from ~/.kastrup/discord_channels. One per line:
+/// `<channel_id> <folder> [# display name]`. Returns (id, folder, name).
+fn load_channels() -> Vec<(String, String, String)> {
+    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".kastrup/discord_channels");
+    std::fs::read_to_string(path).ok().map(|s| {
+        s.lines().filter_map(|l| {
+            let t = l.trim();
+            if t.is_empty() || t.starts_with('#') { return None; }
+            let (cfg, name) = match t.split_once('#') {
+                Some((a, b)) => (a.trim(), b.trim().to_string()),
+                None => (t, String::new()),
+            };
+            let mut it = cfg.split_whitespace();
+            let id = it.next()?.to_string();
+            let folder = it.next().unwrap_or("Discord").to_string();
+            let name = if name.is_empty() { folder.clone() } else { name };
+            Some((id, folder, name))
+        }).collect()
+    }).unwrap_or_default()
 }
 
 fn fetch_self_id(auth: &str) -> Option<String> {

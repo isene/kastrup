@@ -7788,6 +7788,35 @@ impl App {
             }
         }
 
+        // Discord (native bot). A channel reply posts inline via channel:<id> —
+        // exactly what the weechat/discord-irc bridge did, as the bot in the
+        // channel. A DM reply posts via dm:<author> (the bot-DM path).
+        if msg.source_type == "discord" {
+            let chan = msg.metadata.get("discord_channel_id").and_then(|v| v.as_str()).unwrap_or("");
+            let author = msg.metadata.get("discord_author_id").and_then(|v| v.as_str()).unwrap_or("");
+            let is_channel = msg.metadata.get("is_channel").and_then(|v| v.as_bool()).unwrap_or(false);
+            let target = if is_channel && !chan.is_empty() {
+                format!("channel:{}", chan)
+            } else if !author.is_empty() {
+                format!("dm:{}", author)
+            } else if !chan.is_empty() {
+                format!("channel:{}", chan)
+            } else {
+                self.set_feedback("Discord reply: message missing channel/author",
+                    self.config.theme_colors.feedback_warn);
+                return;
+            };
+            let label = msg.recipients.clone();
+            self.set_feedback(
+                &format!("Reply to {} (Discord)", if label.is_empty() { target.clone() } else { label }),
+                self.config.theme_colors.feedback_info);
+            self.compose_kind = DraftKind::Discord;
+            let template = format!("Channel: {}\n\n", target);
+            self.run_editor_compose_at_full(&template, Some(3), Some(1), true);
+            self.compose_kind = DraftKind::Email;
+            return;
+        }
+
         // Phone gateway reply (Instagram / Messenger / WhatsApp / Telegram
         // / Signal / SMS). The reply target is the thread_key the phone
         // captured; the relay matches it to a live notification (chat
@@ -8960,6 +8989,68 @@ impl App {
     /// Attach: headers (one per line, ~ expanded) upload alongside the
     /// message body via a single multipart POST so the file(s) and the
     /// caption appear as one Discord message instead of two.
+    /// Make a just-sent Discord message visible. We send via the bot, and the
+    /// ingest path deliberately skips the bot's own posts (anti-echo), so an
+    /// outbound message would otherwise never appear in the thread. Insert the
+    /// row here, at send time, so a `channel:`/`dm:` send shows immediately.
+    fn record_outbound_discord(&mut self, draft: &str) {
+        let Some(target) = parse_chat_channel(draft) else { return };
+        let body = parse_chat_body(draft);
+        if body.trim().is_empty() { return; }
+        let target = target.trim();
+
+        let (folder, channel_id, is_channel) =
+            if let Some(cid) = target.strip_prefix("channel:") {
+                let cid = cid.trim().to_string();
+                let folder = crate::sources::discord::folder_for_channel(&cid)
+                    .unwrap_or_else(|| "Discord".to_string());
+                (folder, cid, true)
+            } else if let Some(uid) = target.strip_prefix("dm:") {
+                let uid = uid.trim().to_string();
+                let folder = crate::sources::discord::peer_name(&uid).unwrap_or_else(|| uid.clone());
+                (folder, uid, false)
+            } else {
+                return; // webhook — no thread to attach to
+            };
+
+        let src_id = self.sources_list.iter().find(|s| s.plugin_type == "discord").map(|s| s.id)
+            .or_else(|| self.db.get_sources(false).iter().find(|s| s.plugin_type == "discord").map(|s| s.id))
+            .unwrap_or(0);
+        if src_id == 0 { return; }
+
+        let now = crate::database::now_secs();
+        let subject = body.lines().map(|l| l.trim()).find(|l| !l.is_empty())
+            .map(|l| { let mut s: String = l.chars().take(80).collect();
+                       if l.chars().count() > 80 { s.push('…'); } s })
+            .unwrap_or_default();
+
+        let md = crate::sources::MessageData {
+            external_id: format!("out-discord-{}-{}", channel_id, now),
+            sender: "me".to_string(),
+            sender_name: Some("GeirIsene".to_string()),
+            recipients: folder.clone(),
+            cc: None, bcc: None,
+            subject: Some(subject),
+            content: body,
+            html_content: None,
+            timestamp: now,
+            labels: vec!["discord".to_string()],
+            attachments: vec![],
+            metadata: serde_json::json!({
+                "discord_channel_id": channel_id,
+                "source_type": "discord",
+                "is_channel": is_channel,
+                "platform": "discord",
+                "outbound": true,
+            }),
+            folder: Some(folder),
+            thread_id: Some(channel_id),
+        };
+        self.db.insert_message(src_id, &md);
+        self.messages_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.refresh_current_view();
+    }
+
     fn send_discord_draft(&self, data: &str) -> Result<String, String> {
         let target = parse_chat_channel(data)
             .ok_or_else(|| "missing Channel: header".to_string())?;
@@ -9429,8 +9520,11 @@ impl App {
                                         DraftKind::Discord => {
                                             match self.send_discord_draft(&final_content) {
                                                 Ok(label) => {
+                                                    // Ingest skips our own bot's posts, so the
+                                                    // send is otherwise invisible — record it now.
+                                                    self.record_outbound_discord(&final_content);
                                                     self.set_feedback(
-                                                        &format!("Sent AS BOT to discord {} — not from your account; may land in their Message Requests", label),
+                                                        &format!("Sent to discord {}", label),
                                                         tc.feedback_ok,
                                                     );
                                                     break;
