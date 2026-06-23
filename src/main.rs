@@ -1192,59 +1192,6 @@ fn ensure_discord_source(db: &Arc<Database>) {
 }
 
 /// Auto-register a Weechat-Relay source if the connection triplet is
-/// Supervise a long-lived external `listen` command — a realtime push
-/// source such as `ws-bridge listen`. The child writes new rows straight
-/// into kastrup.db and prints one line per change to stdout; we read
-/// those lines and flip `messages_dirty` so the periodic refresh tick
-/// surfaces the externally-inserted rows. Event-driven: this replaces a
-/// per-minute `sync` fork with one held connection + a thread blocked on
-/// read(). The child is spawned with PR_SET_PDEATHSIG so it dies with
-/// kastrup (normal quit, crash, or SIGKILL — no orphaned listener), and
-/// is respawned with escalating backoff if it exits.
-fn spawn_listen_supervisor(cmd: String, messages_dirty: Arc<AtomicBool>) {
-    std::thread::spawn(move || {
-        use std::io::BufRead;
-        const BACKOFF: [u64; 5] = [2, 5, 15, 30, 60];
-        let mut fails = 0usize;
-        loop {
-            let started = std::time::Instant::now();
-            let mut command = std::process::Command::new("sh");
-            command
-                .arg("-c").arg(&cmd)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null());
-            #[cfg(target_os = "linux")]
-            unsafe {
-                use std::os::unix::process::CommandExt;
-                command.pre_exec(|| {
-                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0);
-                    Ok(())
-                });
-            }
-            match command.spawn() {
-                Ok(mut child) => {
-                    if let Some(out) = child.stdout.take() {
-                        for line in std::io::BufReader::new(out).lines() {
-                            match line {
-                                Ok(_) => messages_dirty.store(true, Ordering::Relaxed),
-                                Err(_) => break,
-                            }
-                        }
-                    }
-                    let _ = child.wait();
-                }
-                Err(e) => log::info(&format!("listen supervisor: spawn failed: {}", e)),
-            }
-            // Reset backoff after a healthy run; otherwise escalate.
-            if started.elapsed().as_secs() >= 60 { fails = 0; }
-            let delay = BACKOFF[fails.min(BACKOFF.len() - 1)];
-            fails += 1;
-            std::thread::sleep(std::time::Duration::from_secs(delay));
-        }
-    });
-}
-
 /// present in `~/.kastrup/.env`. Mirrors live IRC + Slack channels +
 /// Discord-bridge + Matrix rooms (anything weechat sees) into kastrup
 /// as DB messages, one folder per buffer. As of M5, transport is a
@@ -1453,16 +1400,6 @@ fn main() {
             db.clone(), sid, messages_dirty.clone(),
             nick_lists.clone(), subscribed_buffers.clone(), relay_kill.clone(),
         );
-    }
-    // Realtime push sources: any plugin configured with a `listen` command
-    // (e.g. workspace → `ws-bridge listen`) runs as a long-lived child that
-    // writes into kastrup.db and prints a line per change; we flip
-    // messages_dirty on each so the 5s tick surfaces the new rows. This is
-    // the event-driven replacement for per-minute `sync` polling.
-    for (_plugin, actions) in &config.senders {
-        if let Some(listen_cmd) = actions.get("listen") {
-            spawn_listen_supervisor(listen_cmd.clone(), messages_dirty.clone());
-        }
     }
     // Editor completion socket at ~/.kastrup/completion.sock.
     // Blocking accept loop on a worker thread; only consumes cycles
