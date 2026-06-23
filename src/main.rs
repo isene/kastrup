@@ -1954,6 +1954,7 @@ impl App {
             "N" => { self.switch_to_view("N"); }
             "S" => { self.search_command(); }
             "C-S" => { self.show_sources(); }
+            "C-W" => { self.show_views_screen(); }
             "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
                 self.switch_to_view(key);
             }
@@ -5268,7 +5269,15 @@ impl App {
         let hint: String = keys.iter()
             .map(|k| {
                 let v = &shortcuts[*k];
-                let short = v.rsplit('.').next().unwrap_or(v);
+                // Show the last two path elements so e.g.
+                // AA.Customers.Dualog.Archive reads as Dualog.Archive and the
+                // several *.Archive targets stay distinguishable.
+                let parts: Vec<&str> = v.split('.').collect();
+                let short = if parts.len() > 2 {
+                    parts[parts.len() - 2..].join(".")
+                } else {
+                    v.to_string()
+                };
                 format!("s{}:{}", k, short)
             })
             .collect::<Vec<_>>()
@@ -5867,6 +5876,7 @@ impl App {
   A              All messages\n\
   N              New (unread)\n\
   Ctrl-S         Sources management\n\
+  Ctrl-W         Views overview\n\
   0-9            Custom views\n\
   F1-F12         Extended views\n\
   F              Favorites browser\n\
@@ -5939,6 +5949,94 @@ impl App {
         self.right.set_text(&help);
         self.right.ix = 0;
         self.right.full_refresh();
+    }
+
+    /// Read-only Views overview rendered into the right pane (like
+    /// `show_help`). Triggered by `Ctrl-W` or `:views`. Lists every
+    /// view's key, name and a compact description of what it matches,
+    /// so the whole layout is visible at a glance for rearranging.
+    fn show_views_screen(&mut self) {
+        // Order: built-ins (A/N/*), then digit views 0-9, then F-keys,
+        // then anything else — so the list reads in key order, not DB id.
+        fn sort_key(key: &str) -> (u8, i64, String) {
+            match key {
+                "A" => (0, 0, String::new()),
+                "N" => (0, 1, String::new()),
+                "*" => (0, 2, String::new()),
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_digit() =>
+                    (1, (k.as_bytes()[0] - b'0') as i64, String::new()),
+                k if k.len() > 1 && k.starts_with('F')
+                    && k[1..].chars().all(|c| c.is_ascii_digit()) =>
+                    (2, k[1..].parse::<i64>().unwrap_or(0), String::new()),
+                k => (3, 0, k.to_string()),
+            }
+        }
+        let warn = self.config.theme_colors.feedback_warn;
+        let mut views = self.db.get_views();
+        views.sort_by_key(|v| sort_key(v.key_binding.as_deref().unwrap_or("")));
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(style::bold("Kastrup - Views"));
+        lines.push(String::new());
+        lines.push(style::fg("  Key  View                Matches", warn));
+        for v in &views {
+            let key = v.key_binding.clone().unwrap_or_else(|| "-".into());
+            let summary = self.summarize_view_filter(&v.filters);
+            lines.push(format!("  {} {:<19} {}",
+                style::fg(&format!("{:<3}", key), warn), v.name, summary));
+        }
+        lines.push(String::new());
+        lines.push(style::fg(
+            "  (read-only — switch with a view key, or open a message to dismiss)",
+            warn));
+        self.right.set_text(&lines.join("\n"));
+        self.right.ix = 0;
+        self.right.full_refresh();
+    }
+
+    /// Compact human description of a view's `filters` JSON for the
+    /// Views overview. Handles a bare rules array, a
+    /// `{branches:[{rules}]}` OR-set, or `{}` (all). Maps `source_id`
+    /// to the source name.
+    fn summarize_view_filter(&self, filters_json: &str) -> String {
+        let parsed: serde_json::Value =
+            serde_json::from_str(filters_json).unwrap_or(serde_json::Value::Null);
+        let sources = &self.sources_list;
+        let describe = |rules: &[serde_json::Value]| -> String {
+            rules.iter().map(|r| {
+                let f = r.get("field").and_then(|x| x.as_str()).unwrap_or("?");
+                let op = r.get("op").and_then(|x| x.as_str()).unwrap_or("=");
+                let raw = match r.get("value") {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(serde_json::Value::Bool(b)) => b.to_string(),
+                    Some(other) => other.to_string(),
+                    None => String::new(),
+                };
+                if f == "source_id" {
+                    if let Ok(id) = raw.parse::<i64>() {
+                        if let Some(s) = sources.iter().find(|s| s.id == id) {
+                            return format!("src:{}", s.name);
+                        }
+                    }
+                    return format!("src:{}", raw);
+                }
+                let val = if raw.chars().count() > 28 {
+                    format!("{}…", raw.chars().take(28).collect::<String>())
+                } else { raw };
+                format!("{}{}{}", f, if op == "like" { "~" } else { "=" }, val)
+            }).collect::<Vec<_>>().join(" & ")
+        };
+        if let Some(branches) = parsed.get("branches").and_then(|b| b.as_array()) {
+            branches.iter()
+                .filter_map(|b| b.get("rules").and_then(|r| r.as_array()))
+                .map(|r| describe(r))
+                .collect::<Vec<_>>().join("  |  ")
+        } else if let Some(rules) = parsed.as_array() {
+            describe(rules)
+        } else if let Some(rules) = parsed.get("rules").and_then(|r| r.as_array()) {
+            describe(rules)
+        } else {
+            "all messages".into()
+        }
     }
 
     fn handle_resize(&mut self) {
@@ -11715,6 +11813,7 @@ impl App {
                 }
             }
             "triage" => { self.show_triage_history(); }
+            "views" => { self.show_views_screen(); }
             "q" | "quit" => {
                 if self.pending_send.is_some() {
                     self.set_feedback(
