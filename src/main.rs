@@ -1815,8 +1815,21 @@ fn main() {
                 // doesn't always trip the dirty flag.
                 if app.last_highlight_refresh.elapsed().as_secs() >= 5 {
                     app.last_highlight_refresh = std::time::Instant::now();
-                    app.unread_cache = app.db.unread_count_by_folder();
-                    app.source_unread_cache = app.db.unread_count_by_source();
+                    let new_unread = app.db.unread_count_by_folder();
+                    let new_src_unread = app.db.unread_count_by_source();
+                    // External writers (the systemd ws-bridge-listen writing
+                    // Workspace rows straight into kastrup.db) don't trip
+                    // messages_dirty, so the gated list refresh above never
+                    // fires for them. This unread requery already runs on the
+                    // existing loop wake — if its result changed, an external
+                    // insert landed, so flag dirty and the next gated refresh
+                    // surfaces it. No new query / timer / wakeup: idle cost is
+                    // one in-memory comparison.
+                    if new_unread != app.unread_cache || new_src_unread != app.source_unread_cache {
+                        app.messages_dirty.store(true, Ordering::Relaxed);
+                    }
+                    app.unread_cache = new_unread;
+                    app.source_unread_cache = new_src_unread;
                     app.render_top_bar();
                 }
                 // Periodic stuck-maildir reconcile. A read whose new/→cur/
