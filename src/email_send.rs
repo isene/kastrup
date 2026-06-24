@@ -1,3 +1,7 @@
+// Also #[path]-included by src/bin/email_send_test.rs, which exercises only
+// a subset (send_email_gmail/default_safedir); the rest is used by the main
+// kastrup binary, so it's "dead" only from the test binary's point of view.
+#![allow(dead_code)]
 //! Native-Rust SMTP send for Gmail via XOAUTH2.
 //!
 //! Replaces the shell-out to `~/bin/gmail_smtp` (Ruby + Python
