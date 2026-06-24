@@ -77,6 +77,9 @@ pub enum Object {
 /// `"buffer"` or `"buffer/own_lines/last_line/data"`); the per-item
 /// `ptrs` mirror that path. `keys` defines the field name + type for
 /// each entry in `items`.
+// Wire-model from the weechat relay hdata frame; `path`/`keys` are parsed
+// from the header but only `items` is consumed downstream.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Hdata {
     pub path: String,

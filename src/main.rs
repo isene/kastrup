@@ -19,7 +19,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 
-/// Background DB write operations (fire-and-forget from main thread)
+/// Background DB write operations (fire-and-forget from main thread).
+/// Some variants (ToggleStar, UpdateFolder/Labels/Metadata,
+/// MarkAllReadBulk) are the async-writer surface for ops the current
+/// callers perform via direct single-row db calls; kept as the canonical
+/// write API even though those callers don't route through here today.
+#[allow(dead_code)]
 enum DbWriteOp {
     MarkRead(i64),
     MarkUnread(i64),
@@ -1007,8 +1012,6 @@ struct App {
     config: Config,
     source_type_map: HashMap<i64, String>,
 
-    // Stats cache with TTL
-    stats_cache: Option<(std::time::Instant, (i64, i64, i64))>,
     last_db_refresh: std::time::Instant,
     /// Last time the periodic stuck-maildir reconcile ran (see the main
     /// loop). Throttles it to ~once every 2 min on the loop's existing
@@ -1563,7 +1566,6 @@ fn main() {
         db,
         config,
         source_type_map,
-        stats_cache: None,
         last_db_refresh: std::time::Instant::now(),
         last_reconcile: std::time::Instant::now(),
         pending_gateway_replies: Vec::new(),
@@ -2192,17 +2194,6 @@ impl App {
 // --- Rendering ---
 
 impl App {
-    fn cached_stats(&mut self) -> (i64, i64, i64) {
-        if let Some((time, stats)) = &self.stats_cache {
-            if time.elapsed().as_secs() < 5 {
-                return *stats;
-            }
-        }
-        let stats = self.db.get_stats();
-        self.stats_cache = Some((std::time::Instant::now(), stats));
-        stats
-    }
-
     fn render_all(&mut self) {
         self.render_top_bar();
         if self.in_source_view {
@@ -2755,7 +2746,6 @@ impl App {
                         m.read = true;
                     }
                 }
-                self.stats_cache = None; // Invalidate stats
                 // If this read happened inside a muted channel that had
                 // resurfaced, arm a deferred re-hide. We don't rebuild here:
                 // the rest of this function still draws the right pane from
@@ -3757,7 +3747,6 @@ impl App {
             return;
         }
 
-        self.stats_cache = None;
         self.render_all();
     }
 
@@ -6822,7 +6811,6 @@ impl App {
                     m.read = false;
                 }
             }
-            self.stats_cache = None;
             self.set_feedback("Message marked unread", self.config.theme_colors.feedback_ok);
             self.render_all();
         }
@@ -7470,23 +7458,7 @@ impl App {
     }
 
     /// Get the SMTP command for the current identity.
-    fn compose_smtp(&self) -> String {
-        if let Some(ident) = self.current_identity() {
-            if let Some(ref smtp) = ident.smtp {
-                return smtp.clone();
-            }
-        }
-        let home = std::env::var("HOME").unwrap_or_default();
-        self.config.smtp_command.replace("~/", &format!("{}/", home))
-    }
-
-    /// Ensure the selected message has full content loaded.
-    fn ensure_full_content(&mut self) {
-        if self.index >= self.filtered_messages.len() { return; }
-        self.ensure_full_content_at(self.index);
-    }
-
-    /// Like `ensure_full_content` but for an explicit `filtered_messages`
+    /// Ensure a message at an explicit `filtered_messages`
     /// index. Reply / forward must use this in threaded view, where
     /// `self.index` points into `display_messages` (which has header
     /// pseudo-rows) and the corresponding filtered_messages entry sits

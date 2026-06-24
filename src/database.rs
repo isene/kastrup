@@ -41,7 +41,9 @@ pub struct Filters {
     pub branches: Option<Vec<Filters>>,
 }
 
-/// A user-defined view from the database
+/// A user-defined view from the database. DB-model struct: fields mirror
+/// the `views` table columns; not all are read at every call site.
+#[allow(dead_code)]
 pub struct View {
     pub id: i64,
     pub name: String,
@@ -899,20 +901,6 @@ impl Database {
         );
     }
 
-    /// Get overall stats: (total, unread, starred) in a single query
-    pub fn get_stats(&self) -> (i64, i64, i64) {
-        let conn = self.read();
-        conn.query_row(
-            "SELECT COUNT(*), SUM(CASE WHEN read=0 THEN 1 ELSE 0 END), \
-             SUM(CASE WHEN starred=1 THEN 1 ELSE 0 END) FROM messages",
-            [],
-            |r| Ok((
-                r.get::<_, i64>(0).unwrap_or(0),
-                r.get::<_, Option<i64>>(1).unwrap_or(Some(0)).unwrap_or(0),
-                r.get::<_, Option<i64>>(2).unwrap_or(Some(0)).unwrap_or(0),
-            ))
-        ).unwrap_or((0, 0, 0))
-    }
 
     /// Folder → count of unread messages. Used by the top-bar
     /// view-strip badges to flag views (other than the current one)
