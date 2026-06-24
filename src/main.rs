@@ -1330,7 +1330,7 @@ fn main() {
     // ~6 lines once at startup, nothing on idle.
     let t0 = std::time::Instant::now();
     let mut phase = std::time::Instant::now();
-    let mut log_phase = |name: &str, p: &mut std::time::Instant| {
+    let log_phase = |name: &str, p: &mut std::time::Instant| {
         let now = std::time::Instant::now();
         log::info(&format!("startup phase: {} took {} ms (total {} ms)",
             name, now.duration_since(*p).as_millis(),
@@ -2045,7 +2045,6 @@ impl App {
             // UI
             "w" => { self.cycle_width(); }
             "W" => { self.cycle_width_reverse(); }
-            "D" => { self.cycle_date_format(); }
             "H" => { self.set_view_color(); }
             "P" => { self.show_preferences(); }
 
@@ -2511,28 +2510,6 @@ impl App {
             None => source_info(&msg.source_type, tc).1,
         };
 
-        // Split the display name at the LAST `.` — everything up to
-        // and including that dot is dimmed (it's the workspace /
-        // network prefix); the tail is the actual channel name and
-        // keeps the source-themed colour. No dot → no split, the
-        // whole name uses the source colour.
-        let (dim_part, chan_part) = match subject.rfind('.') {
-            Some(idx) => (&subject[..=idx], &subject[idx + 1..]),
-            None      => ("", subject),
-        };
-        let chan_styled = if selected {
-            style::underline(&style::bold(&style::fg(chan_part, channel_color)))
-        } else {
-            style::bold(&style::fg(chan_part, channel_color))
-        };
-        let dim_styled = if dim_part.is_empty() {
-            String::new()
-        } else if selected {
-            style::underline(&style::fg(dim_part, tc.hint_fg))
-        } else {
-            style::fg(dim_part, tc.hint_fg)
-        };
-
         let lead = style::bold(&style::fg(&format!("{} {} ", arrow, icon), tc.thread));
         let suffix = style::fg(&format!(" [{}]", msg.content), tc.hint_fg);
         // During a Ctrl+U peek, tag the channels that are only visible
@@ -2550,6 +2527,41 @@ impl App {
         } else {
             String::new()
         };
+
+        // Cap the name so the whole header is exactly ONE visual row.
+        // render_message_list windows the list by item index assuming one
+        // row per item; a name wide enough to wrap added a phantom row and
+        // desynced the cursor highlight from the right-pane selection. The
+        // trailing pad below handles the short case; this is the missing
+        // pad-DOWN, and it truncates only the name so the count + unread
+        // mark survive.
+        let deco_w = crust::display_width(&lead)
+            + crust::display_width(&suffix)
+            + crust::display_width(&muted_tag)
+            + crust::display_width(&unread_mark);
+        let name = truncate_str(subject, pane_w.saturating_sub(deco_w));
+
+        // Split the display name at the LAST `.` — everything up to and
+        // including that dot is dimmed (the workspace / network prefix);
+        // the tail is the channel name and keeps the source-themed colour.
+        // No dot → no split, the whole name uses the source colour.
+        let (dim_part, chan_part) = match name.rfind('.') {
+            Some(idx) => (&name[..=idx], &name[idx + 1..]),
+            None      => ("", name.as_str()),
+        };
+        let chan_styled = if selected {
+            style::underline(&style::bold(&style::fg(chan_part, channel_color)))
+        } else {
+            style::bold(&style::fg(chan_part, channel_color))
+        };
+        let dim_styled = if dim_part.is_empty() {
+            String::new()
+        } else if selected {
+            style::underline(&style::fg(dim_part, tc.hint_fg))
+        } else {
+            style::fg(dim_part, tc.hint_fg)
+        };
+
         let content = format!("{}{}{}{}{}{}", lead, dim_styled, chan_styled, suffix, muted_tag, unread_mark);
 
         // Trailing pad so the row bg fills the pane width; padding is not
@@ -5944,7 +5956,6 @@ impl App {
   H              Set top bar (view) colour\n\
   B              Folder browser\n\
   Ctrl-B         Cycle border style\n\
-  D              Cycle date format\n\
   P              Preferences\n\
   y/Y            Copy ID / copy content\n\
   @              Address book\n\
@@ -6968,6 +6979,10 @@ impl App {
         self.handle_resize();
     }
 
+    // `dirty` is a save/discard flag set across the input loop; only the
+    // W (save) / ESC (cancel) exits are read, so per-branch sets are
+    // deliberately not all read.
+    #[allow(unused_assignments)]
     fn show_preferences(&mut self) {
         let pw = 90u16.min(self.cols.saturating_sub(2));
         let ph = 38u16.min(self.rows.saturating_sub(2));
@@ -8215,7 +8230,6 @@ impl App {
         if let Some(file) = msg.metadata.get("maildir_file").and_then(|v| v.as_str()) {
             if std::path::Path::new(file).exists() {
                 // Copy to temp with .eml extension
-                let name = msg.subject.as_deref().unwrap_or("message").replace('/', "_");
                 let eml_path = format!("/tmp/kastrup_fwd_{}.eml", msg.id);
                 let _ = std::fs::copy(file, &eml_path);
                 self.pending_forward_attachments.push(eml_path);
@@ -12946,8 +12960,6 @@ fn extract_mime_html_depth(raw: &str, depth: usize) -> Option<String> {
             let headers = &part[..hdr_end];
             let body = &part[body_start..];
             let is_qp = headers.to_lowercase().contains("quoted-printable");
-            let decoded = if is_qp { decode_quoted_printable(body) } else { body.to_string() };
-
             let headers_lower = headers.to_lowercase();
             let is_b64 = headers_lower.contains("base64");
             let is_latin1 = headers_lower.contains("iso-8859") || headers_lower.contains("windows-1252");
@@ -13923,7 +13935,6 @@ fn html_to_text(html: &str) -> String {
 
         // HTML entity decoding
         if chars[i] == '&' {
-            let rest: String = chars[i..].iter().take(10).collect();
             // Find the entity (up to ';')
             let entity_end = chars[i..].iter().take(12).position(|&c| c == ';');
             if let Some(end) = entity_end {
