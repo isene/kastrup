@@ -1,4 +1,6 @@
 /// A configured communication source (email account, Discord server, RSS feed, etc.)
+/// DB-model struct: fields mirror the `sources` table; not all are read.
+#[allow(dead_code)]
 pub struct Source {
     pub id: i64,
     pub name: String,

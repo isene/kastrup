@@ -155,6 +155,9 @@ impl ThemeColors {
 }
 
 /// A custom view definition from config
+// Parsed from kastruprc `custom_views`, kept for backward compat; the DB
+// `views` table is authoritative at runtime, so these fields aren't all read.
+#[allow(dead_code)]
 #[derive(Default, Clone)]
 pub struct ViewDef {
     pub name: String,
@@ -206,6 +209,7 @@ pub struct Config {
     pub smtp_command: String,
     pub confirm_purge: bool,
     pub load_limit: usize,
+    #[allow(dead_code)] // back-compat config surface; DB views are authoritative
     pub custom_views: HashMap<String, ViewDef>,
     pub identities: HashMap<String, Identity>,
     pub folder_hooks: Vec<(String, String)>,
