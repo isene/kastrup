@@ -3740,6 +3740,20 @@ impl App {
             self.index = saved_index.min(self.filtered_messages.len().saturating_sub(1));
         }
 
+        // The restores above clamp to filtered_messages, but in threaded
+        // mode self.index tracks display_messages (shorter when sections
+        // are collapsed). Clamp to the active list so the cursor can't be
+        // left past the end — that out-of-range index is what crashed
+        // Ctrl+Space (toggle_collapse_all) after a background refresh.
+        let active_len = if self.show_threaded {
+            self.display_messages.len()
+        } else {
+            self.filtered_messages.len()
+        };
+        if self.index >= active_len {
+            self.index = active_len.saturating_sub(1);
+        }
+
         // Skip render if nothing changed (avoids flicker on periodic refresh)
         let new_ids: Vec<i64> = self.filtered_messages.iter().map(|m| m.id).collect();
         let new_read: Vec<bool> = self.filtered_messages.iter().map(|m| m.read).collect();
@@ -4489,13 +4503,20 @@ impl App {
         // Snap the cursor to the section it was in so a follow-up
         // expand puts the user back where they were.
         let cursor_section: Option<String> = {
-            let mut ix = self.index;
+            // Clamp before indexing: a background refresh can leave
+            // self.index past the end of display_messages in threaded
+            // mode (it tracks display_messages, but refresh clamps to
+            // filtered_messages). Without this, the [ix] below panics.
+            let mut ix = self.index.min(self.display_messages.len().saturating_sub(1));
             while ix > 0 && !self.display_messages[ix].is_header { ix -= 1; }
             self.display_messages.get(ix)
                 .filter(|m| m.is_header)
                 .and_then(|m| m.thread_id.clone())
         };
         self.rebuild_display();
+        if self.index >= self.display_messages.len() {
+            self.index = self.display_messages.len().saturating_sub(1);
+        }
         if let Some(name) = cursor_section {
             if let Some(pos) = self.display_messages.iter()
                 .position(|m| m.is_header && m.thread_id.as_deref() == Some(name.as_str()))
@@ -9496,9 +9517,12 @@ impl App {
             if let Some(c) = start_col {
                 scribe_extra.push_str(&format!(" --col {}", c));
             }
-            if start_insert {
-                scribe_extra.push_str(" --insert");
-            }
+            // Every kastrup→scribe compose lands in Insert mode so the
+            // user types immediately: reply, forward, new, recalled, on
+            // any channel/template. start_insert (which still drives the
+            // vim path below) is ignored for scribe; all compose paths
+            // funnel through here.
+            scribe_extra.push_str(" --insert");
         }
         // For vim, simulate insert-after-To: with `-c startinsert` plus a
         // column move. Cheap and worth it: `m` is the daily compose path.
