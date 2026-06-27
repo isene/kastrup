@@ -109,7 +109,14 @@ pub fn sync_maildir(maildir_path: &str, known_ids: &HashSet<String>, last_sync: 
 }
 
 fn parse_maildir_file(path: &Path, folder: &str, filename: &str) -> Option<MessageData> {
-    let content = std::fs::read_to_string(path).ok()?;
+    // Read as bytes and decode lossily, NOT read_to_string: a mail with
+    // a non-UTF-8 body (charset=windows-1252 / latin-1 with 8bit transfer
+    // encoding — common in marketing mail) is invalid UTF-8, so
+    // read_to_string returns Err and the whole message was silently
+    // dropped — never ingested, while gmail-idle still counted the new/
+    // file (asmite vs kastrup unread-count mismatch). Headers are ASCII
+    // so they parse fine; lossy only touches stray body bytes.
+    let content = String::from_utf8_lossy(&std::fs::read(path).ok()?).into_owned();
 
     // Parse headers (everything before first blank line)
     let mut from = String::new();
@@ -542,5 +549,32 @@ mod tests {
     fn basename_none_when_no_epoch_anchor() {
         let s = "not-a-maildir-name";
         assert_eq!(extract_maildir_basename(s), None);
+    }
+
+    #[test]
+    fn non_utf8_body_still_parses() {
+        // windows-1252 / latin-1 8bit body: 0x92 (right single quote),
+        // 0x97 (em dash), 0xa0 (nbsp) are invalid UTF-8. read_to_string
+        // would error and drop the whole message; from_utf8_lossy keeps
+        // it. ASCII headers must still parse correctly.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"From: \"BMW UK\" <bmwuk@service.bmw.com>\r\n");
+        bytes.extend_from_slice(b"Subject: Your BMW is in need of attention\r\n");
+        bytes.extend_from_slice(b"Message-ID: <abc123@service.bmw.com>\r\n");
+        bytes.extend_from_slice(b"Date: Sat, 27 Jun 2026 15:41:42 +0100\r\n");
+        bytes.extend_from_slice(b"\r\n");
+        bytes.extend_from_slice(b"Hello\x92 world \x97 done\xa0now");
+
+        let dir = std::env::temp_dir().join("kastrup_w1252_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let fp = dir.join("1782571311.test_1.host:2,");
+        std::fs::write(&fp, &bytes).unwrap();
+
+        let msg = parse_maildir_file(&fp, "Geir", "1782571311.test_1.host:2,");
+        let _ = std::fs::remove_file(&fp);
+
+        let msg = msg.expect("non-UTF-8 mail must still parse (not be dropped)");
+        assert_eq!(msg.subject.as_deref(), Some("Your BMW is in need of attention"));
+        assert!(msg.sender.contains("bmwuk@service.bmw.com"));
     }
 }

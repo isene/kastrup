@@ -142,9 +142,17 @@ fn poller_loop(
     // orphaned (the bug: inotify wake skipped by the 5 s gate, then
     // the next timeout poll advances last_sync past the file's dir
     // mtime → sync_maildir mtime-skips it forever until the next
-    // delivery bumps the dir). First iteration is unforced (normal
-    // startup gating / last_sync from DB).
-    let mut forced = false;
+    // delivery bumps the dir).
+    //
+    // The first iteration is ALSO forced (last_sync=0, no mtime gate):
+    // a mail that was skipped or dropped on an earlier run (mtime-gate
+    // race, or a parse failure now fixed) sits in new/ with a dir mtime
+    // ≤ the stored last_sync, so a gated startup scan would never re-read
+    // it. One full scan at boot re-examines every dir so such backlog
+    // gets ingested (known_ids dedups everything already in the DB).
+    // Runs on the background poller thread, off the UI paint path, so it
+    // adds no startup latency — the heavier walk is paid once per launch.
+    let mut forced = true;
 
     loop {
         if std::time::Instant::now() >= next_mem_log {
