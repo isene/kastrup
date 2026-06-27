@@ -1087,6 +1087,11 @@ struct App {
 
     showing_image: bool,
     right_pane_msg_id: Option<i64>,
+    /// True only while a background refresh (refresh_current_view) is
+    /// repainting. Auto-mark-read in render_message_content is gated off
+    /// it: a new message that lands under a STATIONARY cursor must not be
+    /// marked read — only an explicit user navigation onto it marks it.
+    suppress_automark_read: bool,
     /// Cached rendered body for the most-recent message rendered in the
     /// right pane. Re-rendering the SAME message (cursor bounce, resize,
     /// return-from-editor) reuses this instead of re-running the full
@@ -1599,6 +1604,7 @@ fn main() {
         feedback_clear_on_key: false,
         showing_image: false,
         right_pane_msg_id: None,
+        suppress_automark_read: false,
             body_cache: None,
         pending_forward_ids: Vec::new(),
         pending_forward_attachments: Vec::new(),
@@ -2735,11 +2741,17 @@ impl App {
             self.filtered_messages.get(self.index)
         };
         if let Some(msg) = msg_ref {
-            // Clear unseen protection if user navigated away and came back
-            if self.unseen_ids.contains(&msg.id) && self.right_pane_msg_id != Some(msg.id) {
+            // Clear unseen protection if user navigated away and came back.
+            // Skipped during a background refresh: when a new message lands
+            // under a stationary cursor, right_pane_msg_id still points at the
+            // PREVIOUS message, so this heuristic would mistake "arrived here"
+            // for "navigated here" and wrongly mark the new message read.
+            if !self.suppress_automark_read
+                && self.unseen_ids.contains(&msg.id) && self.right_pane_msg_id != Some(msg.id) {
                 self.unseen_ids.remove(&msg.id);
             }
-            if !msg.read && !msg.is_header && msg.id > 0 && !self.unseen_ids.contains(&msg.id) {
+            if !self.suppress_automark_read
+                && !msg.read && !msg.is_header && msg.id > 0 && !self.unseen_ids.contains(&msg.id) {
                 let id = msg.id;
                 let metadata = msg.metadata.clone();
                 let folder = msg.folder.clone();
@@ -3680,7 +3692,9 @@ impl App {
             self.sort_messages();
             self.rebuild_display();
             self.left.full_refresh();
+            self.suppress_automark_read = true;
             self.render_all();
+            self.suppress_automark_read = false;
             return;
         }
 
@@ -3771,7 +3785,9 @@ impl App {
             return;
         }
 
+        self.suppress_automark_read = true;
         self.render_all();
+        self.suppress_automark_read = false;
     }
 
     fn show_sources(&mut self) {
