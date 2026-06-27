@@ -1829,6 +1829,16 @@ fn main() {
                     // one in-memory comparison.
                     if new_unread != app.unread_cache || new_src_unread != app.source_unread_cache {
                         app.messages_dirty.store(true, Ordering::Relaxed);
+                        // Unread changed from a source that bypasses the
+                        // DbWriteOp counts_dirty gate (poller new mail,
+                        // external/maildir writers marking read). Those never
+                        // rewrite the asmite count file, so ~/.mail drifts
+                        // until a UI op or restart. Rewrite it here — only on
+                        // an actual change, so idle cost stays zero.
+                        if let Some(ref cfg) = app.mailfile_cfg {
+                            let counts = app.db.all_folder_counts();
+                            mailfile::write_count_file(cfg, &counts);
+                        }
                     }
                     app.unread_cache = new_unread;
                     app.source_unread_cache = new_src_unread;
