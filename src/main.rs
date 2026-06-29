@@ -7936,7 +7936,14 @@ impl App {
         // Discord (native bot). A channel reply posts inline via channel:<id> —
         // exactly what the weechat/discord-irc bridge did, as the bot in the
         // channel. A DM reply posts via dm:<author> (the bot-DM path).
-        if msg.source_type == "discord" {
+        //
+        // Skip gateway-relayed Discord: resolve_source_type maps a gateway
+        // message with platform=discord to source_type "discord", but the
+        // phone relay only captured a display name — there's no
+        // discord_channel_id/author_id for the bot API. Let it fall through
+        // to the gateway reply path below (reply via the live notification).
+        if msg.source_type == "discord"
+            && msg.metadata.get("source").and_then(|v| v.as_str()) != Some("gateway") {
             let chan = msg.metadata.get("discord_channel_id").and_then(|v| v.as_str()).unwrap_or("");
             let author = msg.metadata.get("discord_author_id").and_then(|v| v.as_str()).unwrap_or("");
             let is_channel = msg.metadata.get("is_channel").and_then(|v| v.as_bool()).unwrap_or(false);
