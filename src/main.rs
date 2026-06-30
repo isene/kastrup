@@ -1519,7 +1519,7 @@ fn main() {
             writer_dirty.store(true, Ordering::Relaxed);
             if counts_dirty {
                 if let Some(ref cfg) = writer_mailfile {
-                    let counts = writer_db.all_folder_counts();
+                    let counts = writer_db.unread_count_by_folder();
                     mailfile::write_count_file(cfg, &counts);
                 }
             }
@@ -1669,7 +1669,7 @@ fn main() {
             .spawn(move || {
                 let t = std::time::Instant::now();
                 if let Some(cfg) = mailfile_cfg {
-                    let counts = db.all_folder_counts();
+                    let counts = db.unread_count_by_folder();
                     mailfile::write_count_file(&cfg, &counts);
                 }
                 log::info(&format!(
@@ -1839,11 +1839,12 @@ fn main() {
                         // DbWriteOp counts_dirty gate (poller new mail,
                         // external/maildir writers marking read). Those never
                         // rewrite the asmite count file, so ~/.mail drifts
-                        // until a UI op or restart. Rewrite it here — only on
-                        // an actual change, so idle cost stays zero.
+                        // until a UI op or restart. Reuse new_unread (already
+                        // computed above) — NOT all_folder_counts, whose
+                        // unfiltered full-table scan of the multi-GB DB froze
+                        // the UI thread in folio_wait on a cold page cache.
                         if let Some(ref cfg) = app.mailfile_cfg {
-                            let counts = app.db.all_folder_counts();
-                            mailfile::write_count_file(cfg, &counts);
+                            mailfile::write_count_file(cfg, &new_unread);
                         }
                     }
                     app.unread_cache = new_unread;
@@ -4892,7 +4893,10 @@ impl App {
     /// `UpdateFolder` so both paths stay in sync.
     fn sync_mail_count(&self) {
         if let Some(ref cfg) = self.mailfile_cfg {
-            let counts = self.db.all_folder_counts();
+            // unread_count_by_folder (WHERE read=0, index-backed) — NOT
+            // all_folder_counts, whose unfiltered full-table scan of the
+            // multi-GB DB stalled this (main-thread) call in folio_wait.
+            let counts = self.db.unread_count_by_folder();
             mailfile::write_count_file(cfg, &counts);
         }
     }
