@@ -24,7 +24,7 @@ Unified terminal messaging client. All your email, chat, and feeds in one TUI. B
 - **Inline images**: Kitty protocol image display (V key)
 - **Folder browser**: hierarchical Maildir folder navigation (B key)
 - **Search**: substring and notmuch full-text search
-- **AI assistant**: draft, summarize, translate, ask (I key)
+- **Claude integration**: `I` = one-shot `claude -p` ask (response in right pane), `Ctrl+A` = full Claude session; `c` = AI assistant menu (draft / summarize / translate / ask + plugins)
 - **AI triage** (z key): Claude reads the current message, optionally takes a free-text hint, and emits a JSON action plan (calendar events to [Tock](https://github.com/isene/tock) / todos to a [hyperlist](https://github.com/isene/hyperlist) at `~/.tasks/todo.hl`). Multi-pick preview before commit; rolling history via `:triage`
 - **Address book**: contact storage and lookup (@ key)
 - **Labels and tagging**: multi-select tagging, label management
@@ -111,9 +111,10 @@ cp target/release/kastrup ~/.local/bin/
 | l | Label message |
 | s | File / save message |
 | `+` | Add to favorites |
-| I | AI assistant menu (draft / summarize / translate / ask) |
-| **c** | **`:claude PROMPT`** — pipe message + custom prompt to `claude -p`, response shown in the right pane |
-| **C** | **`:chat`** — suspend kastrup, open interactive `claude` with the current message snapshot as context |
+| **I** | **`:claude PROMPT`** — one-shot: pipe message + custom prompt to `claude -p`, response shown in the right pane |
+| **Ctrl+A** | **`:chat`** — full session: suspend kastrup, open interactive `claude` with the current message snapshot as context |
+| c | AI assistant menu (draft / summarize / translate / ask + plugins) |
+| C | Full Claude session (alias of Ctrl+A) |
 | **`:`** | **Colon prompt** — type any verb explicitly: `:claude PROMPT`, `:search QUERY`, `:chat`, `:triage`, `:q`/`:quit` |
 | Esc | Clear sticky search, return to current view |
 | **z** | **AI triage** — Claude reads the current message (+ optional hint) and proposes calendar events / hyperlist todos; multi-pick preview before committing to `~/.tock/incoming/` and `~/.tasks/todo.hl` |
