@@ -131,15 +131,19 @@ fn scan_mailboxes(text: &str) -> Option<Vec<(String, String)>> {
 }
 
 /// Write `$mailfile` and `$mailfile2` from the DB unread counts.
-/// Caller passes the folder→unread map (typically `db.all_folder_counts()`)
-/// so we don't take a DB lock per mailbox.
+/// Caller passes folder→unread (`db.unread_count_by_folder()`), NOT the
+/// total counts: that query is `WHERE read=0` (index-backed, a few
+/// thousand rows) instead of a full-table GROUP BY over the whole DB.
+/// On a multi-GB DB the unfiltered scan stalled the UI thread in
+/// folio_wait on a cold page cache. Folders absent from the map have
+/// zero unread.
 pub fn write_count_file(
     cfg: &MailfileConfig,
-    counts: &std::collections::HashMap<String, (i64, i64)>,
+    unread: &std::collections::HashMap<String, i64>,
 ) {
     let mut out = String::new();
     for (label, folder) in &cfg.mailboxes {
-        let unread = counts.get(folder).map(|(_, u)| *u).unwrap_or(0);
+        let unread = unread.get(folder).copied().unwrap_or(0);
         out.push_str(label);
         out.push_str(&unread.to_string());
         out.push('\n');
@@ -190,10 +194,10 @@ $mailboxes = [
                 ("W:".into(), "Work".into()),
             ],
         };
-        let mut counts = std::collections::HashMap::new();
-        counts.insert("Personal".to_string(), (10i64, 3i64));
-        counts.insert("Work".to_string(),     (50i64, 7i64));
-        write_count_file(&cfg, &counts);
+        let mut unread = std::collections::HashMap::new();
+        unread.insert("Personal".to_string(), 3i64);
+        unread.insert("Work".to_string(),     7i64);
+        write_count_file(&cfg, &unread);
         let body = std::fs::read_to_string(&cfg.path).unwrap();
         assert_eq!(body, "P:3\nW:7\n");
         let _ = std::fs::remove_file(&cfg.path);
