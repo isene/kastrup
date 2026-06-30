@@ -2057,7 +2057,7 @@ impl App {
             "s" => { self.file_message(); }
             "+" => { self.compose_new(); }
             "k" => { self.external_react(false); }
-            "I" => { self.ai_assistant(); }
+            "I" => { self.claude_command(); }
             "Z" => { self.open_in_tock(); }
             "z" => { self.triage_message(); }
 
@@ -2067,8 +2067,12 @@ impl App {
             "H" => { self.set_view_color(); }
             "P" => { self.show_preferences(); }
 
-            // Claude integration (mirrors scribe's :claude / :chat)
-            "c" => { self.claude_command(); }
+            // Claude integration. Harmonized across Fe2O3: I = one-shot
+            // claude -p ask (above), Ctrl+A = full CC session. c keeps the
+            // richer AI menu (Draft/Summarize/Translate/Ask + plugins); C
+            // stays an alias for the session for muscle memory.
+            "C-A" => { self.chat_command(); }
+            "c" => { self.ai_assistant(); }
             "C" => { self.chat_command(); }
 
             // Vim-style `:` command prompt — types out the colon command
@@ -5981,9 +5985,10 @@ impl App {
   s              File/save message\n\
   m / M          Mute channel: until new msg / until mention\n\
   Ctrl-U         Toggle: all channels / unmuted only\n\
-  I              AI assistant / plugins\n\
-  c              :claude PROMPT (response in right pane)\n\
-  C              :chat (suspend, claude w/ message context)\n\
+  I              claude -p ask (one-shot, response in right pane)\n\
+  Ctrl-A         Full Claude session (suspend, message context)\n\
+  c              AI assistant menu (draft/summarize/translate + plugins)\n\
+  C              Full Claude session (alias of Ctrl-A)\n\
   :              Colon command (claude/chat/search/triage/q)\n\
   Esc            Clear sticky search, return to current view\n\
   z              AI triage → tock calendar or ~/.tasks/todo.hl\n\
