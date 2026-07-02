@@ -82,6 +82,13 @@ struct PendingSend {
     /// the success toast for the attach path. `None` keeps the plain
     /// "Sent to X" wording.
     attachment_count: Option<usize>,
+    /// The compose-format draft (From/To/Cc/Bcc/Reply-To/Subject + body),
+    /// NOT the assembled RFC. On send failure this is re-filed into the
+    /// `postponed` table so the draft survives (VPN down, SMTP
+    /// unreachable) and reappears in the `m` recall picker. Especially
+    /// important for a recalled draft, whose durable copy was already
+    /// consumed on load.
+    compose_draft: String,
 }
 
 /// What the SMTP worker thread reports back. `Ok(())` means the
@@ -10030,6 +10037,7 @@ impl App {
         forward_ids: Vec<i64>,
         reply_id: Option<i64>,
         attachment_count: Option<usize>,
+        compose_draft: String,
     ) -> bool {
         if self.pending_send.is_some() {
             self.set_feedback(
@@ -10059,6 +10067,7 @@ impl App {
             forward_ids,
             reply_id,
             attachment_count,
+            compose_draft,
         });
         // Persistent "Sending..." badge in the top bar — survives any
         // bottom-bar feedback the user might trigger while the send is
@@ -10113,17 +10122,36 @@ impl App {
                 }
             }
             Err(msg) => {
-                // Keep the tempfile so the user can inspect or retry.
-                // Sticky feedback so the failure doesn't auto-expire
-                // while the user is in another workspace — they'd
-                // come back, find the top-bar badge gone, and have no
-                // idea whether the send succeeded.
+                // Re-file the draft into `postponed` so a failed send (VPN
+                // down, SMTP unreachable) never loses it — it reappears in
+                // the `m` recall picker, exactly like Postpone. Critical for
+                // a recalled draft, whose durable copy was consumed on load.
+                // The compose-format text is used (NOT rfc_msg / tmpfile,
+                // which hold assembled MIME that won't round-trip).
                 log::info(&format!("SMTP send failed for {}: {}", ps.to_display, msg));
-                self.set_feedback_sticky(
-                    &format!("Send failed to {}: {} (draft kept at {})",
-                        ps.to_display, msg, ps.tmpfile),
-                    196,
-                );
+                let saved = if !ps.compose_draft.trim().is_empty() {
+                    let now = database::now_secs();
+                    let conn = self.db.conn.lock().unwrap();
+                    let ok = conn.execute(
+                        "INSERT INTO postponed (data, created_at) VALUES (?, ?)",
+                        rusqlite::params![ps.compose_draft, now],
+                    ).is_ok();
+                    drop(conn);
+                    ok
+                } else {
+                    false
+                };
+                let note = if saved {
+                    // Safely in `postponed` now — drop the ephemeral RFC tmpfile.
+                    let _ = std::fs::remove_file(&ps.tmpfile);
+                    format!("Send failed to {}: {}. Draft saved (press m to recall)",
+                        ps.to_display, msg)
+                } else {
+                    // Couldn't re-file: keep the tmpfile as a last resort.
+                    format!("Send failed to {}: {} (draft kept at {})",
+                        ps.to_display, msg, ps.tmpfile)
+                };
+                self.set_feedback_sticky(&note, 196);
             }
         }
         // Clear the in-flight badge from the top bar.
@@ -10228,7 +10256,7 @@ impl App {
         let att_n = attachments.len();
         self.spawn_smtp_send(
             from_email, recipients, to, smtp_tmpfile, rfc_msg, smtp_spec,
-            forward_ids, reply_id, Some(att_n),
+            forward_ids, reply_id, Some(att_n), content.to_string(),
         );
     }
 
@@ -10340,7 +10368,7 @@ impl App {
         let reply_id = self.pending_reply_id.take();
         self.spawn_smtp_send(
             from_email, recipients, to, smtp_tmpfile, rfc_msg, smtp_spec,
-            forward_ids, reply_id, None,
+            forward_ids, reply_id, None, content.to_string(),
         );
     }
 }
