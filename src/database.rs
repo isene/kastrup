@@ -357,6 +357,11 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_messages_read_timestamp ON messages(read, timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_folder ON messages(folder);
             CREATE INDEX IF NOT EXISTS idx_messages_folder_timestamp ON messages(folder, timestamp DESC);
+            -- Covers all_folder_counts: (folder, COUNT(*), SUM(read=0)) GROUP BY
+            -- folder. Without `read` in the index the grouping does a per-row
+            -- table lookup over the whole DB (folio_wait UI freeze on the F /
+            -- folder browser). With it the query is covering: ~30s -> <0.05s.
+            CREATE INDEX IF NOT EXISTS idx_messages_folder_read ON messages(folder, read);
             CREATE INDEX IF NOT EXISTS idx_sources_enabled ON sources(enabled);
             CREATE INDEX IF NOT EXISTS idx_sources_plugin_type ON sources(plugin_type);
             CREATE INDEX IF NOT EXISTS idx_views_key_binding ON views(key_binding);
@@ -1103,12 +1108,14 @@ impl Database {
             "INSERT OR IGNORE INTO messages (source_id, external_id, thread_id, \
              sender, sender_name, recipients, cc, bcc, subject, content, html_content, \
              timestamp, received_at, read, starred, labels, attachments, metadata, folder) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
             params![
                 source_id, msg.external_id, msg.thread_id,
                 msg.sender, msg.sender_name, recipients_json, cc_json, bcc_json,
                 msg.subject, msg.content, msg.html_content,
                 msg.timestamp, now,
+                // Sent mail is mail the user wrote — arrives already read.
+                if is_sent_folder(msg.folder.as_deref()) { 1i64 } else { 0i64 },
                 labels_json, atts_json, meta_json, msg.folder,
             ],
         );
@@ -1134,12 +1141,14 @@ impl Database {
                     "INSERT OR IGNORE INTO messages (source_id, external_id, thread_id, \
                      sender, sender_name, recipients, cc, bcc, subject, content, html_content, \
                      timestamp, received_at, read, starred, labels, attachments, metadata, folder) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
                     params![
                         source_id, msg.external_id, msg.thread_id,
                         msg.sender, msg.sender_name, recipients_json, cc_json, bcc_json,
                         msg.subject, msg.content, msg.html_content,
                         msg.timestamp, now,
+                        // Sent mail is mail the user wrote — arrives already read.
+                        if is_sent_folder(msg.folder.as_deref()) { 1i64 } else { 0i64 },
                         labels_json, atts_json, meta_json, msg.folder,
                     ],
                 );
@@ -1168,6 +1177,25 @@ impl Database {
             params![now, source_id],
         );
     }
+}
+
+/// True for a "Sent" mailbox in the common maildir / IMAP naming schemes
+/// (`Sent`, `Sent.2026-06`, `sent-mail`, `INBOX.Sent`, `[Gmail]/Sent Mail`,
+/// Outlook `Sent Items`). Mail in these folders was written by the user, so
+/// it lands already-read. Deliberately strict so folders like `consent` or
+/// `Presents` don't match.
+fn is_sent_folder(folder: Option<&str>) -> bool {
+    let Some(f) = folder else { return false };
+    let l = f.to_lowercase();
+    l == "sent"
+        || l.starts_with("sent.")   // Sent.2026-06 archive months
+        || l.starts_with("sent/")
+        || l.starts_with("sent-")   // sent-mail, sent-items
+        || l.starts_with("sent ")   // "Sent Mail", "Sent Items"
+        || l.ends_with(".sent")     // INBOX.Sent
+        || l.ends_with("/sent")     // [Gmail]/Sent
+        || l.contains("sent mail")
+        || l.contains("sent items")
 }
 
 /// Convert a rusqlite row to a Message struct
