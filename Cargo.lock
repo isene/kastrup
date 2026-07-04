@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-glow"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base64",
  "image",
@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "kastrup"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "base64",
  "fe2o3-crust",
