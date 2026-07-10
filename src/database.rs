@@ -574,6 +574,56 @@ impl Database {
         }
     }
 
+    /// Does this view's *actual* filter match at least one non-archived
+    /// unread message? Mirrors `get_messages`' WHERE exactly (every rule
+    /// dimension via `build_branch_where`, plus the archived exclusion), so
+    /// an inactive-view badge lights only when the view would really show
+    /// unread. The folder/source caches can't do this: they ignore the
+    /// per-branch rules (platform, sender, …) and archived state, so a
+    /// `folder=Virham AND platform=discord` branch lit on any unread Virham
+    /// row. Index-backed EXISTS (`idx_messages_folder_read`), LIMIT 1.
+    pub fn view_has_unread(&self, filters: &Filters) -> bool {
+        let conn = self.read();
+        let mut sql = String::from(
+            "SELECT 1 FROM messages WHERE read = 0 AND (archived = 0 OR archived IS NULL)"
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(branches) = &filters.branches {
+            if branches.is_empty() {
+                return false;
+            }
+            let mut parts: Vec<String> = Vec::with_capacity(branches.len());
+            for b in branches {
+                let (frag, params) = build_branch_where(b);
+                if frag.is_empty() {
+                    // Empty branch matches everything — short-circuit.
+                    parts.clear();
+                    break;
+                }
+                parts.push(format!("({})", frag));
+                for p in params { param_values.push(p); }
+            }
+            if !parts.is_empty() {
+                sql.push_str(&format!(" AND ({})", parts.join(" OR ")));
+            }
+        } else {
+            let (frag, params) = build_branch_where(filters);
+            if !frag.is_empty() {
+                sql.push_str(" AND ");
+                sql.push_str(&frag);
+                for p in params { param_values.push(p); }
+            }
+        }
+        sql.push_str(" LIMIT 1");
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|b| b.as_ref()).collect();
+        let found = match conn.prepare(&sql) {
+            Ok(mut stmt) => stmt.exists(param_refs.as_slice()).unwrap_or(false),
+            Err(_) => false,
+        };
+        found
+    }
+
     /// Get a single message with full content
     pub fn get_message(&self, id: i64) -> Option<Message> {
         let conn = self.read();

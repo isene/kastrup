@@ -343,32 +343,6 @@ fn build_thread_order(messages: &[Message], section_indices: &[usize]) -> Vec<(u
     out
 }
 
-/// Does `folder` pass the folder-related parts of `filters`? Used
-/// when merging the supervisor's subscribed-buffer list into the
-/// Folders view — only buffers that would have appeared as message
-/// rows under this view's filter should get an empty section.
-fn folder_matches_filter(folder: &str, filters: &Filters) -> bool {
-    // OR-of-AND-groups: any branch matching means the whole filter
-    // matches. Mirrors the SQL `(b1) OR (b2) OR …` shape.
-    if let Some(branches) = &filters.branches {
-        return branches.iter().any(|b| folder_matches_filter(folder, b));
-    }
-    if let Some(ref f) = filters.folder {
-        return folder == f;
-    }
-    if let Some(ref pat) = filters.folder_pattern {
-        for sub in pat.split('|') {
-            let sub = sub.trim();
-            if sub.is_empty() { continue; }
-            if folder.contains(sub) { return true; }
-        }
-        return false;
-    }
-    // No folder filter → match anything (e.g. view "A" with no
-    // source_id restriction).
-    true
-}
-
 /// Decide whether a subscribed weechat buffer (`buf`, a full_name like
 /// `irc.libera.#vim` or `python.slack.team.#chan`) should be merged into a
 /// folders-mode view as an empty section. Unlike `folder_matches_filter`
@@ -1158,6 +1132,12 @@ struct App {
     /// answer "does this source have unread" — without this, those
     /// views' badges lit whenever ANY folder anywhere had unread.
     source_unread_cache: std::collections::HashMap<i64, i64>,
+    /// Per-view "has unread?" flag, keyed by the view's key_binding.
+    /// Computed from each view's REAL filter (via `db.view_has_unread`), so
+    /// the inactive-view badges match what the view would actually show —
+    /// unlike the coarse folder/source caches. Refreshed on the 5s tick and
+    /// after any mark-read / view reload, so render just reads the map.
+    view_unread_cache: std::collections::HashMap<String, bool>,
     last_highlight_refresh: std::time::Instant,
     /// Per-view list of muted (hidden) channels. Each carries a mode
     /// (resurface on any new message vs only on a mention/highlight)
@@ -1630,6 +1610,7 @@ fn main() {
         subscribed_buffers: subscribed_buffers.clone(),
         unread_cache: std::collections::HashMap::new(),
         source_unread_cache: std::collections::HashMap::new(),
+        view_unread_cache: std::collections::HashMap::new(),
         last_highlight_refresh: std::time::Instant::now() - std::time::Duration::from_secs(60),
         current_hidden_channels: Vec::new(),
         show_muted: false,
@@ -1856,6 +1837,7 @@ fn main() {
                     }
                     app.unread_cache = new_unread;
                     app.source_unread_cache = new_src_unread;
+                    app.refresh_view_unread_cache();
                     app.render_top_bar();
                 }
                 // Periodic stuck-maildir reconcile. A read whose new/→cur/
@@ -2236,50 +2218,26 @@ impl App {
         self.render_bottom_bar();
     }
 
-    /// Does this view's filter currently match at least one unread
-    /// message? Drives the inactive-view badges. Respects the source
-    /// dimension: a source-scoped view (no folder filter) lights up
-    /// only when THAT source has unread, instead of the old
-    /// `folder_matches_filter` "no folder → match anything" default
-    /// that lit every source-only view whenever any folder anywhere
-    /// had unread.
-    fn filter_has_unread(&self, f: &Filters) -> bool {
-        if let Some(branches) = &f.branches {
-            return branches.iter().any(|b| self.filter_has_unread(b));
+    /// Recompute the per-view "has unread?" cache from each view's REAL
+    /// filter — a DB EXISTS over non-archived unread, mirroring exactly what
+    /// the view shows. Keyed by the view's key_binding; skips the built-in
+    /// A/N/* derived views. Runs on the 5s tick and after any mark-read /
+    /// view reload, NEVER in the render loop (the badge draw just reads the
+    /// map). Replaces the old folder/source-cache heuristic, which ignored
+    /// per-branch rules (platform, sender) and archived state and so lit
+    /// badges for unread the view would never display.
+    fn refresh_view_unread_cache(&mut self) {
+        let mut map = std::collections::HashMap::new();
+        for v in &self.views {
+            let Some(key) = v.key_binding.clone() else { continue };
+            if matches!(key.as_str(), "A" | "N" | "*") { continue; }
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&v.filters) else {
+                continue;
+            };
+            let filters = parse_view_filters_json(&json);
+            map.insert(key, self.db.view_has_unread(&filters));
         }
-        if let Some(sid) = f.source_id {
-            if self.source_unread_cache.get(&sid).copied().unwrap_or(0) == 0 {
-                return false;
-            }
-            // Source AND folder constrained: also require an unread
-            // folder match. (No current view combines them, but keep
-            // the AND honest.)
-            if f.folder.is_some() || f.folder_pattern.is_some() {
-                return self.unread_cache.iter()
-                    .any(|(folder, n)| *n > 0 && folder_matches_filter(folder, f));
-            }
-            return true;
-        }
-        if let Some(stype) = &f.source_type {
-            return self.source_unread_cache.iter().any(|(sid, n)| {
-                *n > 0 && self.source_type_map.get(sid).map(|t| t == stype).unwrap_or(false)
-            });
-        }
-        if f.folder.is_some() || f.folder_pattern.is_some() {
-            return self.unread_cache.iter()
-                .any(|(folder, n)| *n > 0 && folder_matches_filter(folder, f));
-        }
-        // No source and no folder dimension. A sender/content-only view
-        // (e.g. Family, filtered by sender) can't be evaluated from the
-        // folder/source caches, so don't light a badge we can't verify —
-        // a phantom "go look, there's unread" that sends the user to an
-        // empty view is worse than no badge. A truly empty filter
-        // (match-all custom view) lights if anything is unread anywhere.
-        if f.sender_pattern.is_some() || f.content_pattern.is_some() {
-            return false;
-        }
-        self.unread_cache.values().any(|n| *n > 0)
-            || self.source_unread_cache.values().any(|n| *n > 0)
+        self.view_unread_cache = map;
     }
 
     fn render_top_bar(&mut self) {
@@ -2375,25 +2333,16 @@ impl App {
         // built-in `A`/`N`/`*` derived views — they overlap with
         // everything and would always be lit. The display is just the
         // view's key glyph: e.g. `1 5 F2`, in the unread colour.
+        // Badge every other view flagged unread in view_unread_cache (kept in
+        // sync on the 5s tick / after mark-read). Iterate self.views for
+        // stable left-to-right order; cheap map lookups, no parse, no DB.
         let mut other_view_badges: Vec<String> = Vec::new();
-        if !self.unread_cache.is_empty() || !self.source_unread_cache.is_empty() {
-            // Use the canonical filter parser so `branches` views
-            // (PassionFruits, Dualog) parse correctly — the old inline
-            // parser only read `rules`, leaving branch views with an
-            // empty filter that matched everything.
-            let view_keys_and_filters: Vec<(String, Filters)> = self.views.iter()
-                .filter_map(|v| {
-                    let key = v.key_binding.clone()?;
-                    if key == self.current_view { return None; }
-                    if matches!(key.as_str(), "A" | "N" | "*") { return None; }
-                    let f = serde_json::from_str::<serde_json::Value>(&v.filters).ok()?;
-                    Some((key, parse_view_filters_json(&f)))
-                })
-                .collect();
-            for (key, filters) in view_keys_and_filters {
-                if self.filter_has_unread(&filters) {
-                    other_view_badges.push(style::fg(&key, tc.unread));
-                }
+        for v in &self.views {
+            let Some(key) = v.key_binding.clone() else { continue };
+            if key == self.current_view { continue; }
+            if matches!(key.as_str(), "A" | "N" | "*") { continue; }
+            if self.view_unread_cache.get(&key).copied().unwrap_or(false) {
+                other_view_badges.push(style::fg(&key, tc.unread));
             }
         }
 
@@ -3574,6 +3523,10 @@ impl App {
             return;
         }
         self.current_view = key.to_string();
+        // Recompute the inactive-view unread badges from the DB. By the time
+        // you switch views, any mark-read done in the view you're leaving has
+        // committed, so the view you just cleared correctly shows no badge.
+        self.refresh_view_unread_cache();
         self.active_folder = None;
         self.in_source_view = false;
         self.index = 0;
@@ -4876,9 +4829,6 @@ impl App {
         }
         let n = ids.len();
         let idset: std::collections::HashSet<i64> = ids.iter().copied().collect();
-        // Optimistically clear the badge caches before the flip (same reason
-        // as mark_all_read), so the section's view badge doesn't linger.
-        self.decrement_badge_caches(&idset);
         let _ = self.write_tx.send(DbWriteOp::MarkReadByIds(ids));
         // Flip BOTH stores: filtered_messages is canonical, but the
         // threaded view renders from display_messages.
@@ -5019,38 +4969,6 @@ impl App {
         }
     }
 
-    /// Optimistically decrement the folder→unread and source→unread badge
-    /// caches for the given ids (only rows still marked unread), so the
-    /// inactive-view badges (`filter_has_unread`) reflect a mark-read the
-    /// instant it happens rather than at the next 5s DB reconcile. MUST be
-    /// called BEFORE flipping the in-memory rows to read.
-    fn decrement_badge_caches(&mut self, ids: &std::collections::HashSet<i64>) {
-        let mut folder_dec: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
-        let mut source_dec: std::collections::HashMap<i64, i64> =
-            std::collections::HashMap::new();
-        for m in self
-            .filtered_messages
-            .iter()
-            .filter(|m| !m.read && ids.contains(&m.id))
-        {
-            if let Some(folder) = &m.folder {
-                *folder_dec.entry(folder.clone()).or_insert(0) += 1;
-            }
-            *source_dec.entry(m.source_id).or_insert(0) += 1;
-        }
-        for (folder, dec) in folder_dec {
-            if let Some(c) = self.unread_cache.get_mut(&folder) {
-                *c = (*c - dec).max(0);
-            }
-        }
-        for (sid, dec) in source_dec {
-            if let Some(c) = self.source_unread_cache.get_mut(&sid) {
-                *c = (*c - dec).max(0);
-            }
-        }
-    }
-
     fn mark_all_read(&mut self) {
         let okcol = self.config.theme_colors.feedback_ok;
         let warncol = self.config.theme_colors.feedback_warn;
@@ -5069,12 +4987,6 @@ impl App {
             return;
         }
         let n = ids.len();
-
-        // Optimistically clear the badge caches for these rows so the
-        // inactive-view badges update the moment we switch views, instead
-        // of lingering until the next 5s DB refresh. Must run BEFORE the flip.
-        let idset: std::collections::HashSet<i64> = ids.iter().copied().collect();
-        self.decrement_badge_caches(&idset);
 
         // Writer thread does the SQL UPDATE, the maildir-flag rename,
         // and the bulk metadata bump in one shot. Main thread flips the
@@ -6993,6 +6905,7 @@ impl App {
                             rusqlite::params![new_filters, self.current_view]);
                         drop(conn);
                         self.views = self.db.get_views();
+                        self.refresh_view_unread_cache();
                         self.set_feedback("Rule added", tc.feedback_ok);
                     }
                     break;
@@ -7005,6 +6918,7 @@ impl App {
                         rusqlite::params![new_filters, self.current_view]);
                     drop(conn);
                     self.views = self.db.get_views();
+                    self.refresh_view_unread_cache();
                     self.set_feedback("Filters cleared", tc.feedback_ok);
                     break;
                 }
@@ -7027,6 +6941,7 @@ impl App {
                 let _ = conn.execute("DELETE FROM views WHERE key_binding = ?", rusqlite::params![self.current_view]);
                 drop(conn);
                 self.views = self.db.get_views();
+                self.refresh_view_unread_cache();
                 self.set_feedback("View deleted", self.config.theme_colors.feedback_ok);
                 self.switch_to_view("A");
             } else {
