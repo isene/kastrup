@@ -4876,6 +4876,9 @@ impl App {
         }
         let n = ids.len();
         let idset: std::collections::HashSet<i64> = ids.iter().copied().collect();
+        // Optimistically clear the badge caches before the flip (same reason
+        // as mark_all_read), so the section's view badge doesn't linger.
+        self.decrement_badge_caches(&idset);
         let _ = self.write_tx.send(DbWriteOp::MarkReadByIds(ids));
         // Flip BOTH stores: filtered_messages is canonical, but the
         // threaded view renders from display_messages.
@@ -5016,6 +5019,38 @@ impl App {
         }
     }
 
+    /// Optimistically decrement the folder→unread and source→unread badge
+    /// caches for the given ids (only rows still marked unread), so the
+    /// inactive-view badges (`filter_has_unread`) reflect a mark-read the
+    /// instant it happens rather than at the next 5s DB reconcile. MUST be
+    /// called BEFORE flipping the in-memory rows to read.
+    fn decrement_badge_caches(&mut self, ids: &std::collections::HashSet<i64>) {
+        let mut folder_dec: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        let mut source_dec: std::collections::HashMap<i64, i64> =
+            std::collections::HashMap::new();
+        for m in self
+            .filtered_messages
+            .iter()
+            .filter(|m| !m.read && ids.contains(&m.id))
+        {
+            if let Some(folder) = &m.folder {
+                *folder_dec.entry(folder.clone()).or_insert(0) += 1;
+            }
+            *source_dec.entry(m.source_id).or_insert(0) += 1;
+        }
+        for (folder, dec) in folder_dec {
+            if let Some(c) = self.unread_cache.get_mut(&folder) {
+                *c = (*c - dec).max(0);
+            }
+        }
+        for (sid, dec) in source_dec {
+            if let Some(c) = self.source_unread_cache.get_mut(&sid) {
+                *c = (*c - dec).max(0);
+            }
+        }
+    }
+
     fn mark_all_read(&mut self) {
         let okcol = self.config.theme_colors.feedback_ok;
         let warncol = self.config.theme_colors.feedback_warn;
@@ -5034,6 +5069,12 @@ impl App {
             return;
         }
         let n = ids.len();
+
+        // Optimistically clear the badge caches for these rows so the
+        // inactive-view badges update the moment we switch views, instead
+        // of lingering until the next 5s DB refresh. Must run BEFORE the flip.
+        let idset: std::collections::HashSet<i64> = ids.iter().copied().collect();
+        self.decrement_badge_caches(&idset);
 
         // Writer thread does the SQL UPDATE, the maildir-flag rename,
         // and the bulk metadata bump in one shot. Main thread flips the
