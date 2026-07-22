@@ -2235,7 +2235,7 @@ impl App {
                 continue;
             };
             let filters = parse_view_filters_json(&json);
-            map.insert(key, self.db.view_has_unread(&filters));
+            map.insert(key, self.db.view_has_unread(&filters, self.config.load_limit as i64));
         }
         self.view_unread_cache = map;
     }

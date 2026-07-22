@@ -582,10 +582,15 @@ impl Database {
     /// per-branch rules (platform, sender, …) and archived state, so a
     /// `folder=Virham AND platform=discord` branch lit on any unread Virham
     /// row. Index-backed EXISTS (`idx_messages_folder_read`), LIMIT 1.
-    pub fn view_has_unread(&self, filters: &Filters) -> bool {
+    /// True iff the view WOULD SHOW an unread message: probes the same
+    /// window the view loads (newest `limit` matching messages, like
+    /// get_messages), not the whole history. Querying all of history
+    /// lit badges for views whose visible window was fully read but
+    /// whose deep past held forever-unread rows (old RSS items etc.).
+    pub fn view_has_unread(&self, filters: &Filters, limit: i64) -> bool {
         let conn = self.read();
         let mut sql = String::from(
-            "SELECT 1 FROM messages WHERE read = 0 AND (archived = 0 OR archived IS NULL)"
+            "SELECT read FROM messages WHERE (archived = 0 OR archived IS NULL)"
         );
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(branches) = &filters.branches {
@@ -614,7 +619,9 @@ impl Database {
                 for p in params { param_values.push(p); }
             }
         }
-        sql.push_str(" LIMIT 1");
+        sql.push_str(" ORDER BY timestamp DESC LIMIT ?");
+        param_values.push(Box::new(limit));
+        let sql = format!("SELECT 1 FROM ({}) WHERE read = 0 LIMIT 1", sql);
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             param_values.iter().map(|b| b.as_ref()).collect();
         let found = match conn.prepare(&sql) {
