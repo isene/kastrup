@@ -96,7 +96,7 @@ cp target/release/kastrup ~/.local/bin/
 ### Attachments & External
 | Key | Action |
 |-----|--------|
-| v | View / save attachments |
+| v | View / save attachments (`p`/`P` open / save office docs as PDF) |
 | V | Toggle inline image |
 | D | Download images to disk |
 | x | Open in external app |

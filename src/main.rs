@@ -10428,7 +10428,7 @@ impl App {
             lines.push(String::new());
             lines.push(style::fg(
                 &format!(
-                    "t:Tag  T:All  o/Enter:Open  s:Save{}  ESC:Back",
+                    "t:Tag  T:All  o/Enter:Open  s:Save  p:Open PDF  P:Save PDF{}  ESC:Back",
                     tagged_hint
                 ),
                 self.config.theme_colors.hint_fg,
@@ -10442,7 +10442,7 @@ impl App {
             }
 
             self.bottom.say(&style::fg(
-                " j/k:Navigate  t:Tag  T:Tag all  o:Open  s:Save  ESC:Back",
+                " j/k:Navigate  t:Tag  T:Tag all  o:Open  s:Save  p/P:Open/Save as PDF  ESC:Back",
                 self.config.theme_colors.hint_fg,
             ));
 
@@ -10510,6 +10510,62 @@ impl App {
                                 idx,
                                 &dest,
                             );
+                        }
+                    }
+                }
+                "p" => {
+                    let name = attachments[att_index]
+                        .get("name")
+                        .or_else(|| attachments[att_index].get("filename"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unnamed").to_string();
+                    if !is_office_doc(&name) {
+                        self.set_feedback("Not an office document",
+                            self.config.theme_colors.feedback_warn);
+                    } else {
+                        self.extract_and_open_attachment(
+                            maildir_file.as_deref(), &attachments, att_index, false);
+                        if let Some(pdf) = self.office_to_pdf(&att_temp_path(&name)) {
+                            let pdf_name = pdf_file_name(&name);
+                            self.open_attachment_file(&pdf, &pdf_name);
+                        }
+                    }
+                }
+                "P" => {
+                    let targets: Vec<usize> = if att_tagged.is_empty() {
+                        vec![att_index]
+                    } else {
+                        att_tagged.iter().copied().collect()
+                    };
+                    for &idx in &targets {
+                        let name = attachments[idx]
+                            .get("name")
+                            .or_else(|| attachments[idx].get("filename"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unnamed").to_string();
+                        if !is_office_doc(&name) {
+                            self.set_feedback(&format!("Not an office document: {}", name),
+                                self.config.theme_colors.feedback_warn);
+                            continue;
+                        }
+                        self.extract_and_open_attachment(
+                            maildir_file.as_deref(), &attachments, idx, false);
+                        let Some(pdf) = self.office_to_pdf(&att_temp_path(&name)) else {
+                            continue;
+                        };
+                        let dl = self.config.download_folder.replace(
+                            '~',
+                            &std::env::var("HOME").unwrap_or_default(),
+                        );
+                        let default_dest = format!("{}/{}", dl, pdf_file_name(&name));
+                        let dest = self.prompt("Save PDF to: ", &default_dest);
+                        if !dest.is_empty() {
+                            match std::fs::copy(&pdf, &dest) {
+                                Ok(_) => self.set_feedback(&format!("Saved: {}", dest),
+                                    self.config.theme_colors.feedback_ok),
+                                Err(e) => self.set_feedback(&format!("Save failed: {}", e),
+                                    self.config.theme_colors.feedback_warn),
+                            }
                         }
                     }
                 }
@@ -10858,6 +10914,37 @@ sys.exit(2)
                 &format!("Could not extract: {}", name),
                 self.config.theme_colors.feedback_warn,
             );
+        }
+    }
+
+    /// Convert an office document (already extracted to `src`) to PDF
+    /// via headless LibreOffice, returning the produced PDF path.
+    /// Runs with a private user profile under ~/.kastrup/lo_profile —
+    /// with the default profile, `--convert-to` silently no-ops
+    /// whenever a LibreOffice GUI instance is running.
+    fn office_to_pdf(&mut self, src: &str) -> Option<String> {
+        if !std::path::Path::new(src).exists() {
+            return None;
+        }
+        self.set_feedback("Converting to PDF…", self.config.theme_colors.feedback_info);
+        let pdf = std::path::Path::new(src).with_extension("pdf");
+        let _ = std::fs::remove_file(&pdf); // never serve a stale conversion
+        let home = std::env::var("HOME").unwrap_or_default();
+        let out = std::process::Command::new("soffice")
+            .arg("--headless")
+            .arg(format!("-env:UserInstallation=file://{}/.kastrup/lo_profile", home))
+            .arg("--convert-to").arg("pdf")
+            .arg("--outdir").arg("/tmp")
+            .arg(src)
+            .output();
+        if out.is_ok() && pdf.exists() {
+            Some(pdf.to_string_lossy().into_owned())
+        } else {
+            let err = out.err().map(|e| e.to_string())
+                .unwrap_or_else(|| "no PDF produced".into());
+            self.set_feedback(&format!("PDF conversion failed: {}", err),
+                self.config.theme_colors.feedback_warn);
+            None
         }
     }
 }
@@ -13396,6 +13483,26 @@ fn att_temp_path(name: &str) -> String {
         .map(|c| if c.is_alphanumeric() || ".-_".contains(c) { c } else { '_' })
         .collect();
     format!("/tmp/kastrup_att_{}", safe)
+}
+
+/// Office-type documents LibreOffice can render to PDF (attachment
+/// view `p`/`P` keys).
+fn is_office_doc(name: &str) -> bool {
+    let ext = std::path::Path::new(name).extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(ext.as_str(),
+        "doc" | "docx" | "odt" | "ott" | "rtf" |
+        "xls" | "xlsx" | "ods" | "ots" |
+        "ppt" | "pptx" | "odp" | "otp")
+}
+
+/// `Report May.docx` → `Report May.pdf`
+fn pdf_file_name(name: &str) -> String {
+    let stem = std::path::Path::new(name).file_stem()
+        .and_then(|s| s.to_str()).unwrap_or("attachment");
+    format!("{}.pdf", stem)
 }
 
 /// Quick HTML sniffer: returns true if `s` contains at least two
