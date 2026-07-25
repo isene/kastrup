@@ -5136,9 +5136,24 @@ impl App {
         > = std::collections::HashMap::new();
 
         for &id in &ids {
-            let Some(msg) = id_to_msg.get(&id) else { continue };
-            let Some(file) = msg.metadata.get("maildir_file").and_then(|v| v.as_str()) else { continue };
-            let path = std::path::Path::new(file);
+            // Fast path is the current view; fall back to the DB when the
+            // id isn't in it. A marked message can drop out of
+            // `filtered_messages` before the purge runs (view switch,
+            // search/filter change, auto-refresh), and skipping it here
+            // deleted the DB row while leaving the maildir file on disk
+            // forever — the row's external_id then lands in
+            // deleted_external_ids, so the poller never re-ingests it and
+            // the orphan is invisible to kastrup but still on disk.
+            let file = match id_to_msg.get(&id) {
+                Some(m) => m.metadata.get("maildir_file")
+                    .and_then(|v| v.as_str()).map(str::to_string),
+                None => self.db.get_message(id).and_then(|m| {
+                    m.metadata.get("maildir_file")
+                        .and_then(|v| v.as_str()).map(str::to_string)
+                }),
+            };
+            let Some(file) = file else { continue };
+            let path = std::path::Path::new(&file);
             if path.exists() {
                 let _ = std::fs::remove_file(path);
                 continue;
