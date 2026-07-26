@@ -193,6 +193,14 @@ impl DraftKind {
     }
 }
 
+/// What the draft picker came back with. `New` and `Quit` used to be the
+/// same `None`, so ESC and q both dropped the user into a fresh compose.
+enum DraftPick {
+    Load(usize),
+    New,
+    Quit,
+}
+
 struct DraftCandidate {
     source: DraftSource,
     kind: DraftKind,
@@ -8639,7 +8647,7 @@ impl App {
         }
         lines.push(String::new());
         lines.push(style::fg(
-            "Press [letter/digit] to load, d+key to delete, n = new, ESC = cancel",
+            "[letter/digit] load · d+key delete · n or ESC new message · q quit",
             tc.hint_fg,
         ));
         self.right.set_text(&lines.join("\n"));
@@ -8648,11 +8656,11 @@ impl App {
         if self.right.border { self.right.border_refresh(); }
     }
 
-    /// Show a numbered picker in the right pane. Returns the
-    /// selected index, or None on ESC / N (new). Supports `d<key>`
-    /// to delete a candidate (file-drop → unlink, postponed → row
-    /// DELETE), then redraws.
-    fn pick_draft(&mut self, candidates: &[DraftCandidate]) -> Option<usize> {
+    /// Show a numbered picker in the right pane: a letter/digit loads
+    /// that draft, `n` or ESC starts a fresh message, `q` backs out to
+    /// the message list. `d<key>` deletes a candidate (file-drop →
+    /// unlink, postponed / scheduled → row DELETE), then redraws.
+    fn pick_draft(&mut self, candidates: &[DraftCandidate]) -> DraftPick {
         let mut list: Vec<DraftCandidate> = candidates.iter().map(|c| DraftCandidate {
             source: match &c.source {
                 DraftSource::Postponed(id) => DraftSource::Postponed(*id),
@@ -8669,8 +8677,8 @@ impl App {
         loop {
             let Some(chr) = Input::getchr(None) else { continue };
             match chr.as_str() {
-                "ESC" | "q" => return None,
-                "n" | "N" => return None,
+                "q" | "Q" => return DraftPick::Quit,
+                "ESC" | "n" | "N" => return DraftPick::New,
                 "d" | "D" => {
                     self.set_feedback(
                         "Delete which? (letter/digit, ESC=cancel)",
@@ -8694,7 +8702,7 @@ impl App {
                         if i < list.len() {
                             self.consume_draft(&list[i].source);
                             list.remove(i);
-                            if list.is_empty() { return None; }
+                            if list.is_empty() { return DraftPick::New; }
                             self.render_draft_picker(&list);
                             continue;
                         }
@@ -8720,11 +8728,12 @@ impl App {
                                 let same = match (&c.source, &chosen.source) {
                                     (DraftSource::Postponed(a), DraftSource::Postponed(b)) => a == b,
                                     (DraftSource::File(a), DraftSource::File(b)) => a == b,
+                                    (DraftSource::Scheduled(a), DraftSource::Scheduled(b)) => a == b,
                                     _ => false,
                                 };
-                                if same { return Some(j); }
+                                if same { return DraftPick::Load(j); }
                             }
-                            return None;
+                            return DraftPick::New;
                         }
                     }
                 }
@@ -8748,13 +8757,23 @@ impl App {
             // Always show the picker — even for a single draft, the
             // subject + body-preview context is more useful than a
             // y/n prompt with just the subject in the status line.
-            if let Some(i) = self.pick_draft(&candidates) {
-                let c = &candidates[i];
-                self.consume_draft(&c.source);
-                self.run_editor_compose_recalled(&c.data, c.kind);
-                return;
+            match self.pick_draft(&candidates) {
+                DraftPick::Load(i) => {
+                    let c = &candidates[i];
+                    self.consume_draft(&c.source);
+                    self.run_editor_compose_recalled(&c.data, c.kind);
+                    return;
+                }
+                // q backs all the way out; ESC / n fall through to a
+                // fresh compose. Repaint, or the picker's pane sits
+                // there looking like it is still waiting for a key.
+                DraftPick::Quit => {
+                    self.render_message_content();
+                    self.render_bottom_bar();
+                    return;
+                }
+                DraftPick::New => {}
             }
-            // ESC/n falls through to fresh compose
         }
 
         // Set compose source type from current message context.

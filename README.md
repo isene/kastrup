@@ -91,7 +91,7 @@ cp target/release/kastrup ~/.local/bin/
 | e | Reply in editor |
 | g | Reply-all |
 | f | Forward (then `i` inline / `a` attach) |
-| m | Compose new |
+| + | Compose new (lists postponed + scheduled drafts; `q` backs out) |
 | E | Edit draft |
 | S | In the send review: schedule instead of sending now |
 
