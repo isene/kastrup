@@ -115,6 +115,10 @@ struct ComposeTarget {
 enum DraftSource {
     Postponed(i64),
     File(std::path::PathBuf),
+    /// A row in `scheduled`: a draft with a time on it. Loading one in
+    /// the picker cancels the schedule and hands the text back to the
+    /// editor, same as recalling a postponed draft.
+    Scheduled(i64),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -160,6 +164,18 @@ impl DraftKind {
             DraftKind::Weechat => "Channel",
             DraftKind::Gateway => "Channel",
             DraftKind::Workspace => "Channel",
+        }
+    }
+
+    /// Resolve from a stored `tag()` string.
+    fn from_tag(t: &str) -> Self {
+        match t {
+            "slack"     => DraftKind::Slack,
+            "discord"   => DraftKind::Discord,
+            "weechat"   => DraftKind::Weechat,
+            "gateway"   => DraftKind::Gateway,
+            "workspace" => DraftKind::Workspace,
+            _           => DraftKind::Email,
         }
     }
 
@@ -1081,6 +1097,15 @@ struct App {
     /// We only allow one at a time — UI feedback when a second
     /// attempt starts before the first completes.
     pending_send: Option<PendingSend>,
+    /// Earliest `scheduled.send_at`, cached so the idle loop costs one
+    /// integer compare instead of a query per wake. `None` = nothing
+    /// scheduled. Refreshed whenever the table changes.
+    next_send_at: Option<i64>,
+    /// When the cache was last re-read from the table. Rows can also be
+    /// inserted from outside kastrup (a script, a Claude session), so the
+    /// cache is refreshed once a minute — an indexed MIN() over a handful
+    /// of rows, against a loop that already wakes every ten seconds.
+    last_sched_check: i64,
     compose_source_type: Option<String>,
     /// Set by the recall path so an unmodified editor return still
     /// lands on the review screen (Send / Postpone / Cancel) instead
@@ -1588,6 +1613,8 @@ fn main() {
         pending_forward_attachments: Vec::new(),
         pending_reply_id: None,
         pending_send: None,
+        next_send_at: None,
+        last_sched_check: 0,
         compose_source_type: None,
         compose_force_review: false,
         compose_kind: DraftKind::Email,
@@ -1702,6 +1729,10 @@ fn main() {
         app.compose_to(&to, &subj);
     }
 
+    // Anything scheduled in an earlier session: prime the cache so the
+    // first idle wake can deliver what is already due.
+    app.refresh_next_send_at();
+
     // Resume watchdog state: wall-clock at the previous loop turn.
     let mut last_wall = std::time::SystemTime::now();
 
@@ -1787,6 +1818,10 @@ fn main() {
                     );
                     app.refresh_current_view();
                 }
+                // Anything scheduled that has come due. Gated on a cached
+                // timestamp, so this is one integer compare when nothing
+                // is waiting — no new timer, no query per wake.
+                app.send_due_scheduled();
                 // Periodic DB refresh (skip when showing inline images).
                 // Gated on messages_dirty so an idle kastrup doesn't rerun
                 // get_messages() every 5s for no reason.
@@ -5937,8 +5972,9 @@ impl App {
   e              Reply in editor\n\
   g              Reply-all\n\
   f              Forward\n\
-  +              Compose new\n\
+  +              Compose new (also lists postponed + scheduled drafts)\n\
   E              Edit draft\n\
+  S              (in the send review) schedule instead of sending now\n\
   k              Add emoji reaction (chat)\n\n\
 {}\n\
   v              View/save attachments\n\
@@ -8368,6 +8404,29 @@ impl App {
                 }
             }
         }
+        // Scheduled rows: same picker, with the time they will go.
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT id, kind, data, send_at FROM scheduled ORDER BY send_at"
+        ) {
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?, r.get::<_, i64>(3)?))
+            });
+            if let Ok(rows) = rows {
+                for (id, tag, data, at) in rows.flatten() {
+                    let kind = DraftKind::from_tag(&tag);
+                    let (subject, body_preview) = parse_draft_preview(&data, kind);
+                    out.push(DraftCandidate {
+                        source: DraftSource::Scheduled(id),
+                        kind,
+                        subject: format!("⏰ {} · {}", fmt_send_at(at), subject),
+                        body_preview,
+                        data,
+                        created_at: at,
+                    });
+                }
+            }
+        }
         drop(conn);
         // File-side: drop folder
         let dir = drafts_drop_dir();
@@ -8398,6 +8457,106 @@ impl App {
         out
     }
 
+    /// Park a draft in `scheduled` and report when it will go.
+    fn schedule_draft(&mut self, kind: DraftKind, data: &str, at: i64) {
+        let now = database::now_secs();
+        {
+            let conn = self.db.conn.lock().unwrap();
+            let _ = conn.execute(
+                "INSERT INTO scheduled (kind, data, send_at, created_at) VALUES (?, ?, ?, ?)",
+                rusqlite::params![kind.tag(), data, at, now],
+            );
+        }
+        self.refresh_next_send_at();
+        let tc = self.config.theme_colors.clone();
+        self.set_feedback(&format!("Scheduled for {}", fmt_send_at(at)), tc.feedback_ok);
+    }
+
+    /// Re-read the earliest due time. One query, only when the table
+    /// changed — the idle loop then compares an i64 and moves on.
+    fn refresh_next_send_at(&mut self) {
+        let conn = self.db.conn.lock().unwrap();
+        self.next_send_at = conn
+            .query_row("SELECT MIN(send_at) FROM scheduled", [], |r| r.get::<_, Option<i64>>(0))
+            .ok()
+            .flatten();
+    }
+
+    /// Send whatever has come due. Called from the idle arm of the main
+    /// loop, which already wakes every few seconds — no new timer.
+    ///
+    /// One message per turn: the email path routes through the single
+    /// `pending_send` slot, and holding the rest until the next wake is
+    /// simpler than queueing behind it.
+    fn send_due_scheduled(&mut self) {
+        let now = database::now_secs();
+        if now - self.last_sched_check >= 60 {
+            self.last_sched_check = now;
+            self.refresh_next_send_at();
+        }
+        match self.next_send_at {
+            Some(at) if at <= now => {}
+            _ => return,
+        }
+        let due: Option<(i64, String, String)> = {
+            let conn = self.db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT id, kind, data FROM scheduled WHERE send_at <= ? ORDER BY send_at LIMIT 1",
+                rusqlite::params![now],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).ok()
+        };
+        let Some((id, tag, data)) = due else {
+            self.refresh_next_send_at();
+            return;
+        };
+        let kind = DraftKind::from_tag(&tag);
+        // Email goes out through the same background SMTP machinery the
+        // interactive path uses; the chat kinds send inline and report.
+        let outcome: Result<String, String> = match kind {
+            DraftKind::Email => {
+                if self.pending_send.is_some() {
+                    return; // a send is already in flight; try again next wake
+                }
+                self.handle_composed_message(&data);
+                Ok(String::new())
+            }
+            DraftKind::Slack     => self.send_slack_draft(&data).map(|c| format!("Sent to {}", c)),
+            DraftKind::Discord   => self.send_discord_draft(&data).map(|c| format!("Sent to discord {}", c)),
+            DraftKind::Weechat   => self.send_weechat_draft(&data).map(|c| format!("Sent to weechat {}", c)),
+            DraftKind::Gateway   => self.send_gateway_draft(&data),
+            DraftKind::Workspace => self.send_workspace_draft(&data),
+        };
+        let tc = self.config.theme_colors.clone();
+        match outcome {
+            Ok(msg) => {
+                {
+                    let conn = self.db.conn.lock().unwrap();
+                    let _ = conn.execute("DELETE FROM scheduled WHERE id = ?", rusqlite::params![id]);
+                }
+                if !msg.is_empty() {
+                    log::info(&format!("scheduled send: {}", msg));
+                    self.set_feedback(&format!("{} (scheduled)", msg), tc.feedback_ok);
+                }
+            }
+            Err(e) => {
+                // Keep the row and push it out five minutes: a scheduled
+                // send that fails because the VPN is down should retry,
+                // not vanish or spin.
+                log::info(&format!("scheduled send failed: {}", e));
+                {
+                    let conn = self.db.conn.lock().unwrap();
+                    let _ = conn.execute(
+                        "UPDATE scheduled SET send_at = ?, last_error = ? WHERE id = ?",
+                        rusqlite::params![now + 300, e, id],
+                    );
+                }
+                self.set_feedback(&format!("Scheduled send failed: {} (retrying)", e), tc.feedback_warn);
+            }
+        }
+        self.refresh_next_send_at();
+    }
+
     /// Drop a draft from its backing store after the user loads it.
     fn consume_draft(&self, source: &DraftSource) {
         match source {
@@ -8410,6 +8569,13 @@ impl App {
             }
             DraftSource::File(path) => {
                 let _ = std::fs::remove_file(path);
+            }
+            DraftSource::Scheduled(id) => {
+                let conn = self.db.conn.lock().unwrap();
+                let _ = conn.execute(
+                    "DELETE FROM scheduled WHERE id = ?",
+                    rusqlite::params![id],
+                );
             }
         }
     }
@@ -8468,6 +8634,7 @@ impl App {
             source: match &c.source {
                 DraftSource::Postponed(id) => DraftSource::Postponed(*id),
                 DraftSource::File(p) => DraftSource::File(p.clone()),
+                DraftSource::Scheduled(id) => DraftSource::Scheduled(*id),
             },
             kind: c.kind,
             subject: c.subject.clone(),
@@ -9621,7 +9788,7 @@ impl App {
                             let att_hint = if attachments.is_empty() { String::new() }
                                 else { format!(" [{}att]", attachments.len()) };
                             let prompt_text = format!(
-                                " Enter:Send  e:Re-edit  p:Postpone  a:Attach{}{} ESC:Cancel",
+                                " Enter:Send  S:Schedule  e:Re-edit  p:Postpone  a:Attach{}{} ESC:Cancel",
                                 plugin_hints, att_hint);
                             self.bottom.say(&style::fg(&prompt_text, 226));
                             let Some(key) = Input::getchr(None) else { continue };
@@ -9806,6 +9973,27 @@ impl App {
                                         let _ = std::fs::write(&tmpfile, &final_content);
                                     }
                                     continue;
+                                }
+                                "S" => {
+                                    let when = self.prompt(
+                                        "Send at (08:00, tomorrow 09:00, +2h, 2026-07-28 08:00): ", "");
+                                    match parse_send_at(&when) {
+                                        Some(at) => {
+                                            let final_content = std::fs::read_to_string(&tmpfile)
+                                                .unwrap_or_else(|_| content.clone());
+                                            let kind = self.compose_kind;
+                                            self.schedule_draft(kind, &final_content, at);
+                                            break;
+                                        }
+                                        None => {
+                                            if !when.trim().is_empty() {
+                                                self.set_feedback(
+                                                    "Not a time I understand — try 08:00, tomorrow 09:00, +2h",
+                                                    tc.feedback_warn);
+                                            }
+                                            continue;
+                                        }
+                                    }
                                 }
                                 "p" => {
                                     let now = database::now_secs();
@@ -14632,6 +14820,116 @@ fn rfc822_date_and_msgid(from: &str) -> (String, String) {
     (date, msgid)
 }
 
+/// Parse a send-at expression into a unix timestamp, local time.
+///
+/// Accepts what a person would actually type at a prompt:
+///   `+2h`, `+90m`, `+3d`     relative to now
+///   `08:00`                  today if it is still ahead, else tomorrow
+///   `tomorrow 08:00`         or just `tomorrow` (09:00)
+///   `2026-07-28 08:00`       explicit, `T` also accepted between them
+fn parse_send_at(input: &str) -> Option<i64> {
+    let t = input.trim().to_lowercase();
+    if t.is_empty() {
+        return None;
+    }
+    let now = database::now_secs();
+    // Relative: +N with a unit.
+    if let Some(rest) = t.strip_prefix('+') {
+        let split = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        let (num, unit) = rest.split_at(split);
+        let n: i64 = num.parse().ok()?;
+        let mult = match unit.trim() {
+            "" | "m" | "min" | "mins" | "minutes" => 60,
+            "h" | "hr" | "hrs" | "hours" => 3600,
+            "d" | "day" | "days" => 86_400,
+            "w" | "week" | "weeks" => 604_800,
+            _ => return None,
+        };
+        return Some(now + n * mult);
+    }
+    // Absolute: an optional date word and an optional HH:MM, any order.
+    let mut date: Option<String> = None;
+    let mut time: Option<String> = None;
+    let mut tomorrow = false;
+    for word in t.split([' ', ',']).filter(|w| !w.is_empty()) {
+        if word.starts_with("tomorrow") || word == "tmr" {
+            tomorrow = true;
+        } else if word.matches('-').count() == 2 {
+            // "2026-07-28T08:00" arrives as one word; split the clock off.
+            match word.split_once('t') {
+                Some((day, clock)) if clock.contains(':') => {
+                    date = Some(day.to_string());
+                    time = Some(clock.to_string());
+                }
+                _ => date = Some(word.to_string()),
+            }
+        } else if word.contains(':') {
+            time = Some(word.to_string());
+        }
+    }
+    let (hh, mm) = match time {
+        Some(ref hm) => {
+            let mut it = hm.split(':');
+            (it.next()?.parse::<i32>().ok()?, it.next()?.parse::<i32>().ok()?)
+        }
+        // A bare date means that morning.
+        None => (9, 0),
+    };
+    if !(0..24).contains(&hh) || !(0..60).contains(&mm) {
+        return None;
+    }
+    if date.is_none() && time.is_none() && !tomorrow {
+        return None;
+    }
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        let mut base: libc::time_t = now as libc::time_t;
+        libc::localtime_r(&mut base as *mut _, &mut tm);
+    }
+    let explicit_date = date.is_some() || tomorrow;
+    if let Some(d) = date {
+        let mut it = d.split('-');
+        let y: i32 = it.next()?.parse().ok()?;
+        let mo: i32 = it.next()?.parse().ok()?;
+        let da: i32 = it.next()?.parse().ok()?;
+        tm.tm_year = y - 1900;
+        tm.tm_mon = mo - 1;
+        tm.tm_mday = da;
+    } else if tomorrow {
+        tm.tm_mday += 1;
+    }
+    tm.tm_hour = hh;
+    tm.tm_min = mm;
+    tm.tm_sec = 0;
+    tm.tm_isdst = -1; // let libc work out DST for that date
+    let ts = unsafe { libc::mktime(&mut tm) } as i64;
+    if ts <= 0 {
+        return None;
+    }
+    // A bare time that has already gone by today means tomorrow.
+    if !explicit_date && ts <= now {
+        return Some(ts + 86_400);
+    }
+    Some(ts)
+}
+
+/// "Mon 08:00" for this week, "2026-08-14 08:00" beyond it.
+fn fmt_send_at(ts: i64) -> String {
+    const WDAY: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    unsafe {
+        let mut t: libc::time_t = ts as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&mut t as *mut _, &mut tm);
+        let days = (ts - database::now_secs()) / 86_400;
+        if days < 6 {
+            format!("{} {:02}:{:02}", WDAY[(tm.tm_wday as usize) % 7], tm.tm_hour, tm.tm_min)
+        } else {
+            format!("{:04}-{:02}-{:02} {:02}:{:02}",
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min)
+        }
+    }
+}
+
 /// Get local UTC offset in seconds using libc
 fn local_utc_offset() -> i64 {
     unsafe {
@@ -14950,4 +15248,59 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hm(ts: i64) -> (i32, i32) {
+        unsafe {
+            let mut t: libc::time_t = ts as libc::time_t;
+            let mut tm: libc::tm = std::mem::zeroed();
+            libc::localtime_r(&mut t as *mut _, &mut tm);
+            (tm.tm_hour, tm.tm_min)
+        }
+    }
+
+    #[test]
+    fn relative_offsets() {
+        let now = database::now_secs();
+        assert_eq!(parse_send_at("+2h").unwrap() - now, 7200);
+        assert_eq!(parse_send_at("+90m").unwrap() - now, 5400);
+        assert_eq!(parse_send_at("+45").unwrap() - now, 2700);
+        assert_eq!(parse_send_at("+3d").unwrap() - now, 259_200);
+        assert_eq!(parse_send_at("+1w").unwrap() - now, 604_800);
+    }
+
+    #[test]
+    fn clock_times_land_on_the_clock() {
+        let ts = parse_send_at("08:30").unwrap();
+        assert_eq!(hm(ts), (8, 30));
+        // Always in the future: today if it is still ahead, else tomorrow.
+        assert!(ts > database::now_secs());
+        assert!(ts - database::now_secs() <= 86_400);
+    }
+
+    #[test]
+    fn tomorrow_is_a_day_ahead() {
+        let ts = parse_send_at("tomorrow 09:00").unwrap();
+        assert_eq!(hm(ts), (9, 0));
+        let bare = parse_send_at("tomorrow").unwrap();
+        assert_eq!(hm(bare), (9, 0)); // a bare date means that morning
+    }
+
+    #[test]
+    fn explicit_dates() {
+        let ts = parse_send_at("2030-03-14 15:09").unwrap();
+        assert_eq!(hm(ts), (15, 9));
+        assert_eq!(parse_send_at("2030-03-14t15:09").map(hm), Some((15, 9)));
+    }
+
+    #[test]
+    fn nonsense_is_rejected() {
+        for bad in ["", "   ", "later", "+2x", "25:00", "08:99", "banana"] {
+            assert!(parse_send_at(bad).is_none(), "accepted {bad:?}");
+        }
+    }
 }

@@ -21,6 +21,7 @@ Unified terminal messaging client. All your email, chat, and feeds in one TUI. B
 - **Threading**: flat, threaded, and folder-grouped message views
 - **Background sync**: automatic polling with configurable intervals per source
 - **Compose/Reply/Forward**: full email composition with editor integration
+- **Send later**: `S` in the send review parks the message until its time (`08:00`, `tomorrow 09:00`, `+2h`, `2026-07-28 08:00`). Works for every channel, not just email; scheduled messages sit in the `+` picker where they can be cancelled or edited
 - **Inline images**: Kitty protocol image display (V key)
 - **Folder browser**: hierarchical Maildir folder navigation (B key)
 - **Search**: substring and notmuch full-text search
@@ -92,6 +93,7 @@ cp target/release/kastrup ~/.local/bin/
 | f | Forward (then `i` inline / `a` attach) |
 | m | Compose new |
 | E | Edit draft |
+| S | In the send review: schedule instead of sending now |
 
 ### Attachments & External
 | Key | Action |
