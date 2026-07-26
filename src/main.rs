@@ -719,11 +719,7 @@ fn collapse_bracketed_links(body: &str) -> String {
                 if c == '\u{E002}' { break; }
                 visible.push(c);
             }
-            out.push_str("\x1b]8;;");
-            out.push_str(&url);
-            out.push_str("\x1b\\\x1b[4m");
-            out.push_str(&visible);
-            out.push_str("\x1b[24m\x1b]8;;\x1b\\");
+            out.push_str(&style::hyperlink(&url, &style::underline(&visible)));
         } else {
             out.push(c);
         }
@@ -755,9 +751,8 @@ fn shorten_url_label(url: &str) -> String {
 fn header_row(key: &str, value: &str, color: u8) -> String {
     let val_styled = highlight::color_emails(value, Some(color));
     format!(
-        "{} \x1b[38;5;{}m{}\x1b[39m",
+        "{} {}",
         style::bold(&style::fg(key, color)),
-        color,
         val_styled
     )
 }
@@ -825,11 +820,7 @@ fn hyperlink_urls(line: &str) -> String {
             let label = if url.len() > 60 { shorten_url_label(url) } else { url.to_string() };
             // OSC 8 link with SGR underline around the visible text so users
             // can see where links are; SGR 24 turns underline off after.
-            out.push_str("\x1b]8;;");
-            out.push_str(url);
-            out.push_str("\x1b\\\x1b[4m");
-            out.push_str(&label);
-            out.push_str("\x1b[24m\x1b]8;;\x1b\\");
+            out.push_str(&style::hyperlink(url, &style::underline(&label)));
             last = m.end();
         }
         out.push_str(&chunk[last..]);
@@ -2630,8 +2621,10 @@ impl App {
         // Per-sender avatar: 1 colored char between source icon and sender.
         let (avatar_ch, avatar_color) = sender_avatar(&msg.sender, msg.sender_name.as_deref());
         let avatar_inline = format!(
-            "\x1b[38;5;{}m{}\x1b[38;5;{}m",
-            avatar_color, avatar_ch, color
+            "{}{}{}",
+            style::set_fg(avatar_color),
+            avatar_ch,
+            style::set_fg(color)
         );
 
         // Build content. avatar_inline carries its own ANSI; everything
@@ -12036,7 +12029,7 @@ impl App {
         // interfere with claude's input handling, so disable it for
         // the duration. Mirrors scribe's run_chat_session.
         use std::io::Write as _;
-        print!("\x1b[?2004l");
+        Crust::disable_bracketed_paste();
         let _ = std::io::stdout().flush();
         Crust::cleanup();
         Crust::clear_screen();
@@ -12047,7 +12040,7 @@ impl App {
 
         // Restore kastrup's terminal state and force a full repaint.
         Crust::init();
-        print!("\x1b[?2004h");
+        Crust::enable_bracketed_paste();
         let _ = std::io::stdout().flush();
         let _ = std::fs::remove_file(&tmpfile);
         self.handle_resize();
@@ -14264,7 +14257,7 @@ fn source_info(source_type: &str, tc: &config::ThemeColors) -> (String, u8) {
     // falls back to the default bullet.
     if let Some((color, glyph)) = tc.source_styles.get(source_type) {
         let g = if glyph.is_empty() { "\u{2022}" } else { glyph.as_str() };
-        let styled = format!("\x1b[38;5;{}m{}\x1b[39m", color, g);
+        let styled = style::fg(g, *color);
         return (styled, *color);
     }
     let (glyph, icon_color, row_color) = match source_type {
@@ -14289,7 +14282,7 @@ fn source_info(source_type: &str, tc: &config::ThemeColors) -> (String, u8) {
     };
     // \x1b[39m resets only the foreground (not bg/style) so the
     // row's outer style continues unaffected after the icon.
-    let styled = format!("\x1b[38;5;{}m{}\x1b[39m", icon_color, glyph);
+    let styled = style::fg(glyph, icon_color);
     (styled, row_color)
 }
 
