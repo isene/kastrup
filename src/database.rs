@@ -349,6 +349,18 @@ impl Database {
                 data TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
+            -- Outgoing messages held until their time comes. `kind` is the
+            -- DraftKind tag so a scheduled Workspace post goes out the
+            -- Workspace path, not the SMTP one.
+            CREATE TABLE IF NOT EXISTS scheduled (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                data TEXT NOT NULL,
+                send_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_scheduled_due ON scheduled(send_at);
             CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source_id);
             CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
