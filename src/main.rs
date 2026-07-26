@@ -8457,19 +8457,42 @@ impl App {
         out
     }
 
-    /// Park a draft in `scheduled` and report when it will go.
+    /// Park a draft in `scheduled` and report when it will go. If the
+    /// insert fails the text is NOT lost: it falls back to `postponed`,
+    /// and the user is told, because a message that reports "Scheduled"
+    /// and then does not exist is the worst outcome here.
     fn schedule_draft(&mut self, kind: DraftKind, data: &str, at: i64) {
         let now = database::now_secs();
-        {
+        let stored = {
             let conn = self.db.conn.lock().unwrap();
-            let _ = conn.execute(
+            conn.execute(
                 "INSERT INTO scheduled (kind, data, send_at, created_at) VALUES (?, ?, ?, ?)",
                 rusqlite::params![kind.tag(), data, at, now],
-            );
-        }
-        self.refresh_next_send_at();
+            )
+        };
         let tc = self.config.theme_colors.clone();
-        self.set_feedback(&format!("Scheduled for {}", fmt_send_at(at)), tc.feedback_ok);
+        match stored {
+            Ok(_) => {
+                self.refresh_next_send_at();
+                self.set_feedback(&format!("Scheduled for {}", fmt_send_at(at)), tc.feedback_ok);
+            }
+            Err(e) => {
+                log::info(&format!("schedule failed: {}", e));
+                let saved = {
+                    let conn = self.db.conn.lock().unwrap();
+                    conn.execute(
+                        "INSERT INTO postponed (data, created_at) VALUES (?, ?)",
+                        rusqlite::params![data, now],
+                    ).is_ok()
+                };
+                let note = if saved {
+                    format!("Could not schedule ({}) — draft postponed instead, press + to recall", e)
+                } else {
+                    format!("Could not schedule or save the draft: {}", e)
+                };
+                self.set_feedback_sticky(&note, tc.feedback_warn);
+            }
+        }
     }
 
     /// Re-read the earliest due time. One query, only when the table

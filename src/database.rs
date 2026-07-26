@@ -205,6 +205,11 @@ impl Database {
         ).map_err(|e| format!("Failed to set pragmas: {}", e))?;
         if is_new {
             Self::create_schema(&conn)?;
+        } else {
+            // create_schema only runs for a brand-new file, so tables added
+            // in later versions never reach an existing database. Anything
+            // additive belongs here too.
+            Self::ensure_added_tables(&conn);
         }
         Ok(Self { conn: Mutex::new(conn), read_pool: Mutex::new(Vec::new()) })
     }
@@ -243,6 +248,23 @@ impl Database {
         let conn = self.read();
         conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
             .unwrap_or(0) == 0
+    }
+
+    /// Tables introduced after a database was first created. Idempotent,
+    /// and cheap enough to run on every open: SQLite parses two statements
+    /// and finds both objects already there.
+    fn ensure_added_tables(conn: &Connection) {
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS scheduled (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                data TEXT NOT NULL,
+                send_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_scheduled_due ON scheduled(send_at);"
+        );
     }
 
     fn create_schema(conn: &Connection) -> Result<(), String> {
