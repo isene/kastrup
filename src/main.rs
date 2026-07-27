@@ -1253,6 +1253,31 @@ fn ensure_slack_source(db: &Arc<Database>) {
 }
 
 fn main() {
+    // --help / --version answer before anything else, including the
+    // no-terminal guard below: a CLI that cannot say what it is when
+    // asked over a pipe is useless to any tool that asks (the fe2o3
+    // launcher shows this text in its card popup).
+    if std::env::args().skip(1).any(|a| a == "-h" || a == "--help") {
+        println!("kastrup — unified terminal messaging hub (Fe2O3 suite)");
+        println!();
+        println!("Usage: kastrup [OPTIONS]");
+        println!();
+        println!("  --compose-to ADDR     open a compose window to ADDR");
+        println!("  --subject TEXT        subject for --compose-to");
+        println!("  --weechat-probe       one-shot relay wire test");
+        println!("  -v, --version         print version");
+        println!("  -h, --help            this text");
+        println!();
+        println!("Email, RSS, weechat (Slack / IRC / WhatsApp), Discord and the phone");
+        println!("gateway in one inbox. Views 1-9, + composes, m mutes, ? shows every key.");
+        println!("Data lives in ~/.kastrup/; config in ~/.kastrup/config.yml.");
+        return;
+    }
+    if std::env::args().skip(1).any(|a| a == "-v" || a == "--version") {
+        println!("kastrup {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     // --weechat-probe: M1 one-shot wire test for the relay client.
     // Hijacks main() before any TUI / DB init so the output goes
     // straight to stdout/stderr with no alt-screen interference.
