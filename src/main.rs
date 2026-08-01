@@ -54,6 +54,25 @@ enum DbWriteOp {
     Execute(String, Vec<String>), // raw SQL with string params
 }
 
+/// Name for the slow-write log line. Borrowed match, no allocation —
+/// the writer takes it once per op, and only user actions produce ops.
+fn write_op_label(op: &DbWriteOp) -> &'static str {
+    match op {
+        DbWriteOp::MarkRead(_) => "MarkRead",
+        DbWriteOp::MarkUnread(_) => "MarkUnread",
+        DbWriteOp::ToggleStar(_) => "ToggleStar",
+        DbWriteOp::DeleteMessages(_) => "DeleteMessages",
+        DbWriteOp::UpdateFolder(..) => "UpdateFolder",
+        DbWriteOp::UpdateLabels(..) => "UpdateLabels",
+        DbWriteOp::UpdateMetadata(..) => "UpdateMetadata",
+        DbWriteOp::SyncMaildirFlag(..) => "SyncMaildirFlag",
+        DbWriteOp::MarkAllReadBulk { .. } => "MarkAllReadBulk",
+        DbWriteOp::MarkReadByIds(_) => "MarkReadByIds",
+        DbWriteOp::SetSetting(..) => "SetSetting",
+        DbWriteOp::Execute(..) => "Execute",
+    }
+}
+
 use config::{Config, Identity};
 use database::{Database, Filters};
 use message::Message;
@@ -1458,6 +1477,12 @@ fn main() {
             // (unread or folder membership). Rewriting the count file on
             // every op would be wasteful; gate it.
             let mut counts_dirty = false;
+            // Freeze watchdog: a write that waits seconds on the conn
+            // mutex (or on cold pages inside sqlite) is invisible from
+            // the UI side, so name it here. Two clock reads per op, and
+            // ops only exist because the user did something.
+            let op_label = write_op_label(&op);
+            let op_start = std::time::Instant::now();
             match op {
                 DbWriteOp::MarkRead(id) => { writer_db.mark_as_read(id); counts_dirty = true; }
                 DbWriteOp::MarkUnread(id) => { writer_db.mark_as_unread(id); counts_dirty = true; }
@@ -1558,6 +1583,10 @@ fn main() {
                     let counts = writer_db.unread_count_by_folder();
                     mailfile::write_count_file(cfg, &counts);
                 }
+            }
+            let op_ms = op_start.elapsed().as_millis();
+            if op_ms >= 500 {
+                log::warn(&format!("slow db write {}: {} ms", op_label, op_ms));
             }
         }
         // Channel closed → main thread is shutting down. Force a
@@ -1827,12 +1856,26 @@ fn main() {
                     app.feedback_clear_on_key = false;
                     app.render_bottom_bar();
                 }
+                // Freeze watchdog. Everything the user experiences as a
+                // hang happens between these two clock reads, so a
+                // "kastrup froze" report can name the key that did it
+                // instead of guessing. Same vDSO cost as the resume
+                // watchdog above, and only on an actual keypress.
+                let key_start = std::time::Instant::now();
                 app.handle_key(&k);
                 // A muted channel the user just caught up on re-hides once
                 // they navigate off it (cheap no-op unless a recheck is armed).
                 app.honor_pending_mute_rehide();
+                let key_ms = key_start.elapsed().as_millis();
+                if key_ms >= 250 {
+                    log::warn(&format!("slow key '{}': {} ms", k, key_ms));
+                }
             }
             None => {
+                // Same watchdog for the idle tick: a background refresh
+                // that stalls looks exactly like a hang to the user, and
+                // this arm runs at most once per second.
+                let tick_start = std::time::Instant::now();
                 // Check for new messages from poller
                 let mut new_count = 0usize;
                 if let Some(ref rx) = app.poller_rx {
@@ -1916,6 +1959,10 @@ fn main() {
                 // it's cold once the phone has reported (or timed out).
                 if !app.pending_gateway_replies.is_empty() {
                     app.poll_gateway_reply_status();
+                }
+                let tick_ms = tick_start.elapsed().as_millis();
+                if tick_ms >= 250 {
+                    log::warn(&format!("slow idle tick: {} ms", tick_ms));
                 }
             }
         }
@@ -5174,6 +5221,9 @@ impl App {
     fn purge_deleted(&mut self) {
         if self.delete_marked.is_empty() { return; }
 
+        // Phase clock for the freeze watchdog (logged at the end, only
+        // when the purge was slow enough for the user to feel it).
+        let t_start = std::time::Instant::now();
         let ids: Vec<i64> = self.delete_marked.iter().copied().collect();
         let id_set: std::collections::HashSet<i64> = ids.iter().copied().collect();
 
@@ -5208,8 +5258,8 @@ impl App {
             let file = match id_to_msg.get(&id) {
                 Some(m) => m.metadata.get("maildir_file")
                     .and_then(|v| v.as_str()).map(str::to_string),
-                None => self.db.get_message(id).and_then(|m| {
-                    m.metadata.get("maildir_file")
+                None => self.db.get_message_metadata(id).and_then(|m| {
+                    m.get("maildir_file")
                         .and_then(|v| v.as_str()).map(str::to_string)
                 }),
             };
@@ -5242,6 +5292,7 @@ impl App {
             }
         }
 
+        let ms_files = t_start.elapsed().as_millis();
         let _ = self.write_tx.send(DbWriteOp::DeleteMessages(ids.clone()));
         // Guard against an auto-refresh re-reading the DB before the writer
         // commits and resurrecting these rows. Cleared per-id once gone.
@@ -5308,8 +5359,15 @@ impl App {
             self.index = min_deleted_pos.min(len.saturating_sub(1));
         }
 
+        let ms_list = t_start.elapsed().as_millis();
         self.set_feedback(&format!("Purged {} messages", count), self.config.theme_colors.feedback_ok);
         self.render_all();
+        let ms_total = t_start.elapsed().as_millis();
+        if ms_total >= 250 {
+            log::warn(&format!(
+                "slow purge of {} message(s): {} ms total (files {} ms, list {} ms, render {} ms)",
+                count, ms_total, ms_files, ms_list - ms_files, ms_total - ms_list));
+        }
     }
 
     fn file_message(&mut self) {
