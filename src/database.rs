@@ -684,6 +684,19 @@ impl Database {
         }).ok()
     }
 
+    /// Just the metadata JSON for one message. The purge path needs the
+    /// `maildir_file` key and nothing else; `get_message` would drag the
+    /// full body + html_content along, which on a cold page cache is a
+    /// multi-second D-state read on whichever thread asked (the UI, here).
+    pub fn get_message_metadata(&self, id: i64) -> Option<serde_json::Value> {
+        let conn = self.read();
+        let json: String = conn.query_row(
+            "SELECT metadata FROM messages WHERE id = ?", params![id],
+            |row| row.get(0),
+        ).ok()?;
+        serde_json::from_str(&json).ok()
+    }
+
     /// Get only the full content and html_content for a message (light-to-full upgrade)
     pub fn get_message_content(&self, id: i64) -> Option<(String, Option<String>)> {
         let conn = self.read();
