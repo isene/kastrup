@@ -15141,47 +15141,23 @@ fn home_dir() -> std::path::PathBuf {
 /// Sync the Seen (S) flag to a maildir file on disk.
 /// Maildir flags are in the filename: `unique:2,FLAGS` where S=Seen, F=Flagged, R=Replied.
 /// If the file is in new/, move to cur/ and add the S flag.
+/// Add the maildir `S` flag for one message and persist the new path.
+///
+/// The filesystem half lives in `rename_maildir_add_seen` — including
+/// its recovery for a file that has already moved out from under us.
+/// This used to be a second, older copy of that logic WITHOUT the
+/// recovery: it returned early on a missing path, so a message whose
+/// file had been filed elsewhere never got its metadata corrected. The
+/// 2-minute reconcile then re-found the same rows forever (4 of them,
+/// every tick, since June). One implementation, one behaviour.
 fn sync_maildir_seen_flag(metadata: &serde_json::Value, db: &database::Database, msg_id: i64) {
-    let Some(file_path) = metadata.get("maildir_file").and_then(|v| v.as_str()) else { return };
-    let path = std::path::Path::new(file_path);
-    if !path.exists() { return; }
-
-    let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
-    let parent = path.parent().unwrap_or(std::path::Path::new("."));
-    let parent_name = parent.file_name().and_then(|f| f.to_str()).unwrap_or("");
-
-    let new_filename = if filename.contains(":2,") {
-        // Already has flags section - add S if not present
-        if filename.contains('S') { return; } // Already seen
-        let (base, flags) = filename.rsplit_once(":2,").unwrap();
-        let mut flag_chars: Vec<char> = flags.chars().collect();
-        flag_chars.push('S');
-        flag_chars.sort(); // Maildir flags must be alphabetically sorted
-        format!("{}:2,{}", base, flag_chars.into_iter().collect::<String>())
-    } else {
-        // No flags section yet - add one
-        format!("{}:2,S", filename)
-    };
-
-    // If in new/, move to cur/
-    let new_parent = if parent_name == "new" {
-        parent.parent().unwrap_or(parent).join("cur")
-    } else {
-        parent.to_path_buf()
-    };
-
-    let new_path = new_parent.join(&new_filename);
-    if std::fs::rename(path, &new_path).is_ok() {
-        // Update the metadata in DB with new file path
-        let mut new_meta = metadata.clone();
-        new_meta["maildir_file"] = serde_json::json!(new_path.to_string_lossy().to_string());
-        let meta_json = serde_json::to_string(&new_meta).unwrap_or_default();
-        let conn = db.conn.lock().unwrap();
-        let _ = conn.execute(
-            "UPDATE messages SET metadata = ? WHERE id = ?",
-            rusqlite::params![meta_json, msg_id],
-        );
-    }
+    let Some(new_meta) = rename_maildir_add_seen(metadata) else { return };
+    let meta_json = serde_json::to_string(&new_meta).unwrap_or_default();
+    let conn = db.conn.lock().unwrap();
+    let _ = conn.execute(
+        "UPDATE messages SET metadata = ? WHERE id = ?",
+        rusqlite::params![meta_json, msg_id],
+    );
 }
 
 /// Background version (called from writer thread)
@@ -15386,6 +15362,33 @@ mod tests {
             libc::localtime_r(&mut t as *mut _, &mut tm);
             (tm.tm_hour, tm.tm_min)
         }
+    }
+
+    /// The four rows the reconcile kept re-finding: metadata says the
+    /// file is in new/, the file is really in the sibling cur/ with the
+    /// S flag already on it. The recovery has to point the metadata at
+    /// the real path, otherwise the reconcile finds the same row again
+    /// every two minutes, forever.
+    #[test]
+    fn seen_flag_recovers_a_file_that_already_moved() {
+        let root = std::env::temp_dir()
+            .join(format!("kastrup-seen-{}", std::process::id()));
+        let new_dir = root.join("new");
+        let cur_dir = root.join("cur");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::create_dir_all(&cur_dir).unwrap();
+        let real = cur_dir.join("1780310872.821587_4978_49.juba:2,S");
+        std::fs::write(&real, "body").unwrap();
+
+        let meta = serde_json::json!({
+            "maildir_file": new_dir.join("1780310872.821587_4978_49.juba:2,")
+                .to_string_lossy().to_string(),
+        });
+        let fixed = rename_maildir_add_seen(&meta).expect("recovery should find cur/");
+        assert_eq!(fixed["maildir_file"].as_str().unwrap(),
+                   real.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
