@@ -3181,10 +3181,7 @@ impl App {
             // has stripped headers (the Nordea bug — the body was
             // QP-encoded but the explicit CTE header was gone, so
             // we render `p=E5` instead of `på`).
-            let body_start = raw.find("\n\n").map(|p| p + 2)
-                .or_else(|| raw.find("\r\n\r\n").map(|p| p + 4))
-                .unwrap_or(0);
-            decode_quoted_printable(&raw[body_start..])
+            decode_quoted_printable(&raw[body_after_headers(raw)..])
         } else {
             raw.clone()
         };
@@ -8972,10 +8969,7 @@ impl App {
             // heuristic — see `render_message_content` for the same
             // shape and the same reason it has to live here too
             // (yank / snippet / search go through this path).
-            let body_start = raw.find("\n\n").map(|p| p + 2)
-                .or_else(|| raw.find("\r\n\r\n").map(|p| p + 4))
-                .unwrap_or(0);
-            decode_quoted_printable(&raw[body_start..])
+            decode_quoted_printable(&raw[body_after_headers(raw)..])
         } else {
             raw.clone()
         };
@@ -14027,6 +14021,33 @@ fn decode_quoted_printable(s: &str) -> String {
 /// line break `=\n` / `=\r\n` is the cleanest signal and rarely
 /// shows up in plain ASCII text; failing that we count `=XX` hex
 /// escapes and require a couple before declaring the body QP.
+/// Where the body starts, given text that may or may not still carry
+/// its MIME headers.
+///
+/// Skipping to the first blank line unconditionally is what threw away
+/// the opening paragraph of every header-less mail — and in a short
+/// reply the opening paragraph IS the reply. The maildir parser strips
+/// headers at ingest, so most stored bodies have none, and their first
+/// blank line is just a paragraph break.
+fn body_after_headers(raw: &str) -> usize {
+    let (at, after) = match raw.find("\n\n").map(|p| (p, p + 2))
+        .or_else(|| raw.find("\r\n\r\n").map(|p| (p, p + 4)))
+    {
+        Some(v) => v,
+        None => return 0,
+    };
+    // Every line before the blank one has to look like a header (or a
+    // folded continuation of one) for this to be a header block.
+    let is_headers = raw[..at].lines().all(|l| {
+        l.starts_with(' ') || l.starts_with('\t') || l.is_empty()
+            || l.split_once(':').map(|(name, _)| {
+                !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            }).unwrap_or(false)
+    });
+    if is_headers { after } else { 0 }
+}
+
 fn looks_quoted_printable(s: &str) -> bool {
     if s.contains("=\n") || s.contains("=\r\n") { return true; }
     let bytes = s.as_bytes();
@@ -15389,6 +15410,36 @@ mod tests {
         assert_eq!(fixed["maildir_file"].as_str().unwrap(),
                    real.to_string_lossy());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The bug this exists to stop: a short reply whose whole substance
+    /// is the first paragraph, stored without headers because the
+    /// maildir parser already stripped them.
+    #[test]
+    fn a_headerless_body_keeps_its_first_paragraph() {
+        let body = "Hei Geir\n\
+                    Det ser greit ut. Har n=C3=A5 sendt inn fullmakt, =\n\
+                    s=C3=A5 da skal det v=C3=A6re i orden. Mitt kontonr. 1234 56 78901\n\
+                    \n\
+                    Mvh\n";
+        assert_eq!(body_after_headers(body), 0, "no headers here to skip");
+        let decoded = decode_quoted_printable(&body[body_after_headers(body)..]);
+        assert!(decoded.starts_with("Hei Geir"), "got: {}", &decoded[..20.min(decoded.len())]);
+        assert!(decoded.contains("1234 56 78901"), "the account number survives");
+        assert!(decoded.contains("være i orden"), "soft breaks and =XX still decode");
+    }
+
+    #[test]
+    fn a_real_header_block_is_still_skipped() {
+        let mail = "Content-Type: text/plain\n\
+                    Content-Transfer-Encoding: quoted-printable\n\
+                    X-Folded: one\n\
+                    \ttwo\n\
+                    \n\
+                    Hei\n";
+        let at = body_after_headers(mail);
+        assert!(at > 0);
+        assert_eq!(&mail[at..], "Hei\n");
     }
 
     #[test]
