@@ -791,12 +791,22 @@ fn shorten_url_label(url: &str) -> String {
 /// `HeaderBold` style). Both share the same fg color. Inline email
 /// addresses inside the value are colored 177 with the outer color
 /// restored after.
+/// One header line, drawn the way scribe draws it.
+///
+/// `highlight::EmailLineStyle::HeaderBold` means the WHOLE line carries
+/// the header colour with the key merely bolded on top. This coloured
+/// only the key and handed the value to `color_emails`, which sets a
+/// colour at each address and restores after it but never sets one to
+/// begin with — so a value stayed in the terminal's default until its
+/// first email address, and a Subject with no address stayed white
+/// throughout. The same mail in scribe was fully coloured.
 fn header_row(key: &str, value: &str, color: u8) -> String {
-    let val_styled = highlight::color_emails(value, Some(color));
     format!(
-        "{} {}",
-        style::bold(&style::fg(key, color)),
-        val_styled
+        "{} {}{}{}",
+        style::styled(key, Some(color), None, "b"),
+        style::set_fg(color),
+        highlight::color_emails(value, Some(color)),
+        style::RESET,
     )
 }
 
@@ -15415,6 +15425,20 @@ mod tests {
     /// The bug this exists to stop: a short reply whose whole substance
     /// is the first paragraph, stored without headers because the
     /// maildir parser already stripped them.
+    /// scribe draws a header line wholly in the header colour with the
+    /// key bolded. kastrup coloured only the key, so a From: value went
+    /// white until its first email address and a Subject stayed white
+    /// throughout.
+    #[test]
+    fn a_header_row_colours_the_whole_value() {
+        let row = header_row("From:", "Kumar S <k@example.com>", 2);
+        assert!(row.contains(&format!("{}Kumar S", crust::style::set_fg(2))),
+                "the value has to open in the header colour: {:?}", row);
+        let subject = header_row("Subject:", "No address in here", 1);
+        assert!(subject.contains(&format!("{}No address in here", crust::style::set_fg(1))),
+                "a value with no address is coloured too: {:?}", subject);
+    }
+
     #[test]
     fn a_headerless_body_keeps_its_first_paragraph() {
         let body = "Hei Geir\n\
