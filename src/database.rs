@@ -762,6 +762,22 @@ impl Database {
         }
     }
 
+    /// Message-IDs of mail deleted here recently. Deleting is the
+    /// strongest "I am done with this" there is, so the phone should not
+    /// keep showing it as new — these go out as read.
+    pub fn recent_deleted_message_ids(&self, since: i64) -> Vec<String> {
+        let conn = self.read();
+        let mut stmt = match conn.prepare(
+            "SELECT message_id FROM deleted_external_ids \
+             WHERE deleted_at > ? AND message_id IS NOT NULL"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };   // no column yet: nothing to say
+        let rows = stmt.query_map(params![since], |r| r.get::<_, String>(0));
+        match rows {
+            Ok(it) => it.filter_map(|r| r.ok()).filter(|m| !m.is_empty()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub fn mark_as_read(&self, id: i64) {
         self.touch_read_state();
         let conn = self.conn.lock().unwrap();
@@ -949,10 +965,17 @@ impl Database {
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS deleted_external_ids (external_id TEXT PRIMARY KEY, source_id INTEGER, deleted_at INTEGER)"
         );
+        // Carry the RFC822 Message-ID across with the tombstone. It is the
+        // only identity the phone shares, and once the row is gone there is
+        // nowhere else to read it from — so a message deleted here can be
+        // published as read rather than sitting unread on the phone for
+        // ever. Errors ignored: the column already exists on second run.
+        let _ = conn.execute("ALTER TABLE deleted_external_ids ADD COLUMN message_id TEXT", []);
         let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
         let select_sql = format!(
-            "INSERT OR IGNORE INTO deleted_external_ids (external_id, source_id, deleted_at) \
-             SELECT external_id, source_id, {} FROM messages WHERE id IN ({})",
+            "INSERT OR IGNORE INTO deleted_external_ids (external_id, source_id, deleted_at, message_id) \
+             SELECT external_id, source_id, {}, json_extract(metadata, '$.message_id') \
+             FROM messages WHERE id IN ({})",
             now_secs(), placeholders.join(",")
         );
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
