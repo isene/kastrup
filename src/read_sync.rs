@@ -105,7 +105,8 @@ impl ReadSync {
     pub fn sync(&mut self, db: &Database) -> usize {
         let since = now_secs() - self.days * 86_400;
         let rows = db.recent_mail_read_state(since);
-        if rows.is_empty() { return 0; }
+        let deleted = db.recent_deleted_message_ids(since);
+        if rows.is_empty() && deleted.is_empty() { return 0; }
 
         let theirs = read_state::merge_all(
             self.others.iter()
@@ -115,7 +116,7 @@ impl ReadSync {
                 .map(|s| s.as_str())
         );
 
-        let plan = plan(&rows, &theirs, &mut self.marks, now_secs());
+        let plan = plan(&rows, &deleted, &theirs, &mut self.marks, now_secs());
         for (id, read) in &plan.apply {
             if *read { db.mark_as_read(*id) } else { db.mark_as_unread(*id) }
         }
@@ -139,8 +140,14 @@ pub struct Plan {
 /// what we tell everyone else and our memory of *when* each state was
 /// last set — the database has the states but not the times, and the
 /// merge is decided on times.
+///
+/// `deleted` are Message-IDs of mail deleted here. They travel one way
+/// only — published as read, never importable. A deletion is final on
+/// this side, and letting a phone mark argue with it would flip the
+/// state back and forth on every pass.
 pub fn plan(
     rows: &[(i64, String, bool)],
+    deleted: &[String],
     theirs: &Marks,
     marks: &mut Marks,
     now: i64,
@@ -172,10 +179,21 @@ pub fn plan(
         }
     }
 
+    // Deleted here means dealt with. One direction only, and it wins:
+    // whatever anyone else thinks, this is not new mail.
+    for mid in deleted {
+        match marks.get(mid) {
+            Some(m) if m.read => {}
+            _ => { marks.insert(mid.clone(), Mark { read: true, ts: now }); changed = true; }
+        }
+    }
+
     // Nothing outside the window can still be argued about, so it is
     // dead weight. This is what keeps the file from growing for ever.
     let live: std::collections::HashSet<&str> =
-        rows.iter().map(|(_, mid, _)| mid.as_str()).collect();
+        rows.iter().map(|(_, mid, _)| mid.as_str())
+            .chain(deleted.iter().map(|m| m.as_str()))
+            .collect();
     let before = marks.len();
     marks.retain(|k, _| live.contains(k.as_str()));
     if marks.len() != before { changed = true; }
@@ -212,7 +230,7 @@ mod tests {
     #[test]
     fn a_read_here_gets_published() {
         let mut mine = Marks::new();
-        let p = plan(&rows(&[(1, "a@x", true)]), &Marks::new(), &mut mine, 500);
+        let p = plan(&rows(&[(1, "a@x", true)]), &[], &Marks::new(), &mut mine, 500);
         assert!(p.apply.is_empty(), "nobody else asked for anything");
         assert!(p.changed);
         assert_eq!(mine.get("a@x").map(|m| (m.read, m.ts)), Some((true, 500)));
@@ -222,7 +240,7 @@ mod tests {
     fn a_phone_mark_reaches_the_database() {
         let mut mine = marks(&[("a@x", false, 100)]);
         let theirs = marks(&[("a@x", true, 200)]);
-        let p = plan(&rows(&[(7, "a@x", false)]), &theirs, &mut mine, 500);
+        let p = plan(&rows(&[(7, "a@x", false)]), &[], &theirs, &mut mine, 500);
         assert_eq!(p.apply, vec![(7, true)]);
         // Their timestamp is adopted, not restamped with `now`.
         assert_eq!(mine.get("a@x").map(|m| m.ts), Some(200));
@@ -234,7 +252,7 @@ mod tests {
         // laptop win every argument for ever, and no phone mark could
         // ever land.
         let mut mine = marks(&[("a@x", true, 100)]);
-        let p = plan(&rows(&[(1, "a@x", true)]), &Marks::new(), &mut mine, 900);
+        let p = plan(&rows(&[(1, "a@x", true)]), &[], &Marks::new(), &mut mine, 900);
         assert!(!p.changed);
         assert_eq!(mine.get("a@x").map(|m| m.ts), Some(100));
     }
@@ -243,7 +261,7 @@ mod tests {
     fn an_older_phone_mark_loses() {
         let mut mine = marks(&[("a@x", true, 300)]);
         let theirs = marks(&[("a@x", false, 100)]);
-        let p = plan(&rows(&[(1, "a@x", true)]), &theirs, &mut mine, 500);
+        let p = plan(&rows(&[(1, "a@x", true)]), &[], &theirs, &mut mine, 500);
         assert!(p.apply.is_empty());
         assert_eq!(mine.get("a@x").map(|m| (m.read, m.ts)), Some((true, 300)));
     }
@@ -254,17 +272,17 @@ mod tests {
         // timestamp is taken so the next pass has nothing to do either.
         let mut mine = marks(&[("a@x", true, 100)]);
         let theirs = marks(&[("a@x", true, 200)]);
-        let first = plan(&rows(&[(1, "a@x", true)]), &theirs, &mut mine, 500);
+        let first = plan(&rows(&[(1, "a@x", true)]), &[], &theirs, &mut mine, 500);
         assert!(first.apply.is_empty());
         assert_eq!(mine.get("a@x").map(|m| m.ts), Some(200));
-        let second = plan(&rows(&[(1, "a@x", true)]), &theirs, &mut mine, 600);
+        let second = plan(&rows(&[(1, "a@x", true)]), &[], &theirs, &mut mine, 600);
         assert!(!second.changed, "settled");
     }
 
     #[test]
     fn what_falls_out_of_the_window_is_forgotten() {
         let mut mine = marks(&[("old@x", true, 1), ("a@x", true, 2)]);
-        let p = plan(&rows(&[(1, "a@x", true)]), &Marks::new(), &mut mine, 500);
+        let p = plan(&rows(&[(1, "a@x", true)]), &[], &Marks::new(), &mut mine, 500);
         assert!(p.changed);
         assert_eq!(mine.len(), 1);
         assert!(mine.contains_key("a@x"));
@@ -294,10 +312,34 @@ mod tests {
     }
 
     #[test]
+    fn deleting_here_shows_read_on_the_phone() {
+        let mut mine = Marks::new();
+        let p = plan(&[], &["gone@x".to_string()], &Marks::new(), &mut mine, 500);
+        assert!(p.apply.is_empty(), "there is no row left to update");
+        assert!(p.changed);
+        assert_eq!(mine.get("gone@x").map(|m| m.read), Some(true));
+    }
+
+    #[test]
+    fn a_deletion_cannot_be_argued_with() {
+        // The phone marks a deleted message unread. Without the one-way
+        // rule this flips on every pass: import adopts false, export
+        // sees the deletion and writes true, forever.
+        let mut mine = marks(&[("gone@x", true, 100)]);
+        let theirs = marks(&[("gone@x", false, 900)]);
+        let del = vec!["gone@x".to_string()];
+        let first = plan(&[], &del, &theirs, &mut mine, 500);
+        assert!(first.apply.is_empty());
+        assert_eq!(mine.get("gone@x").map(|m| m.read), Some(true));
+        let second = plan(&[], &del, &theirs, &mut mine, 600);
+        assert!(!second.changed, "settled, not oscillating");
+    }
+
+    #[test]
     fn unread_again_travels_too() {
         let mut mine = marks(&[("a@x", true, 100)]);
         let theirs = marks(&[("a@x", false, 200)]);
-        let p = plan(&rows(&[(3, "a@x", true)]), &theirs, &mut mine, 500);
+        let p = plan(&rows(&[(3, "a@x", true)]), &[], &theirs, &mut mine, 500);
         assert_eq!(p.apply, vec![(3, false)]);
     }
 }

@@ -167,8 +167,14 @@ The rule is asymmetric, and it falls out of what each side *writes*:
 | Event | Effect |
 |---|---|
 | Read here | Read on the phone |
+| Deleted here | Read on the phone |
 | Merely opened on the phone | Nothing |
 | **Mark READ** on the phone | Read here |
+
+Deleting travels because deleting is the strongest "done with this" there
+is, and the phone reads the IMAP inbox directly — it never sees the
+delete, so without this the message sits there as new for ever. It goes
+one way only: a deletion here cannot be argued back by a phone.
 
 Idle cost is one atomic load plus a couple of `stat()`s every 5 s. The
 database is queried only when a mark has actually moved on one side.
