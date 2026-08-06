@@ -65,6 +65,10 @@ pub struct Database {
     /// This is the fix for the "single SQLite mutex held across a slow read
     /// freezes the whole UI" stall: more connections, not finer locking.
     read_pool: Mutex<Vec<Connection>>,
+    /// Set by every path that changes a message's read state, cleared by
+    /// the read-state export. One atomic load per idle tick is what keeps
+    /// that export off a timer: nothing changed, nothing runs.
+    read_dirty: std::sync::atomic::AtomicBool,
 }
 
 /// A read connection checked out of `Database::read_pool`. Derefs to the
@@ -211,7 +215,11 @@ impl Database {
             // additive belongs here too.
             Self::ensure_added_tables(&conn);
         }
-        Ok(Self { conn: Mutex::new(conn), read_pool: Mutex::new(Vec::new()) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+            read_pool: Mutex::new(Vec::new()),
+            read_dirty: std::sync::atomic::AtomicBool::new(true),
+        })
     }
 
     /// Open an independent connection to the same DB file. WAL mode lets
@@ -721,19 +729,55 @@ impl Database {
     }
 
     /// Mark a message as read
+    /// Note that read state moved, so the export knows to run. Cheap
+    /// enough to call from every path that touches `read`.
+    pub fn touch_read_state(&self) {
+        self.read_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// True once per batch of changes. Clears as it reports.
+    pub fn take_read_dirty(&self) -> bool {
+        self.read_dirty.swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Recent mail, for the read state shared with the phone: row id,
+    /// RFC822 Message-ID, read. Bounded by `since` and index-backed
+    /// (`idx_messages_timestamp`), so it stays a few hundred rows on a
+    /// database of millions.
+    pub fn recent_mail_read_state(&self, since: i64) -> Vec<(i64, String, bool)> {
+        let conn = self.read();
+        let mut stmt = match conn.prepare(
+            "SELECT id, json_extract(metadata, '$.message_id'), read \
+             FROM messages WHERE timestamp > ? AND metadata LIKE '%\"message_id\"%' \
+             ORDER BY timestamp DESC"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };
+        let rows = stmt.query_map(params![since], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, i64>(2)?))
+        });
+        match rows {
+            Ok(it) => it.filter_map(|r| r.ok())
+                .filter_map(|(id, mid, read)| mid.map(|m| (id, m, read != 0)))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub fn mark_as_read(&self, id: i64) {
+        self.touch_read_state();
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute("UPDATE messages SET read = 1 WHERE id = ?", params![id]);
     }
 
     /// Mark a message as unread
     pub fn mark_as_unread(&self, id: i64) {
+        self.touch_read_state();
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute("UPDATE messages SET read = 0 WHERE id = ?", params![id]);
     }
 
     /// Toggle read status, returning new state
     pub fn toggle_read(&self, id: i64) -> bool {
+        self.touch_read_state();
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
             "UPDATE messages SET read = NOT read WHERE id = ?", params![id]
@@ -815,6 +859,7 @@ impl Database {
     }
 
     pub fn mark_all_as_read(&self, view_filter: Option<&Filters>) {
+        self.touch_read_state();
         let conn = self.conn.lock().unwrap();
         match view_filter {
             Some(f) => {
@@ -884,6 +929,7 @@ impl Database {
     /// Flip `read = 1` on the explicit id set. No-op if empty.
     pub fn mark_as_read_by_ids(&self, ids: &[i64]) {
         if ids.is_empty() { return; }
+        self.touch_read_state();
         let conn = self.conn.lock().unwrap();
         let ph: Vec<&str> = ids.iter().map(|_| "?").collect();
         let sql = format!(

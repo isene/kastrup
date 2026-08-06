@@ -8,6 +8,7 @@ mod mailfile;
 mod message;
 mod organizer;
 mod poller;
+mod read_sync;
 mod source;
 mod sources;
 mod triage;
@@ -76,6 +77,14 @@ fn write_op_label(op: &DbWriteOp) -> &'static str {
 use config::{Config, Identity};
 use database::{Database, Filters};
 use message::Message;
+// Email plumbing, shared with the nomad phone app so the two cannot
+// drift. Imported unqualified: every call site here predates the crate
+// and reads the same either way.
+use mail::html::html_to_text;
+use mail::mime::{
+    body_after_headers, decode_quoted_printable, latin1_to_utf8, looks_base64,
+    looks_quoted_printable, normalize_line_endings,
+};
 
 /// One in-flight SMTP send. The shell child runs on a dedicated
 /// thread and sends `(success, stderr)` back through `result_rx` when
@@ -1042,6 +1051,10 @@ struct App {
     /// loop). Throttles it to ~once every 2 min on the loop's existing
     /// wake — no new timer thread.
     last_reconcile: std::time::Instant,
+    /// Read state shared with the phone. `None` when no folder is
+    /// configured, and then nothing here runs at all.
+    read_sync: Option<read_sync::ReadSync>,
+    last_read_sync: std::time::Instant,
     /// Phone-gateway replies awaiting a delivery result from the relay:
     /// (request id, "<platform>:<thread_key>" label, queued-at, warned). The
     /// main loop polls the relay's status markers while this is non-empty and
@@ -1640,6 +1653,8 @@ fn main() {
         }
     });
 
+    // Read state exchange, resolved before `config` moves into App.
+    let read_sync = read_sync::ReadSync::new(&config.read_sync_dir, config.read_sync_days);
     let mut app = App {
         top, left, right, bottom,
         cols, rows,
@@ -1648,6 +1663,8 @@ fn main() {
         source_type_map,
         last_db_refresh: std::time::Instant::now(),
         last_reconcile: std::time::Instant::now(),
+        read_sync,
+        last_read_sync: std::time::Instant::now(),
         pending_gateway_replies: Vec::new(),
         running: true,
         current_view: "A".to_string(),
@@ -1963,6 +1980,25 @@ fn main() {
                     let db = app.db.clone();
                     let wtx = app.write_tx.clone();
                     std::thread::spawn(move || reconcile_stuck_maildir(&db, &wtx));
+                }
+                // Read state with the phone. Gated twice over: no folder
+                // configured and this is a null check; folder configured
+                // and it is an atomic load plus a couple of stat()s. The
+                // database is only touched when a mark actually moved.
+                if app.last_read_sync.elapsed().as_secs() >= 5 {
+                    app.last_read_sync = std::time::Instant::now();
+                    let ours = app.db.take_read_dirty();
+                    if let Some(ref mut rs) = app.read_sync {
+                        if ours || rs.others_changed() {
+                            if rs.sync(&app.db) > 0 {
+                                // The phone moved something; our own
+                                // write set the flag again, and it has
+                                // already been published.
+                                app.db.take_read_dirty();
+                                app.messages_dirty.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
                 }
                 // Surface phone delivery results for queued gateway replies.
                 // Only touches the filesystem while a reply is outstanding, so
@@ -13112,142 +13148,14 @@ fn extract_json_object(s: &str) -> Option<&str> {
     None
 }
 
-/// Extract readable text from raw MIME multipart content.
+/// The multipart walk lives in the shared crate now. The calendar
+/// renderer stays here: how an invite should look depends on the
+/// display and on taste, and the crate deliberately holds no colours.
 fn extract_mime_text(raw: &str) -> Option<String> {
-    extract_mime_text_depth(raw, 0)
+    mail::mime::extract_mime_text_with(raw, &parse_ical_summary)
 }
 
-fn extract_mime_text_depth(raw: &str, depth: usize) -> Option<String> {
-    if depth > 5 { return None; }
-    // Detect MIME boundary: prefer first "--" line if content starts with one,
-    // otherwise use boundary= attribute, fallback to first "--" line anywhere.
-    let first_line = raw.lines().find(|l| !l.trim().is_empty());
-    let boundary = if first_line.map(|l| l.starts_with("--") && l.len() > 5).unwrap_or(false) {
-        // Content starts with a boundary line: use it as the primary boundary
-        first_line.unwrap()[2..].trim_end_matches("--").trim().to_string()
-    } else if let Some(pos) = raw.find("boundary=") {
-        let rest = &raw[pos + 9..];
-        let b = rest.trim_start_matches('"').split('"').next()
-            .or_else(|| rest.split_whitespace().next())
-            .unwrap_or("");
-        if b.is_empty() { return None; }
-        b.to_string()
-    } else {
-        raw.lines()
-            .find(|l| l.starts_with("--") && l.len() > 5)
-            .map(|l| l[2..].trim_end_matches(':').trim().to_string())?
-    };
 
-    let delimiter = format!("--{}", boundary);
-    let parts: Vec<&str> = raw.split(&delimiter).collect();
-
-    // Find text/plain part first, fall back to text/html, then text/calendar
-    let mut text_part = None;
-    let mut html_part = None;
-    let mut cal_part = None;
-    for part in &parts {
-        let lower = part.to_lowercase();
-        if let Some(header_end) = part.find("\n\n").or_else(|| part.find("\r\n\r\n")) {
-            let headers = &part[..header_end];
-            let body_start = if part[header_end..].starts_with("\r\n\r\n") { header_end + 4 } else { header_end + 2 };
-            let body = &part[body_start..];
-            let headers_lower = headers.to_lowercase();
-            let is_qp = headers_lower.contains("quoted-printable");
-            let is_b64 = headers_lower.contains("base64");
-
-            // Detect charset for proper decoding
-            let is_latin1 = headers_lower.contains("iso-8859") || headers_lower.contains("windows-1252");
-
-            // Recurse into nested multipart parts
-            if headers_lower.contains("multipart/") {
-                if let Some(result) = extract_mime_text_depth(part, depth + 1) {
-                    if text_part.is_none() { text_part = Some(result); }
-                }
-                continue;
-            }
-
-            if lower.contains("text/plain") {
-                let decoded = if is_qp {
-                    let bytes = decode_qp_bytes_body(body);
-                    decode_body_bytes(&bytes, is_latin1)
-                } else if is_b64 {
-                    let bytes = sources::maildir::base64_decode(body.trim()).unwrap_or_default();
-                    decode_body_bytes(&bytes, is_latin1)
-                } else { body.to_string() };
-                if !decoded.trim().is_empty() { text_part = Some(decoded); }
-            } else if lower.contains("text/html") {
-                let decoded = if is_qp {
-                    let bytes = decode_qp_bytes_body(body);
-                    decode_body_bytes(&bytes, is_latin1)
-                } else if is_b64 {
-                    let bytes = sources::maildir::base64_decode(body.trim()).unwrap_or_default();
-                    decode_body_bytes(&bytes, is_latin1)
-                } else { body.to_string() };
-                html_part = Some(decoded);
-            } else if lower.contains("text/calendar") && cal_part.is_none() {
-                let decoded = if is_b64 {
-                    sources::maildir::base64_decode(body.trim())
-                        .and_then(|b| String::from_utf8(b).ok())
-                        .unwrap_or_default()
-                } else {
-                    body.to_string()
-                };
-                if !decoded.is_empty() { cal_part = Some(parse_ical_summary(&decoded)); }
-            }
-        }
-    }
-
-    // Skip text/plain if it's just a "your client doesn't support HTML" fallback
-    let text_is_fallback = text_part.as_ref().map(|t| {
-        let lower = t.to_lowercase();
-        lower.contains("html-e-poster") || lower.contains("html e-post")
-            || lower.contains("doesn't support html") || lower.contains("does not support html")
-            || lower.contains("not displayed") || lower.contains("html messages are not support")
-            || (t.trim().lines().count() <= 3 && html_part.is_some())
-    }).unwrap_or(false);
-
-    let effective_text = if text_is_fallback { None } else { text_part };
-
-    // If text_part contains HTML entities, decode them
-    let body = effective_text
-        .map(|t| {
-            let has_entities = regex::Regex::new(r"&[a-zA-Z]+;|&#\d+;|&#x[0-9a-fA-F]+;")
-                .map(|re| re.is_match(&t)).unwrap_or(false);
-            if has_entities {
-                html_to_text(&t)
-            } else { t }
-        })
-        .or_else(|| html_part.map(|h| html_to_text(&h)).filter(|t| !t.trim().is_empty()));
-
-    // Normalise line endings on the extracted body. Legacy clients (and
-    // some receipt-system mailers, e.g. Mitt Dekkhotell) emit CR-only
-    // line terminators inside a base64 text/plain part. After base64
-    // decode the bare `\r` bytes survive into the string, and Rust's
-    // `str::lines()` only splits on `\n` or `\r\n` — so the whole body
-    // is treated as ONE logical line. When that line is later printed
-    // via the right pane's positioning, each embedded `\r` makes the
-    // terminal cursor jump to column 1 of the row, overwriting the
-    // adjacent left pane with body text. Convert CRLF → LF first, then
-    // any remaining bare CR → LF.
-    let body = body.map(normalize_line_endings);
-    // When this is a calendar invite (text/calendar part present), put the
-    // structured summary on top followed by the plain-text body. That way
-    // the user sees "Title / When / Where / Organizer" first and the
-    // Teams/Zoom join block below.
-    match (cal_part, body) {
-        (Some(cal), Some(text)) => Some(format!("{}\n\n---\n\n{}", cal, text)),
-        (Some(cal), None)       => Some(cal),
-        (None,      Some(text)) => Some(text),
-        (None,      None)       => None,
-    }
-}
-
-/// CRLF / CR-only → LF. Single allocation only when the input actually
-/// contains a CR; otherwise returns the original string unchanged.
-fn normalize_line_endings(s: String) -> String {
-    if !s.contains('\r') { return s; }
-    s.replace("\r\n", "\n").replace('\r', "\n")
-}
 
 /// Pick the most useful HTML representation of a message for the
 /// "open in scroll / browser" path. Tries, in order:
@@ -13878,29 +13786,7 @@ fn looks_qp_html(s: &str) -> bool {
     has_qp && looks_like_html(s)
 }
 
-/// Check if content looks like raw base64 (no MIME headers, just base64 lines).
-fn looks_base64(s: &str) -> bool {
-    let trimmed = s.trim();
-    if trimmed.len() < 20 { return false; }
-    // Check first few lines: should be long lines of base64 chars only
-    let mut b64_lines = 0;
-    for line in trimmed.lines().take(5) {
-        let l = line.trim();
-        if l.is_empty() { continue; }
-        if l.len() < 20 { return false; }
-        if l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=') {
-            b64_lines += 1;
-        } else {
-            return false;
-        }
-    }
-    b64_lines >= 2
-}
 
-/// Convert ISO-8859-1 / Windows-1252 bytes to UTF-8 string.
-fn latin1_to_utf8(bytes: &[u8]) -> String {
-    bytes.iter().map(|&b| b as char).collect()
-}
 
 /// Decode a body byte buffer using the declared MIME charset, but
 /// don't blindly trust the declaration. Many senders mark UTF-8
@@ -13970,521 +13856,18 @@ fn decode_qp_bytes_body(s: &str) -> Vec<u8> {
     bytes
 }
 
-/// Decode quoted-printable encoding: =XX hex escapes, =\n soft line breaks
-fn decode_quoted_printable(s: &str) -> String {
-    let mut bytes = Vec::with_capacity(s.len());
-    let input = s.as_bytes();
-    let mut i = 0;
-    while i < input.len() {
-        if input[i] == b'=' {
-            if i + 1 < input.len() && (input[i + 1] == b'\r' || input[i + 1] == b'\n') {
-                // Soft line break
-                i += 1;
-                if i < input.len() && input[i] == b'\r' { i += 1; }
-                if i < input.len() && input[i] == b'\n' { i += 1; }
-            } else if i + 2 < input.len() {
-                let b1 = input[i + 1];
-                let b2 = input[i + 2];
-                if b1.is_ascii_hexdigit() && b2.is_ascii_hexdigit() {
-                    let hex = [b1, b2];
-                    // SAFETY: both bytes are ASCII hex digits -> valid UTF-8
-                    let hex_str = std::str::from_utf8(&hex).unwrap();
-                    if let Ok(byte) = u8::from_str_radix(hex_str, 16) {
-                        bytes.push(byte);
-                        i += 3;
-                    } else {
-                        bytes.push(b'=');
-                        i += 1;
-                    }
-                } else {
-                    // Bare `=` not followed by ASCII hex (e.g. preceding a
-                    // UTF-8 multi-byte char) — emit literally.
-                    bytes.push(b'=');
-                    i += 1;
-                }
-            } else {
-                bytes.push(b'=');
-                i += 1;
-            }
-        } else {
-            bytes.push(input[i]);
-            i += 1;
-        }
-    }
-    // Try UTF-8 first. When that fails the bytes are almost always
-    // latin1 / Windows-1252 (the Nordics see plenty of these — bank
-    // mailers, .no government letters, etc.). The previous fallback
-    // was `from_utf8_lossy`, which substitutes U+FFFD and showed the
-    // user `?`-in-a-box wherever the original had `å` / `ø` / `æ`.
-    // Latin1 maps one byte → one codepoint with no possible failure
-    // and produces sensible text for any 8-bit-encoded payload; the
-    // small mismatch between latin1 and Cp1252 (a handful of
-    // punctuation glyphs in 0x80..0x9F) is barely visible compared
-    // to losing every Norwegian vowel.
-    String::from_utf8(bytes).unwrap_or_else(|e| latin1_to_utf8(e.as_bytes()))
-}
 
-/// Heuristic: does this look like a quoted-printable payload? Used by
-/// the render and yank paths to decide whether to QP-decode a body
-/// when the `Content-Transfer-Encoding` header has been stripped by
-/// the ingestion stage (the maildir parser does that). The soft
-/// line break `=\n` / `=\r\n` is the cleanest signal and rarely
-/// shows up in plain ASCII text; failing that we count `=XX` hex
-/// escapes and require a couple before declaring the body QP.
-/// Where the body starts, given text that may or may not still carry
-/// its MIME headers.
-///
-/// Skipping to the first blank line unconditionally is what threw away
-/// the opening paragraph of every header-less mail — and in a short
-/// reply the opening paragraph IS the reply. The maildir parser strips
-/// headers at ingest, so most stored bodies have none, and their first
-/// blank line is just a paragraph break.
-fn body_after_headers(raw: &str) -> usize {
-    let (at, after) = match raw.find("\n\n").map(|p| (p, p + 2))
-        .or_else(|| raw.find("\r\n\r\n").map(|p| (p, p + 4)))
-    {
-        Some(v) => v,
-        None => return 0,
-    };
-    // Every line before the blank one has to look like a header (or a
-    // folded continuation of one) for this to be a header block.
-    let is_headers = raw[..at].lines().all(|l| {
-        l.starts_with(' ') || l.starts_with('\t') || l.is_empty()
-            || l.split_once(':').map(|(name, _)| {
-                !name.is_empty()
-                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-            }).unwrap_or(false)
-    });
-    if is_headers { after } else { 0 }
-}
 
-fn looks_quoted_printable(s: &str) -> bool {
-    if s.contains("=\n") || s.contains("=\r\n") { return true; }
-    let bytes = s.as_bytes();
-    let mut hits = 0u32;
-    let mut i = 0;
-    while i + 2 < bytes.len() {
-        if bytes[i] == b'=' && bytes[i+1].is_ascii_hexdigit() && bytes[i+2].is_ascii_hexdigit() {
-            hits += 1;
-            if hits >= 3 { return true; }
-            i += 3;
-        } else {
-            i += 1;
-        }
-    }
-    false
-}
 
 // --- HTML to text ---
 
-/// Decode a named HTML entity like "&micro;" into its character. Returns
-/// `Some('\u{200C}')` for zero-width entities so the caller can skip them
-/// without treating them as "unknown". Returns `None` for unrecognised
-/// entities — caller can leave them verbatim or try numeric fallback.
-fn decode_html_named_entity(entity: &str) -> Option<char> {
-    match entity {
-        // Structural / basic
-        "&amp;" => Some('&'), "&lt;" => Some('<'), "&gt;" => Some('>'),
-        "&quot;" => Some('"'), "&apos;" => Some('\''), "&nbsp;" => Some(' '),
-        "&zwnj;" | "&zwj;" => Some('\u{200C}'),
 
-        // Punctuation / dashes / quotes
-        "&ndash;" => Some('\u{2013}'), "&mdash;" => Some('\u{2014}'),
-        "&lsquo;" => Some('\u{2018}'), "&rsquo;" => Some('\u{2019}'),
-        "&sbquo;" => Some('\u{201A}'), "&bdquo;" => Some('\u{201E}'),
-        "&ldquo;" => Some('\u{201C}'), "&rdquo;" => Some('\u{201D}'),
-        "&lsaquo;" => Some('\u{2039}'), "&rsaquo;" => Some('\u{203A}'),
-        "&laquo;" => Some('\u{00AB}'), "&raquo;" => Some('\u{00BB}'),
-        "&bull;" => Some('\u{2022}'), "&hellip;" => Some('\u{2026}'),
-        "&prime;" => Some('\u{2032}'), "&Prime;" => Some('\u{2033}'),
-        "&oline;" => Some('\u{203E}'), "&middot;" => Some('\u{00B7}'),
-        "&para;" => Some('\u{00B6}'), "&sect;" => Some('\u{00A7}'),
-        "&iexcl;" => Some('\u{00A1}'), "&iquest;" => Some('\u{00BF}'),
 
-        // Currency / symbols
-        "&cent;" => Some('\u{00A2}'), "&pound;" => Some('\u{00A3}'),
-        "&curren;" => Some('\u{00A4}'), "&yen;" => Some('\u{00A5}'),
-        "&euro;" => Some('\u{20AC}'),
 
-        // Trademarks / copyright / misc
-        "&trade;" => Some('\u{2122}'), "&copy;" => Some('\u{00A9}'),
-        "&reg;" => Some('\u{00AE}'),
-        "&deg;" => Some('\u{00B0}'), "&micro;" => Some('\u{00B5}'),
-        "&not;" => Some('\u{00AC}'), "&shy;" => Some('\u{00AD}'),
-        "&macr;" => Some('\u{00AF}'), "&acute;" => Some('\u{00B4}'),
-        "&cedil;" => Some('\u{00B8}'), "&brvbar;" => Some('\u{00A6}'),
-        "&uml;" => Some('\u{00A8}'), "&ordf;" => Some('\u{00AA}'),
-        "&ordm;" => Some('\u{00BA}'),
 
-        // Superscripts / fractions
-        "&sup1;" => Some('\u{00B9}'), "&sup2;" => Some('\u{00B2}'),
-        "&sup3;" => Some('\u{00B3}'),
-        "&frac14;" => Some('\u{00BC}'), "&frac12;" => Some('\u{00BD}'),
-        "&frac34;" => Some('\u{00BE}'),
 
-        // Math operators
-        "&times;" => Some('\u{00D7}'), "&divide;" => Some('\u{00F7}'),
-        "&plusmn;" => Some('\u{00B1}'), "&minus;" => Some('\u{2212}'),
-        "&ne;" => Some('\u{2260}'), "&le;" => Some('\u{2264}'), "&ge;" => Some('\u{2265}'),
-        "&infin;" => Some('\u{221E}'), "&sum;" => Some('\u{2211}'), "&prod;" => Some('\u{220F}'),
-        "&radic;" => Some('\u{221A}'), "&part;" => Some('\u{2202}'),
-        "&int;" => Some('\u{222B}'), "&asymp;" => Some('\u{2248}'),
-        "&equiv;" => Some('\u{2261}'), "&empty;" => Some('\u{2205}'),
-        "&isin;" => Some('\u{2208}'), "&notin;" => Some('\u{2209}'),
-        "&sub;" => Some('\u{2282}'), "&sup;" => Some('\u{2283}'),
-        "&cap;" => Some('\u{2229}'), "&cup;" => Some('\u{222A}'),
-        "&and;" => Some('\u{2227}'), "&or;" => Some('\u{2228}'),
-        "&forall;" => Some('\u{2200}'), "&exist;" => Some('\u{2203}'),
-        "&nabla;" => Some('\u{2207}'), "&prop;" => Some('\u{221D}'),
-        "&lang;" => Some('\u{2329}'), "&rang;" => Some('\u{232A}'),
 
-        // Arrows
-        "&larr;" => Some('\u{2190}'), "&uarr;" => Some('\u{2191}'),
-        "&rarr;" => Some('\u{2192}'), "&darr;" => Some('\u{2193}'),
-        "&harr;" => Some('\u{2194}'),
-        "&lArr;" => Some('\u{21D0}'), "&uArr;" => Some('\u{21D1}'),
-        "&rArr;" => Some('\u{21D2}'), "&dArr;" => Some('\u{21D3}'),
-        "&hArr;" => Some('\u{21D4}'),
 
-        // Latin-1 supplement accented letters (upper)
-        "&Agrave;" => Some('À'), "&Aacute;" => Some('Á'), "&Acirc;" => Some('Â'),
-        "&Atilde;" => Some('Ã'), "&Auml;" => Some('Ä'),   "&Aring;" => Some('Å'),
-        "&AElig;" => Some('Æ'),  "&Ccedil;" => Some('Ç'),
-        "&Egrave;" => Some('È'), "&Eacute;" => Some('É'), "&Ecirc;" => Some('Ê'),
-        "&Euml;" => Some('Ë'),
-        "&Igrave;" => Some('Ì'), "&Iacute;" => Some('Í'), "&Icirc;" => Some('Î'),
-        "&Iuml;" => Some('Ï'),
-        "&ETH;" => Some('Ð'),    "&Ntilde;" => Some('Ñ'),
-        "&Ograve;" => Some('Ò'), "&Oacute;" => Some('Ó'), "&Ocirc;" => Some('Ô'),
-        "&Otilde;" => Some('Õ'), "&Ouml;" => Some('Ö'),   "&Oslash;" => Some('Ø'),
-        "&Ugrave;" => Some('Ù'), "&Uacute;" => Some('Ú'), "&Ucirc;" => Some('Û'),
-        "&Uuml;" => Some('Ü'),
-        "&Yacute;" => Some('Ý'), "&THORN;" => Some('Þ'), "&szlig;" => Some('ß'),
-
-        // Latin-1 supplement (lower)
-        "&agrave;" => Some('à'), "&aacute;" => Some('á'), "&acirc;" => Some('â'),
-        "&atilde;" => Some('ã'), "&auml;" => Some('ä'),   "&aring;" => Some('å'),
-        "&aelig;" => Some('æ'),  "&ccedil;" => Some('ç'),
-        "&egrave;" => Some('è'), "&eacute;" => Some('é'), "&ecirc;" => Some('ê'),
-        "&euml;" => Some('ë'),
-        "&igrave;" => Some('ì'), "&iacute;" => Some('í'), "&icirc;" => Some('î'),
-        "&iuml;" => Some('ï'),
-        "&eth;" => Some('ð'),    "&ntilde;" => Some('ñ'),
-        "&ograve;" => Some('ò'), "&oacute;" => Some('ó'), "&ocirc;" => Some('ô'),
-        "&otilde;" => Some('õ'), "&ouml;" => Some('ö'),   "&oslash;" => Some('ø'),
-        "&ugrave;" => Some('ù'), "&uacute;" => Some('ú'), "&ucirc;" => Some('û'),
-        "&uuml;" => Some('ü'),
-        "&yacute;" => Some('ý'), "&thorn;" => Some('þ'),  "&yuml;" => Some('ÿ'),
-
-        _ => None,
-    }
-}
-
-/// Find every `<table>…</table>` in `html` and replace it with an equivalent
-/// Markdown table. The downstream html_to_text strips what's left; the
-/// downstream format_markdown_tables then lays our Markdown out as a
-/// Unicode-box block.
-fn html_tables_to_markdown(html: &str) -> String {
-    let lower = html.to_lowercase();
-    let mut out = String::with_capacity(html.len());
-    let mut cursor = 0usize;
-    while let Some(rel_start) = lower[cursor..].find("<table") {
-        let start = cursor + rel_start;
-        // Find the matching </table> allowing nested tables (rare but possible).
-        let mut depth = 1usize;
-        let mut scan = start + 6;
-        let end = loop {
-            let next_open = lower[scan..].find("<table").map(|p| scan + p);
-            let next_close = lower[scan..].find("</table>").map(|p| scan + p);
-            match (next_open, next_close) {
-                (Some(o), Some(c)) if o < c => { depth += 1; scan = o + 6; }
-                (_, Some(c)) => {
-                    depth -= 1;
-                    if depth == 0 { break c + 8; } // include "</table>"
-                    scan = c + 8;
-                }
-                _ => return out + &html[cursor..],
-            }
-        };
-        out.push_str(&html[cursor..start]);
-        let block = &html[start..end];
-        out.push('\n');
-        out.push_str(&table_block_to_markdown(block));
-        out.push('\n');
-        cursor = end;
-    }
-    out.push_str(&html[cursor..]);
-    out
-}
-
-fn table_block_to_markdown(block: &str) -> String {
-    let rows = extract_tr_cells(block);
-    if rows.is_empty() { return String::new(); }
-    let n_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-    if n_cols == 0 { return String::new(); }
-    let mut out = String::new();
-    // Header row (first <tr>, even if it only has <td>s).
-    let header = &rows[0];
-    out.push('|');
-    for c in 0..n_cols {
-        out.push(' ');
-        out.push_str(header.get(c).map(|s| s.as_str()).unwrap_or(""));
-        out.push_str(" |");
-    }
-    out.push('\n');
-    out.push('|');
-    for _ in 0..n_cols { out.push_str(" --- |"); }
-    for row in &rows[1..] {
-        out.push('\n');
-        out.push('|');
-        for c in 0..n_cols {
-            out.push(' ');
-            out.push_str(row.get(c).map(|s| s.as_str()).unwrap_or(""));
-            out.push_str(" |");
-        }
-    }
-    out
-}
-
-/// Walk a `<table>…</table>` block, returning each `<tr>` as a Vec of cell
-/// text (both `<td>` and `<th>`). Inner HTML inside each cell is stripped
-/// to plain text; pipe characters are escaped so they don't break the
-/// Markdown we emit.
-fn extract_tr_cells(block: &str) -> Vec<Vec<String>> {
-    let lower = block.to_lowercase();
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    let mut cursor = 0usize;
-    while let Some(rel) = lower[cursor..].find("<tr") {
-        let tr_open = cursor + rel;
-        let tr_body = match lower[tr_open..].find('>') {
-            Some(p) => tr_open + p + 1,
-            None => break,
-        };
-        let tr_end_rel = lower[tr_body..].find("</tr>");
-        let tr_end = match tr_end_rel {
-            Some(p) => tr_body + p,
-            None => lower.len(),
-        };
-        let tr_slice = &block[tr_body..tr_end];
-        let cells = extract_cells_in_tr(tr_slice);
-        if !cells.is_empty() { rows.push(cells); }
-        cursor = tr_end + 5; // skip "</tr>"
-    }
-    rows
-}
-
-fn extract_cells_in_tr(tr: &str) -> Vec<String> {
-    let lower = tr.to_lowercase();
-    let mut cells: Vec<String> = Vec::new();
-    let mut cursor = 0usize;
-    loop {
-        let next_td = lower[cursor..].find("<td").map(|p| cursor + p);
-        let next_th = lower[cursor..].find("<th").map(|p| cursor + p);
-        let cell_open = match (next_td, next_th) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) | (None, Some(a)) => Some(a),
-            _ => None,
-        };
-        let Some(open) = cell_open else { break; };
-        let Some(tag_end) = lower[open..].find('>').map(|p| open + p + 1) else { break; };
-        // Look for matching </td> / </th>.
-        let close_td = lower[tag_end..].find("</td>").map(|p| tag_end + p);
-        let close_th = lower[tag_end..].find("</th>").map(|p| tag_end + p);
-        let (close, close_len) = match (close_td, close_th) {
-            (Some(a), Some(b)) if a < b => (a, 5),
-            (_, Some(b)) => (b, 5),
-            (Some(a), _) => (a, 5),
-            _ => break,
-        };
-        let inner = &tr[tag_end..close];
-        cells.push(cell_html_to_text(inner));
-        cursor = close + close_len;
-    }
-    cells
-}
-
-/// Strip all tags from a cell's inner HTML, decode entities via the main
-/// html_to_text, collapse whitespace to a single space, and escape `|` and
-/// newlines so the resulting string plays nicely in a Markdown table.
-fn cell_html_to_text(inner: &str) -> String {
-    // Turn `<br>` into spaces so multi-line cells fit on one Markdown row.
-    let pre = inner
-        .replace("<br>", " ").replace("<BR>", " ")
-        .replace("<br/>", " ").replace("<br />", " ").replace("<BR/>", " ").replace("<BR />", " ");
-    let stripped = html_to_text(&pre);
-    // Collapse consecutive whitespace, trim.
-    let mut out = String::with_capacity(stripped.len());
-    let mut prev_ws = false;
-    for ch in stripped.chars() {
-        if ch == '\n' || ch == '\r' || ch == '\t' {
-            if !prev_ws { out.push(' '); prev_ws = true; }
-        } else if ch == ' ' {
-            if !prev_ws { out.push(' '); prev_ws = true; }
-        } else if ch == '|' {
-            out.push('\\'); out.push('|'); prev_ws = false;
-        } else {
-            out.push(ch); prev_ws = false;
-        }
-    }
-    out.trim().to_string()
-}
-
-fn html_to_text(html: &str) -> String {
-    // Strip elements that a browser would render as invisible (CSS
-    // display:none, opacity:0, max-height:0, visibility:hidden). Substack
-    // and other newsletters stuff these with preview-padding chars
-    // (soft-hyphen, combining grapheme joiner, NBSP) which otherwise leak
-    // into the pane as "-?" grids. Regex is deliberately narrow — matches
-    // a single <div|span|…> with the offending style and no nested
-    // element of the same type inside it (`[^<]` forbids `<` in the body).
-    use std::sync::OnceLock;
-    static HIDDEN_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let hidden_re = HIDDEN_RE.get_or_init(|| {
-        // Rust's regex crate doesn't support backreferences, so we match
-        // any open/close pair from the same set of element names instead
-        // of pinning the close tag to the open tag. The body is
-        // constrained to `[^<]*` so nested HTML can't sneak in.
-        regex::Regex::new(
-            r#"(?is)<(?:div|span|p|td|tr|table|section)\b[^>]*\bstyle\s*=\s*"[^"]*\b(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0(?:\.0+)?|max-height\s*:\s*0(?:px)?|max-width\s*:\s*0(?:px)?)[^"]*"[^>]*>[^<]*</\s*(?:div|span|p|td|tr|table|section)\s*>"#
-        ).expect("hidden-element regex should compile")
-    });
-    let stripped = hidden_re.replace_all(html, "").into_owned();
-
-    // Convert `<table>` blocks to Markdown BEFORE the generic tag strip so
-    // structure survives. format_markdown_tables will lay them out.
-    // Guard against recursion — cell_html_to_text re-enters html_to_text on
-    // already-stripped cell HTML; skip the table pass when there's nothing
-    // to do.
-    let html_owned;
-    let html: &str = if stripped.contains("<table") || stripped.contains("<TABLE") {
-        html_owned = html_tables_to_markdown(&stripped);
-        &html_owned
-    } else {
-        html_owned = stripped;
-        &html_owned
-    };
-    let mut result = String::new();
-    let mut in_tag = false;
-    let mut in_script = false;
-    let mut in_style = false;
-    let mut last_was_block = false;
-
-    let lower = html.to_lowercase();
-    let chars: Vec<char> = html.chars().collect();
-    let lower_chars: Vec<char> = lower.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        if in_tag {
-            if chars[i] == '>' {
-                in_tag = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if chars[i] == '<' {
-            let rest: String = lower_chars[i..].iter().take(20).collect();
-            if rest.starts_with("<script") { in_script = true; }
-            if rest.starts_with("</script") { in_script = false; }
-            if rest.starts_with("<style") { in_style = true; }
-            if rest.starts_with("</style") { in_style = false; }
-
-            if rest.starts_with("<br") || rest.starts_with("<p")
-                || rest.starts_with("</p") || rest.starts_with("<div")
-                || rest.starts_with("</div") || rest.starts_with("<li")
-                || rest.starts_with("<tr") || rest.starts_with("<h1")
-                || rest.starts_with("<h2") || rest.starts_with("<h3")
-                || rest.starts_with("<h4") || rest.starts_with("<h5")
-                || rest.starts_with("<h6")
-            {
-                if !last_was_block {
-                    result.push('\n');
-                    last_was_block = true;
-                }
-            }
-
-            in_tag = true;
-            i += 1;
-            continue;
-        }
-
-        if in_script || in_style {
-            i += 1;
-            continue;
-        }
-
-        // HTML entity decoding
-        if chars[i] == '&' {
-            // Find the entity (up to ';')
-            let entity_end = chars[i..].iter().take(12).position(|&c| c == ';');
-            if let Some(end) = entity_end {
-                let entity: String = chars[i..i + end + 1].iter().collect();
-                let decoded = decode_html_named_entity(entity.as_str());
-                if let Some(c) = decoded {
-                    if !is_invisible_format_char(c) { result.push(c); }
-                    i += end + 1;
-                    continue;
-                }
-            }
-            // Numeric entities: &#NNN; or &#xHHH;
-            if let Some(end) = entity_end {
-                let entity: String = chars[i..i + end + 1].iter().collect();
-                if entity.starts_with("&#") {
-                    let num_str = &entity[2..entity.len() - 1];
-                    let code = if num_str.starts_with('x') || num_str.starts_with('X') {
-                        u32::from_str_radix(&num_str[1..], 16).ok()
-                    } else {
-                        num_str.parse::<u32>().ok()
-                    };
-                    if let Some(c) = code.and_then(char::from_u32) {
-                        if !is_invisible_format_char(c) { result.push(c); }
-                        i += end + 1;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        last_was_block = false;
-        if !is_invisible_format_char(chars[i]) {
-            result.push(chars[i]);
-        }
-        i += 1;
-    }
-
-    // Clean up: collapse multiple blank lines, trim
-    let mut cleaned = String::new();
-    let mut blank_count = 0;
-    for line in result.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            blank_count += 1;
-            if blank_count <= 2 { cleaned.push('\n'); }
-        } else {
-            blank_count = 0;
-            cleaned.push_str(trimmed);
-            cleaned.push('\n');
-        }
-    }
-    cleaned
-}
-
-/// Characters that browsers render as zero-width or purely-formatting.
-/// Newsletters abuse these to pad email preview text; in a plain-text
-/// pane they leak as "?" / "-" replacement glyphs and junk up the view.
-fn is_invisible_format_char(c: char) -> bool {
-    matches!(c,
-        '\u{00AD}'          // SOFT HYPHEN
-        | '\u{034F}'        // COMBINING GRAPHEME JOINER
-        | '\u{180E}'        // MONGOLIAN VOWEL SEPARATOR
-        | '\u{200B}'        // ZERO WIDTH SPACE
-        | '\u{200C}'        // ZERO WIDTH NON-JOINER
-        | '\u{200D}'        // ZERO WIDTH JOINER
-        | '\u{2060}'        // WORD JOINER
-        | '\u{FEFF}'        // ZERO WIDTH NO-BREAK SPACE / BOM
-    )
-}
 
 // --- Utilities ---
 

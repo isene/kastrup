@@ -208,6 +208,14 @@ pub struct Config {
     pub default_email: String,
     pub smtp_command: String,
     pub confirm_purge: bool,
+    /// Folder shared with the phone (Syncthing), holding one
+    /// `mail-read-<device>.json` per device. Empty disables the exchange
+    /// entirely — no stat, no query, no file.
+    pub read_sync_dir: String,
+    /// How far back the exchange reaches. Must cover the phone's own
+    /// window, or a mark from a message the phone still shows would have
+    /// nothing here to land on.
+    pub read_sync_days: i64,
     pub load_limit: usize,
     #[allow(dead_code)] // back-compat config surface; DB views are authoritative
     pub custom_views: HashMap<String, ViewDef>,
@@ -254,6 +262,8 @@ impl Default for Config {
             default_email: String::new(),
             smtp_command: String::new(),
             confirm_purge: false,
+            read_sync_dir: String::new(),
+            read_sync_days: 60,
             load_limit: 500,
             custom_views: HashMap::new(),
             identities: HashMap::new(),
@@ -289,6 +299,8 @@ impl Config {
             "sort_order": self.sort_order,
             "sort_inverted": self.sort_inverted,
             "confirm_purge": self.confirm_purge,
+            "read_sync_dir": self.read_sync_dir,
+            "read_sync_days": self.read_sync_days,
             "default_view": self.default_view,
             "editor_args": self.editor_args,
         });
@@ -411,6 +423,12 @@ impl Config {
             }
             if let Some(v) = ui.get("confirm_purge").and_then(|v| v.as_bool()) {
                 self.confirm_purge = v;
+            }
+            if let Some(v) = ui.get("read_sync_dir").and_then(|v| v.as_str()) {
+                self.read_sync_dir = v.to_string();
+            }
+            if let Some(v) = ui.get("read_sync_days").and_then(|v| v.as_i64()) {
+                self.read_sync_days = v;
             }
             if let Some(v) = ui.get("editor_args").and_then(|v| v.as_str()) {
                 self.editor_args = v.to_string();
@@ -648,6 +666,10 @@ impl Config {
                     "date_format" => { self.date_format = val.to_string(); }
                     "color_theme" => { self.color_theme = val.to_string(); }
                     "confirm_purge" => { self.confirm_purge = val == "true"; }
+                    "read_sync_dir" => { self.read_sync_dir = val.to_string(); }
+                    "read_sync_days" => {
+                        if let Ok(n) = val.parse::<i64>() { self.read_sync_days = n; }
+                    }
                     "load_limit" => {
                         if let Ok(n) = val.parse::<usize>() {
                             self.load_limit = n;
