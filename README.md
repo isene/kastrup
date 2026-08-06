@@ -152,7 +152,7 @@ there:
 
 ```yaml
 ui:
-  read_sync_dir: ~/.transfer     # empty (the default) disables it entirely
+  read_sync_dir: ~/.kastrup/sync # empty (the default) disables it entirely
   read_sync_days: 60             # must cover the phone's own window
 ```
 
