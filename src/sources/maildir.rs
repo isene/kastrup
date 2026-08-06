@@ -330,109 +330,11 @@ fn decode_qp_body_bytes(s: &str) -> Vec<u8> {
     out
 }
 
-/// Decode RFC 2047 encoded-words: =?charset?encoding?text?=
-pub fn decode_rfc2047(s: &str) -> String {
-    if !s.contains("=?") { return s.to_string(); }
-    let mut result = String::new();
-    let mut rest = s;
-    while let Some(start) = rest.find("=?") {
-        result.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        // Format: charset?encoding?encoded_text?=
-        // Find first ? (end of charset), second ? (end of encoding), then ?= (terminator)
-        let mut qmarks = Vec::new();
-        for (i, b) in after.bytes().enumerate() {
-            if b == b'?' { qmarks.push(i); }
-            if qmarks.len() >= 3 { break; }
-        }
-        // Need at least 2 '?' for charset?encoding?, then find ?= after the encoded text
-        if qmarks.len() >= 2 {
-            let charset_end = qmarks[0];
-            let enc_end = qmarks[1];
-            let _charset = &after[..charset_end];
-            let encoding = &after[charset_end + 1..enc_end];
-            let text_start = enc_end + 1;
-            // Find ?= after the encoded text
-            if let Some(term) = after[text_start..].find("?=") {
-                let encoded = &after[text_start..text_start + term];
-                let decoded_bytes = match encoding.to_lowercase().as_str() {
-                    "b" => base64_decode(encoded),
-                    "q" => Some(decode_qp_bytes(encoded)),
-                    _ => None,
-                };
-                if let Some(bytes) = decoded_bytes {
-                    let text = String::from_utf8(bytes.clone())
-                        .unwrap_or_else(|_| bytes.iter().map(|&b| b as char).collect());
-                    result.push_str(&text);
-                } else {
-                    result.push_str(&rest[start..start + 2 + text_start + term + 2]);
-                }
-                rest = &after[text_start + term + 2..];
-                // Skip whitespace between adjacent encoded words
-                if rest.starts_with(' ') || rest.starts_with("\r\n ") || rest.starts_with("\n ") {
-                    let trimmed = rest.trim_start();
-                    if trimmed.starts_with("=?") { rest = trimmed; }
-                }
-            } else {
-                result.push_str("=?");
-                rest = after;
-            }
-        } else {
-            result.push_str("=?");
-            rest = after;
-        }
-    }
-    result.push_str(rest);
-    result
-}
+// The shared crate owns these now; re-exported so every
+// `sources::maildir::…` call site reads the same as before.
+pub use mail::mime::{base64_decode, decode_rfc2047};
 
-pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    let table: [u8; 128] = {
-        let mut t = [255u8; 128];
-        for (i, &c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".iter().enumerate() {
-            t[c as usize] = i as u8;
-        }
-        t
-    };
-    let mut out = Vec::new();
-    let mut buf = 0u32;
-    let mut bits = 0;
-    for &b in s.as_bytes() {
-        if b == b'=' || b == b'\n' || b == b'\r' || b == b' ' { continue; }
-        if b >= 128 || table[b as usize] == 255 { continue; }
-        buf = (buf << 6) | table[b as usize] as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-        }
-    }
-    Some(out)
-}
 
-fn decode_qp_bytes(s: &str) -> Vec<u8> {
-    let mut result = Vec::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'_' {
-            result.push(b' ');
-            i += 1;
-        } else if bytes[i] == b'=' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i+1..i+3]).unwrap_or(""), 16) {
-                result.push(b);
-                i += 3;
-            } else {
-                result.push(bytes[i]);
-                i += 1;
-            }
-        } else {
-            result.push(bytes[i]);
-            i += 1;
-        }
-    }
-    result
-}
 
 fn parse_date(date_str: &str) -> Option<i64> {
     let s = date_str.trim();

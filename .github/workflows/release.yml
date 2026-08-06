@@ -51,6 +51,12 @@ jobs:
           repository: isene/highlight
           path: highlight
 
+      - name: Checkout mail
+        uses: actions/checkout@v4
+        with:
+          repository: isene/mail
+          path: mail
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

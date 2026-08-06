@@ -32,6 +32,7 @@ Unified terminal messaging client. All your email, chat, and feeds in one TUI. B
 - **Customizable themes**: full 256-color theme editor with presets
 - **Per-view settings**: independent sort, thread mode, and section order per view
 - **SQLite database**: messages and metadata at `~/.kastrup/kastrup.db`
+- **Read state shared with the phone**: mail marked read here shows read in the [nomad mail app](https://github.com/isene/nomad/tree/master/apps/mail), and an explicit *Mark READ* there reaches back. See [Read state](#read-state-shared-with-the-phone)
 
 ## Install
 
@@ -143,6 +144,34 @@ cp target/release/kastrup ~/.local/bin/
 Config file: `~/.kastrup/kastruprc`
 
 On first run, Kastrup creates the database and guides you through initial setup (default email, editor).
+
+### Read state shared with the phone
+
+Set a folder Syncthing carries to the phone and mail read here shows read
+there:
+
+```yaml
+ui:
+  read_sync_dir: ~/.transfer     # empty (the default) disables it entirely
+  read_sync_days: 60             # must cover the phone's own window
+```
+
+Each device writes one `mail-read-<device>.json` and reads them all, keyed
+by RFC822 `Message-ID`, so Syncthing never has two writers to leave a
+`.sync-conflict-` copy of. Newest timestamp wins, and the merge is
+[fe2o3-mail](https://github.com/isene/mail), shared with the phone so
+neither end can invent its own answer.
+
+The rule is asymmetric, and it falls out of what each side *writes*:
+
+| Event | Effect |
+|---|---|
+| Read here | Read on the phone |
+| Merely opened on the phone | Nothing |
+| **Mark READ** on the phone | Read here |
+
+Idle cost is one atomic load plus a couple of `stat()`s every 5 s. The
+database is queried only when a mark has actually moved on one side.
 
 ### External fetch scripts (messenger / instagram)
 

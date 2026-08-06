@@ -241,6 +241,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fe2o3-mail"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -527,12 +536,13 @@ dependencies = [
 
 [[package]]
 name = "kastrup"
-version = "0.2.17"
+version = "0.3.0"
 dependencies = [
  "base64",
  "fe2o3-crust",
  "fe2o3-glow",
  "fe2o3-highlight",
+ "fe2o3-mail",
  "inotify",
  "libc",
  "regex",
