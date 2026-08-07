@@ -13544,51 +13544,7 @@ fn parse_rrule_display(rrule: &str) -> String {
     s
 }
 
-/// Extract MIME attachments from raw content, decode to temp files, return as JSON Value array
-/// matching the DB attachment format so existing v/V handlers work.
-/// Collapse RFC 2822 header folding: a CR?LF followed by one or more
-/// SP/HT bytes is just a continuation, equivalent to a single space
-/// in the logical header value. Also normalises any leftover bare
-/// newlines (rare but seen on broken senders) so the result never
-/// contains control characters that would corrupt downstream paths.
-fn unfold_header_value(s: &str) -> String {
-    // Replace folding sequences first (newline + indent → single space),
-    // then squash any remaining stray newlines / tabs to spaces.
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'\r' || b == b'\n' {
-            // Walk past CR/LF and any leading SP/HT on the next line.
-            i += 1;
-            if b == b'\r' && i < bytes.len() && bytes[i] == b'\n' { i += 1; }
-            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') { i += 1; }
-            out.push(' ');
-        } else if b == b'\t' {
-            out.push(' ');
-            i += 1;
-        } else {
-            // Copy one UTF-8 char rather than one byte so multi-byte
-            // sequences (æøå, etc.) survive intact.
-            let ch_len = utf8_char_len(bytes[i]);
-            out.push_str(std::str::from_utf8(&bytes[i..(i + ch_len).min(bytes.len())])
-                .unwrap_or(""));
-            i += ch_len;
-        }
-    }
-    // A trailing space is harmless on display but trims cleanly off
-    // tmpfile paths.
-    out.trim().to_string()
-}
 
-fn utf8_char_len(first_byte: u8) -> usize {
-    if first_byte < 0x80 { 1 }
-    else if first_byte < 0xC0 { 1 } // invalid leading byte; advance by one
-    else if first_byte < 0xE0 { 2 }
-    else if first_byte < 0xF0 { 3 }
-    else { 4 }
-}
 
 /// Extract inline MIME image parts from a raw message `content` and
 /// materialise them into the image cache, returning `file://` URLs.
@@ -13620,86 +13576,32 @@ fn mime_image_file_urls(content: &str, msg_id: i64) -> Vec<String> {
     out
 }
 
+/// The files hanging off a message, decoded to `/tmp` and described in
+/// the JSON shape the rest of this file reads.
+///
+/// The walk itself is `fe2o3-mail`'s, shared with the phone app, so the
+/// two cannot disagree about what a message carries. What stays here is
+/// the part that is not shared: putting the bytes somewhere the desktop
+/// can open them. `source_file` is consumed a few lines below and copied
+/// to `att_temp_path`, so its shape is private to this pair.
 fn extract_mime_attachments(content: &str, msg_id: i64) -> Vec<serde_json::Value> {
-    let mut atts = Vec::new();
-    // Find all boundaries in the content (including nested)
-    let boundary_re = regex::Regex::new(r#"boundary="?([^"\s;]+)"?"#).unwrap();
-    let mut boundaries = Vec::new();
-    for cap in boundary_re.captures_iter(content) {
-        boundaries.push(cap.get(1).unwrap().as_str().to_string());
-    }
-    // Also detect bare -- boundary lines
-    for line in content.lines() {
-        if line.starts_with("--") && line.len() > 5 {
-            let b = line[2..].trim_end_matches("--").trim();
-            if !b.is_empty() && !boundaries.contains(&b.to_string()) {
-                boundaries.push(b.to_string());
-            }
+    mail::attach::list(content).into_iter().enumerate().map(|(i, a)| {
+        // Indexed: two attachments may legitimately share a name, and
+        // the old dedup-by-name silently dropped the second.
+        let tmp_path = format!("/tmp/kastrup_att_{}_{}_{}", msg_id, i, a.filename);
+        if let Some(bytes) = mail::attach::bytes(content, i) {
+            let _ = std::fs::write(&tmp_path, &bytes);
         }
-    }
-
-    for boundary in &boundaries {
-        let delimiter = format!("--{}", boundary);
-        for part in content.split(&delimiter) {
-            let Some(hdr_end) = part.find("\n\n").or_else(|| part.find("\r\n\r\n")) else { continue };
-            let headers = &part[..hdr_end];
-            let body_start = if part[hdr_end..].starts_with("\r\n\r\n") { hdr_end + 4 } else { hdr_end + 2 };
-            let body = &part[body_start..];
-            let headers_lower = headers.to_lowercase();
-
-            // Skip text/* and multipart/* parts
-            if headers_lower.contains("text/plain") || headers_lower.contains("text/html")
-                || headers_lower.contains("text/calendar") || headers_lower.contains("multipart/") {
-                continue;
-            }
-
-            // Must have a Content-Type with a non-text type
-            let ct_re = regex::Regex::new(r#"(?i)Content-Type:\s*([^;\n]+)"#).unwrap();
-            let Some(ct_cap) = ct_re.captures(headers) else { continue };
-            let ctype = ct_cap.get(1).unwrap().as_str().trim().to_string();
-
-            // Get filename from name= or filename=. RFC 2822 lets a
-            // long quoted header value fold across lines: the newline
-            // sits inside the quoted string and the continuation line
-            // starts with whitespace. The regex's `[^"]+` happily
-            // captures right through it, so without unfolding we'd
-            // store `"…_May\n 2026.docx"` — that newline then ruins
-            // both the displayed name (hard wrap inside one row) and
-            // the tmpfile path (`xdg-open` chokes on a newline in
-            // the filename).
-            let name_re = regex::Regex::new(r#"(?i)(?:name|filename)="([^"]+)""#).unwrap();
-            let filename_raw = name_re.captures(headers)
-                .map(|c| c.get(1).unwrap().as_str().to_string())
-                .unwrap_or_else(|| format!("attachment_{}", atts.len() + 1));
-            let filename = sources::maildir::decode_rfc2047(&unfold_header_value(&filename_raw));
-
-            // Skip if already found this filename
-            if atts.iter().any(|a: &serde_json::Value| a["name"].as_str() == Some(&filename)) { continue; }
-
-            // Decode body to temp file
-            let is_b64 = headers_lower.contains("base64");
-            let tmp_path = format!("/tmp/kastrup_att_{}_{}", msg_id, filename);
-            if is_b64 {
-                if let Some(bytes) = sources::maildir::base64_decode(body.trim()) {
-                    let _ = std::fs::write(&tmp_path, &bytes);
-                }
-            } else {
-                let _ = std::fs::write(&tmp_path, body);
-            }
-
-            let is_image = ctype.starts_with("image/");
-            atts.push(serde_json::json!({
-                "name": filename,
-                "filename": filename,
-                "content_type": ctype,
-                "size": std::fs::metadata(&tmp_path).map(|m| m.len()).unwrap_or(0),
-                "source_file": tmp_path,
-                "url": format!("file://{}", tmp_path),
-                "is_image": is_image,
-            }));
-        }
-    }
-    atts
+        serde_json::json!({
+            "name": a.filename,
+            "filename": a.filename,
+            "content_type": a.mime_type,
+            "size": a.size,
+            "source_file": tmp_path,
+            "url": format!("file://{}", tmp_path),
+            "is_image": a.mime_type.starts_with("image/"),
+        })
+    }).collect()
 }
 
 /// Build a `/tmp/kastrup_att_*` path for an attachment, sanitising the

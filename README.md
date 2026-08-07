@@ -32,6 +32,7 @@ Unified terminal messaging client. All your email, chat, and feeds in one TUI. B
 - **Customizable themes**: full 256-color theme editor with presets
 - **Per-view settings**: independent sort, thread mode, and section order per view
 - **SQLite database**: messages and metadata at `~/.kastrup/kastrup.db`
+- **Attachments** decoded by [fe2o3-mail](https://github.com/isene/mail), the same walk the phone uses
 - **Read state shared with the phone**: mail marked read here shows read in the [nomad mail app](https://github.com/isene/nomad/tree/master/apps/mail), and an explicit *Mark READ* there reaches back. See [Read state](#read-state-shared-with-the-phone)
 
 ## Install
