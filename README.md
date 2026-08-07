@@ -168,13 +168,17 @@ The rule is asymmetric, and it falls out of what each side *writes*:
 |---|---|
 | Read here | Read on the phone |
 | Deleted here | Read on the phone |
-| Merely opened on the phone | Nothing |
-| **Mark READ** on the phone | Read here |
+| Anything on the phone | Stays on the phone |
 
 Deleting travels because deleting is the strongest "done with this" there
 is, and the phone reads the IMAP inbox directly — it never sees the
-delete, so without this the message sits there as new for ever. It goes
-one way only: a deletion here cannot be argued back by a phone.
+delete, so without this the message sits there as new for ever.
+
+The arrow points one way. A phone writes nothing into the folder: it
+reads what this laptop publishes and keeps its own marks in its own
+prefs, so clearing a phone's list can never cost you mail here. kastrup
+still merges every `mail-read-*.json` it finds, so a second authoritative
+machine would work; it is the phones that stay quiet.
 
 Idle cost is one atomic load plus a couple of `stat()`s every 5 s. The
 database is queried only when a mark has actually moved on one side.
