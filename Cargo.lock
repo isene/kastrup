@@ -224,6 +224,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fe2o3-feed"
+version = "0.1.0"
+
+[[package]]
 name = "fe2o3-glow"
 version = "0.1.24"
 dependencies = [
@@ -540,6 +544,7 @@ version = "0.3.2"
 dependencies = [
  "base64",
  "fe2o3-crust",
+ "fe2o3-feed",
  "fe2o3-glow",
  "fe2o3-highlight",
  "fe2o3-mail",
