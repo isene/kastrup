@@ -57,6 +57,10 @@ The message opens on its own, as a one-line list with the body beside
 it; `Esc` clears that back to the view you were in. An archived message
 opens too — asking for a message by number is asking for that message.
 
+Inside kastrup, `#` does the same thing and takes the same two forms —
+the other end of `y`, which copies the id of the message under the
+cursor.
+
 ## Key Bindings
 
 ### Navigation
@@ -123,6 +127,7 @@ opens too — asking for a message by number is asking for that message.
 | Key | Action |
 |-----|--------|
 | / | Search messages (notmuch + DB substring fallback) |
+| `#` | Go to a message by id — `kastrup:7957849` or `7957849` |
 | **S** | **`:search`** — natural-language query → claude translates to a `Filters` JSON spec → applied to the message list |
 | @ | Address book |
 | l | Label message |

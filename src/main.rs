@@ -1294,6 +1294,15 @@ fn ensure_slack_source(db: &Arc<Database>) {
     );
 }
 
+/// A message id as it is actually written down: `kastrup:7957849` is
+/// how one gets copied out of a note or a chat, and the bare number is
+/// what is left after trimming it. One parser, so the command line and
+/// the `#` prompt cannot disagree about what counts.
+fn parse_message_id(s: &str) -> Option<i64> {
+    let s = s.trim();
+    s.strip_prefix("kastrup:").unwrap_or(s).trim().parse().ok()
+}
+
 fn main() {
     // --help / --version answer before anything else, including the
     // no-terminal guard below: a CLI that cannot say what it is when
@@ -1389,11 +1398,9 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            // A message id, however it was copied: kastrup pastes ids as
-            // `kastrup:7957849` and a bare number is what is left after
-            // trimming, so both are the same argument.
-            a if a.strip_prefix("kastrup:").unwrap_or(a).parse::<i64>().is_ok() => {
-                goto_message = a.strip_prefix("kastrup:").unwrap_or(a).parse().ok();
+            // A message id, however it was copied. See parse_message_id.
+            a if parse_message_id(a).is_some() => {
+                goto_message = parse_message_id(a);
                 i += 1;
             }
             "--compose-to" if i + 1 < args.len() => { compose_to = Some(args[i + 1].clone()); i += 2; }
@@ -2252,6 +2259,7 @@ impl App {
                 }
             }
             "y" => { self.copy_message_id(); }
+            "#" => { self.goto_message_prompt(); }
             "Y" | "C-Y" => {
                 self.copy_right_pane();
                 self.set_feedback("Right pane copied to clipboard",
@@ -6132,6 +6140,7 @@ impl App {
   X              Open HTML in browser\n\n\
 {}\n\
   /              Search messages (DB content substring, sticky)\n\
+  #              Go to message by id (kastrup:7957849 or 7957849)\n\
   S              :search (claude → Filters → message list)\n\
   l              Label message\n\
   s              File/save message\n\
@@ -6651,6 +6660,20 @@ impl App {
     /// kastrup already indexes everything into the DB on ingest, so
     /// keeping a second Xapian index in lock-step was wasted work
     /// (and one more `notmuch new` subprocess spawn per delivery).
+    /// `#` — go to a message by its id: the other end of `y`, and where
+    /// a `kastrup:7957849` from a note or a chat gets pasted.
+    fn goto_message_prompt(&mut self) {
+        let input = self.prompt("Message id: ", "");
+        self.render_bottom_bar();
+        if input.trim().is_empty() { return; }
+        match parse_message_id(&input) {
+            Some(id) => self.goto_message(id),
+            None => self.set_feedback(
+                &format!("Not a message id: {}", input.trim()),
+                self.config.theme_colors.feedback_warn),
+        }
+    }
+
     /// Show one message and open it — `kastrup 7957849`, or the
     /// `kastrup:7957849` an id is pasted as.
     ///
