@@ -57,6 +57,12 @@ jobs:
           repository: isene/mail
           path: mail
 
+      - name: Checkout feed
+        uses: actions/checkout@v4
+        with:
+          repository: isene/feed
+          path: feed
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
