@@ -1304,6 +1304,7 @@ fn main() {
         println!();
         println!("Usage: kastrup [OPTIONS]");
         println!();
+        println!("  kastrup:ID | ID       open that message (paste an id straight in)");
         println!("  --compose-to ADDR     open a compose window to ADDR");
         println!("  --subject TEXT        subject for --compose-to");
         println!("  --weechat-probe       one-shot relay wire test");
@@ -1384,9 +1385,17 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut compose_to: Option<String> = None;
     let mut compose_subject: Option<String> = None;
+    let mut goto_message: Option<i64> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            // A message id, however it was copied: kastrup pastes ids as
+            // `kastrup:7957849` and a bare number is what is left after
+            // trimming, so both are the same argument.
+            a if a.strip_prefix("kastrup:").unwrap_or(a).parse::<i64>().is_ok() => {
+                goto_message = a.strip_prefix("kastrup:").unwrap_or(a).parse().ok();
+                i += 1;
+            }
             "--compose-to" if i + 1 < args.len() => { compose_to = Some(args[i + 1].clone()); i += 2; }
             "--subject" if i + 1 < args.len() => { compose_subject = Some(args[i + 1].clone()); i += 2; }
             a if a.starts_with("mailto:") => {
@@ -1811,6 +1820,11 @@ fn main() {
     let default_view = app.config.default_view.clone();
     app.switch_to_view(&default_view);
     app.render_all();
+
+    // A message id on the command line: show that one and open it.
+    if let Some(id) = goto_message {
+        app.goto_message(id);
+    }
 
     // Handle --compose-to from CLI (e.g. from Tock)
     if let Some(to) = compose_to {
@@ -6637,6 +6651,33 @@ impl App {
     /// kastrup already indexes everything into the DB on ingest, so
     /// keeping a second Xapian index in lock-step was wasted work
     /// (and one more `notmuch new` subprocess spawn per delivery).
+    /// Show one message and open it — `kastrup 7957849`, or the
+    /// `kastrup:7957849` an id is pasted as.
+    ///
+    /// A sticky filter rather than a list built by hand: the five-second
+    /// reconciliation re-runs the current view's rules and would blank
+    /// anything else, exactly as it once blanked search results.
+    fn goto_message(&mut self, id: i64) {
+        let filters = Filters { message_id: Some(id), ..Default::default() };
+        self.filtered_messages = self.db.get_messages(&filters, 1, 0);
+        for msg in &mut self.filtered_messages {
+            resolve_source_type(&self.source_type_map, msg);
+        }
+        if self.filtered_messages.is_empty() {
+            self.set_feedback(&format!("No message {}", id),
+                self.config.theme_colors.feedback_warn);
+            self.render_all();
+            return;
+        }
+        self.index = 0;
+        self.show_threaded = false;
+        self.active_search_label = format!("kastrup:{}", id);
+        self.active_search_filter = Some(filters);
+        self.set_feedback(&format!("kastrup:{}  (Esc clears)", id),
+            self.config.theme_colors.feedback_ok);
+        self.open_message();
+    }
+
     fn search_prompt(&mut self) {
         let query = self.prompt("/", "");
         self.render_bottom_bar();
