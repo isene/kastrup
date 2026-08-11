@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-feed"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "fe2o3-glow"
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "kastrup"
-version = "0.3.2"
+version = "0.3.4"
 dependencies = [
  "base64",
  "fe2o3-crust",

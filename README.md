@@ -44,6 +44,19 @@ cargo build --release
 cp target/release/kastrup ~/.local/bin/
 ```
 
+## Opening one message
+
+```bash
+kastrup 7957849
+kastrup kastrup:7957849
+```
+
+Both forms work, because `kastrup:7957849` is how an id gets copied out
+of a note or a chat and a bare number is what is left after trimming it.
+The message opens on its own, as a one-line list with the body beside
+it; `Esc` clears that back to the view you were in. An archived message
+opens too — asking for a message by number is asking for that message.
+
 ## Key Bindings
 
 ### Navigation

@@ -18,6 +18,11 @@ use crate::source::Source;
 /// list is equivalent to the un-branched Filters.
 #[derive(Default, Clone)]
 pub struct Filters {
+    /// One message by its row id — what `kastrup 7957849` looks up. Set
+    /// alone it names exactly one message, and it is the one filter that
+    /// reaches an archived one: asking for a message by number is asking
+    /// for that message, not for whichever of them is still in the inbox.
+    pub message_id: Option<i64>,
     pub source_id: Option<i64>,
     pub source_ids: Option<Vec<i64>>,
     pub is_read: Option<bool>,
@@ -110,6 +115,10 @@ fn build_branch_where(filters: &Filters) -> (String, Vec<Box<dyn rusqlite::types
     let mut parts: Vec<String> = Vec::new();
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
+    if let Some(id) = filters.message_id {
+        parts.push("id = ?".into());
+        params.push(Box::new(id));
+    }
     if let Some(sid) = filters.source_id {
         parts.push("source_id = ?".into());
         params.push(Box::new(sid));
@@ -559,8 +568,11 @@ impl Database {
         );
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
-        // Exclude archived by default
-        sql.push_str(" AND (archived = 0 OR archived IS NULL)");
+        // Exclude archived by default — but not when the caller named
+        // one message by id; see Filters::message_id.
+        if filters.message_id.is_none() {
+            sql.push_str(" AND (archived = 0 OR archived IS NULL)");
+        }
 
         // OR-of-AND-groups: when `branches` is set, render each branch's
         // single-AND WHERE fragment in parens, joined by `OR`. The
