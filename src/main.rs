@@ -8385,6 +8385,12 @@ impl App {
         self.run_editor_compose_at(&template, None);
     }
 
+    /// The inline-forward fences. Same width, so they read as a pair:
+    /// the closing one says where the forwarded mail stops and whatever
+    /// is written below it begins.
+    const FWD_BEGIN: &'static str = "---------- Forwarded message ----------\n";
+    const FWD_END: &'static str = "-------- End forwarded message --------\n";
+
     fn forward_inline(&mut self) {
         let Some(idx) = self.current_filtered_index() else {
             self.set_feedback(
@@ -8419,7 +8425,7 @@ impl App {
         template.push_str(&format!("Subject: {}\n", fwd_subject));
         template.push('\n');
         template.push('\n');
-        template.push_str("---------- Forwarded message ----------\n");
+        template.push_str(Self::FWD_BEGIN);
         template.push_str(&format!("From: {}\n", sender));
         template.push_str(&format!("Date: {}\n", date));
         template.push_str(&format!("Subject: {}\n", subject));
@@ -8427,7 +8433,8 @@ impl App {
 
         let content = self.get_display_content(msg);
         template.push_str(&content);
-        template.push('\n');
+        if !content.ends_with('\n') { template.push('\n'); }
+        template.push_str(Self::FWD_END);
 
         if !sig.is_empty() {
             template.push('\n');
@@ -8495,7 +8502,7 @@ impl App {
                 let subj = msg.subject.as_deref().unwrap_or("");
                 let date = format_timestamp(msg.timestamp, "%Y-%m-%d %H:%M");
 
-                template.push_str("---------- Forwarded message ----------\n");
+                template.push_str(Self::FWD_BEGIN);
                 template.push_str(&format!("From: {}\n", sender));
                 template.push_str(&format!("Date: {}\n", date));
                 template.push_str(&format!("Subject: {}\n", subj));
@@ -8503,7 +8510,9 @@ impl App {
 
                 let content = self.get_display_content(msg);
                 template.push_str(&content);
-                template.push_str("\n\n");
+                if !content.ends_with('\n') { template.push('\n'); }
+                template.push_str(Self::FWD_END);
+                template.push('\n');
             }
         }
 
