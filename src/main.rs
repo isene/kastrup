@@ -671,6 +671,71 @@ fn strip_header_ci<'a>(line: &'a str, header: &str) -> Option<&'a str> {
     }
 }
 
+/// Apple Mail writes an attachment into the plain-text part as
+/// `<name.pdf>`, in the position it held in the message — which for a
+/// reply is glued to the end of the quoted signature, three of them run
+/// together on one line with no space in front. Give each its own line,
+/// under the quote prefix the line came with.
+///
+/// Only when they are stuck to text: a line that already keeps them
+/// apart reads fine as it is. And only a name with an extension, so a
+/// `<https://…>` or a `<name@host>` is left alone — the text is the
+/// sender's, the line breaks are all this adds.
+fn break_attachment_markers(body: &str) -> String {
+    if !body.contains('<') { return body.to_string(); }
+    let mut out = String::with_capacity(body.len() + 32);
+    for line in body.lines() {
+        match split_trailing_markers(line) {
+            None => { out.push_str(line); }
+            Some((rest, markers)) => {
+                let quote: String = line
+                    .chars()
+                    .take_while(|c| *c == '>' || *c == ' ' || *c == '\t')
+                    .collect();
+                out.push_str(&rest);
+                for m in markers {
+                    out.push('\n');
+                    out.push_str(&quote);
+                    out.push_str(&m);
+                }
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// The run of `<name.ext>` markers a line ends with, and what is left of
+/// the line — `None` unless there is at least one and it is glued to
+/// text. See [`break_attachment_markers`].
+fn split_trailing_markers(line: &str) -> Option<(String, Vec<String>)> {
+    let mut rest = line.trim_end();
+    let mut markers: Vec<String> = Vec::new();
+    while rest.ends_with('>') {
+        let start = match rest.rfind('<') { Some(i) => i, None => break };
+        let inner = &rest[start + 1..rest.len() - 1];
+        // A filename, and nothing that is plainly something else: an
+        // address has an `@`, a URL has a scheme.
+        if inner.is_empty() || inner.len() > 120 { break; }
+        if inner.contains('@') || inner.contains("://") { break; }
+        let has_ext = inner.rsplit_once('.').is_some_and(|(stem, ext)| {
+            !stem.is_empty()
+                && (1..=5).contains(&ext.len())
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        });
+        if !has_ext { break; }
+        markers.push(rest[start..].to_string());
+        rest = &rest[..start];
+    }
+    // Glued, or there is nothing to fix: a line that is only markers, or
+    // that puts a space before them, is already readable.
+    if markers.is_empty() || rest.is_empty() || rest.ends_with(char::is_whitespace) {
+        return None;
+    }
+    markers.reverse();
+    Some((rest.to_string(), markers))
+}
+
 fn collapse_bracketed_links(body: &str) -> String {
     use std::sync::OnceLock;
     static EMBEDDED: OnceLock<regex::Regex> = OnceLock::new();
@@ -3299,6 +3364,9 @@ impl App {
         // carriage-return when the right pane prints, jumping the cursor
         // to column 1 and overwriting the left pane with body fragments.
         let content = normalize_line_endings(content);
+        // Apple Mail's inline `<name.pdf>` attachment markers onto lines
+        // of their own, before anything measures a line's width.
+        let content = break_attachment_markers(&content);
         // Detect and render Markdown tables in-place with Unicode box
         // borders. Non-table text passes through untouched, so the
         // subsequent quote/signature coloring still works.
@@ -14734,6 +14802,38 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_markers_get_their_own_line() {
+        // The real shape: Apple Mail glues them to the quoted signature.
+        let got = break_attachment_markers(
+            "> { } Geir :: http://isene.com<a-Fotografi.pdf><CV-EN.pdf><CV-NO.pdf>",
+        );
+        assert_eq!(
+            got,
+            "> { } Geir :: http://isene.com\n\
+             > <a-Fotografi.pdf>\n\
+             > <CV-EN.pdf>\n\
+             > <CV-NO.pdf>\n",
+        );
+    }
+
+    #[test]
+    fn only_when_glued_and_only_filenames() {
+        // Already separated, or a line that is only markers: leave alone.
+        for line in [
+            "See attached <CV-EN.pdf>",
+            "<CV-EN.pdf>",
+            // Not filenames: an address, a URL, a bare word.
+            "mail me at<geir@isene.com>",
+            "my site is<https://isene.com>",
+            "the tag is<div>",
+            // An extension is one to five alphanumerics, no more.
+            "ends in<name.toolongext>",
+        ] {
+            assert_eq!(break_attachment_markers(line), format!("{}\n", line), "{}", line);
+        }
+    }
 
     fn hm(ts: i64) -> (i32, i32) {
         unsafe {
