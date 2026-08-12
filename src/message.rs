@@ -35,6 +35,21 @@ pub struct Message {
 }
 
 impl Message {
+    /// What to call the sender: the name, or the address when there is
+    /// no name worth showing.
+    ///
+    /// A name can be present and empty. Plenty of mail carries a bare
+    /// `From: us@example.com`, which parses to an empty name rather
+    /// than none, and taken at face value that renders a blank sender
+    /// in the list and `From:  <us@example.com>` in the header. A name
+    /// that merely repeats the address is the same thing said twice.
+    pub fn display_name(&self) -> &str {
+        match self.sender_name.as_deref().map(str::trim) {
+            Some(n) if !n.is_empty() && n != self.sender => n,
+            _ => &self.sender,
+        }
+    }
+
     /// Create a default header message (used as section separator in threaded view).
     pub fn default_header() -> Self {
         Self {

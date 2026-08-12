@@ -2836,7 +2836,7 @@ impl App {
             (style::fg(&s, self.config.theme_colors.hint_fg),
              12usize.saturating_sub(depth_indent * 2))
         };
-        let sender_display = msg.sender_name.as_deref().unwrap_or(&msg.sender);
+        let sender_display = msg.display_name();
         let sender_truncated = truncate_str(sender_display, sender_cap);
         let sender_padded = format!("{}{:<width$} ", depth_prefix, sender_truncated, width = sender_cap);
 
@@ -3109,9 +3109,11 @@ impl App {
         // in the same color, with inline email addresses colored 177. This
         // matches scribe's email-mode rendering exactly so reading mail in
         // kastrup and composing in scribe produces visually identical text.
-        let from_display = match &msg.sender_name {
-            Some(name) => format!("{} <{}>", name, msg.sender),
-            None => msg.sender.clone(),
+        let name = msg.display_name();
+        let from_display = if name == msg.sender {
+            msg.sender.clone()
+        } else {
+            format!("{} <{}>", name, msg.sender)
         };
         lines.push(header_row("From:", &from_display, tc.header_from));
 
@@ -6705,7 +6707,7 @@ impl App {
         if let Ok(re) = regex::Regex::new(&pattern) {
             let mut count = 0;
             for msg in &self.filtered_messages {
-                let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
+                let sender = msg.display_name();
                 let subject = msg.subject.as_deref().unwrap_or("");
                 if re.is_match(sender) || re.is_match(subject) {
                     self.tagged.insert(msg.id);
@@ -8282,7 +8284,7 @@ impl App {
             return;
         }
 
-        let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
+        let sender = msg.display_name();
         let subject = msg.subject.as_deref().unwrap_or("");
         let re_subject = if subject.starts_with("Re:") {
             subject.to_string()
@@ -8333,7 +8335,7 @@ impl App {
         self.compose_source_type = Some(msg.source_type.clone());
         self.pending_reply_id = Some(msg.id);
 
-        let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
+        let sender = msg.display_name();
         let subject = msg.subject.as_deref().unwrap_or("");
         let re_subject = if subject.starts_with("Re:") {
             subject.to_string()
@@ -8404,7 +8406,7 @@ impl App {
         let msg = &self.filtered_messages[idx];
         self.pending_forward_ids = vec![msg.id];
 
-        let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
+        let sender = msg.display_name();
         let subject = msg.subject.as_deref().unwrap_or("");
         let fwd_subject = if subject.starts_with("Fwd:") {
             subject.to_string()
@@ -8498,7 +8500,7 @@ impl App {
                 }
             }
             if let Some(msg) = self.filtered_messages.iter().find(|m| m.id == id) {
-                let sender = msg.sender_name.as_deref().unwrap_or(&msg.sender);
+                let sender = msg.display_name();
                 let subj = msg.subject.as_deref().unwrap_or("");
                 let date = format_timestamp(msg.timestamp, "%Y-%m-%d %H:%M");
 
@@ -12069,7 +12071,7 @@ impl App {
         let (is_header, sender, subject, content) = match self.current_filtered_index().and_then(|i| self.filtered_messages.get(i)) {
             Some(m) => (
                 m.is_header,
-                m.sender_name.as_deref().unwrap_or(&m.sender).to_string(),
+                m.display_name().to_string(),
                 m.subject.as_deref().unwrap_or("").to_string(),
                 if m.content.len() > 3000 { m.content[..3000].to_string() } else { m.content.clone() },
             ),
@@ -12160,7 +12162,7 @@ impl App {
                 m.is_header,
                 m.id,
                 m.thread_id.clone(),
-                m.sender_name.as_deref().unwrap_or(&m.sender).to_string(),
+                m.display_name().to_string(),
                 m.subject.as_deref().unwrap_or("").to_string(),
                 if m.content.len() > 8000 { m.content[..8000].to_string() } else { m.content.clone() },
             ),
@@ -12480,7 +12482,7 @@ impl App {
                 m.is_header,
                 m.id,
                 m.thread_id.clone(),
-                m.sender_name.as_deref().unwrap_or(&m.sender).to_string(),
+                m.display_name().to_string(),
                 m.subject.as_deref().unwrap_or("").to_string(),
                 m.content.clone(),
             ),
@@ -12640,7 +12642,7 @@ impl App {
         match key.as_str() {
             "a" => {
                 if let Some(msg) = self.filtered_messages.get(self.index) {
-                    let name = msg.sender_name.as_deref().unwrap_or(&msg.sender).to_string();
+                    let name = msg.display_name().to_string();
                     let email = msg.sender.clone();
                     let conn = self.db.conn.lock().unwrap();
                     let now = database::now_secs();
@@ -14811,6 +14813,23 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sender_with_no_name_is_just_the_address() {
+        let mut m = Message::default_header();
+        m.sender = "us@example.com".to_string();
+        // Bare `From: us@example.com` parses to an empty name, not none.
+        m.sender_name = Some(String::new());
+        assert_eq!(m.display_name(), "us@example.com");
+        m.sender_name = Some("   ".to_string());
+        assert_eq!(m.display_name(), "us@example.com");
+        // A name that only repeats the address is the same twice over.
+        m.sender_name = Some("us@example.com".to_string());
+        assert_eq!(m.display_name(), "us@example.com");
+        // And a real name is a real name.
+        m.sender_name = Some("Rons Org".to_string());
+        assert_eq!(m.display_name(), "Rons Org");
+    }
 
     #[test]
     fn attachment_markers_get_their_own_line() {
