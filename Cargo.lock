@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-mail"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "regex",
  "serde",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "kastrup"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "base64",
  "fe2o3-crust",
