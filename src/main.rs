@@ -7787,13 +7787,30 @@ impl App {
     /// Get the "From:" identity string for composing.
     fn compose_from(&self) -> String {
         if let Some(ident) = self.current_identity() {
-            if !ident.name.is_empty() {
-                format!("{} <{}>", ident.name, ident.email)
-            } else {
-                ident.email.clone()
-            }
+            ident.from_line()
         } else {
             self.config.default_email.clone()
+        }
+    }
+
+    /// The identity that sent this message, when the sender is one of
+    /// the user's own addresses (i.e. a message the user sent).
+    fn identity_for_sender(&self, sender: &str) -> Option<&Identity> {
+        let s = sender.to_ascii_lowercase();
+        self.config.identities.values()
+            .find(|i| !i.email.is_empty() && s.contains(&i.email.to_ascii_lowercase()))
+    }
+
+    /// From / Reply-To / signature for a reply: the given identity when
+    /// Some (follow-up on the user's own message), else the current one.
+    fn compose_identity(&self, own: Option<&Identity>) -> (String, String, String) {
+        match own {
+            Some(id) => {
+                let s = id.signature();
+                (id.from_line(), id.email.clone(),
+                 if s.is_empty() { String::new() } else { format!("-- \n{}", s) })
+            }
+            None => (self.compose_from(), self.compose_email(), self.compose_signature()),
         }
     }
 
@@ -8321,14 +8338,21 @@ impl App {
             format!("Re: {}", subject)
         };
         let date = format_timestamp(msg.timestamp, "%Y-%m-%d %H:%M");
-        let from = self.compose_from();
-        let reply_to = self.compose_email();
-        let sig = self.compose_signature();
+        // Replying to a message the user sent is a follow-up: same
+        // To/Cc as the original, sent from the same identity.
+        let own = self.identity_for_sender(&msg.sender).cloned();
+        let (from, reply_to, sig) = self.compose_identity(own.as_ref());
+        let (to, cc) = if own.is_some() {
+            (parse_json_recipients(&msg.recipients),
+             msg.cc.as_deref().map(parse_json_recipients).unwrap_or_default())
+        } else {
+            (msg.sender.clone(), String::new())
+        };
 
         let mut template = String::new();
         template.push_str(&format!("From: {}\n", from));
-        template.push_str(&format!("To: {}\n", msg.sender));
-        template.push_str("Cc: \n");
+        template.push_str(&format!("To: {}\n", to));
+        template.push_str(&format!("Cc: {}\n", cc));
         template.push_str("Bcc: \n");
         template.push_str(&format!("Reply-To: {}\n", reply_to));
         template.push_str(&format!("Subject: {}\n", re_subject));
@@ -8372,28 +8396,33 @@ impl App {
             format!("Re: {}", subject)
         };
         let date = format_timestamp(msg.timestamp, "%Y-%m-%d %H:%M");
-        let from = self.compose_from();
-        let reply_to = self.compose_email();
-        let my_email = reply_to.to_lowercase();
-        let sig = self.compose_signature();
+        // Group-replying to a message the user sent is a follow-up:
+        // same To/Cc as the original, sent from the same identity.
+        let own = self.identity_for_sender(&msg.sender).cloned();
+        let (from, reply_to, sig) = self.compose_identity(own.as_ref());
 
-        // Build Cc from original recipients + cc, minus self and original sender
         let to_list = parse_json_recipients(&msg.recipients);
         let cc_list = msg.cc.as_deref().map(parse_json_recipients).unwrap_or_default();
-        let all_cc: Vec<&str> = to_list
-            .split(", ")
-            .chain(cc_list.split(", "))
-            .filter(|a| {
-                !a.is_empty()
-                    && !a.to_lowercase().contains(&my_email)
-                    && !a.to_lowercase().contains(&msg.sender.to_lowercase())
-            })
-            .collect();
-        let cc = all_cc.join(", ");
+        let (to, cc) = if own.is_some() {
+            (to_list, cc_list)
+        } else {
+            // Build Cc from original recipients + cc, minus self and original sender
+            let my_email = reply_to.to_lowercase();
+            let all_cc: Vec<&str> = to_list
+                .split(", ")
+                .chain(cc_list.split(", "))
+                .filter(|a| {
+                    !a.is_empty()
+                        && !a.to_lowercase().contains(&my_email)
+                        && !a.to_lowercase().contains(&msg.sender.to_lowercase())
+                })
+                .collect();
+            (msg.sender.clone(), all_cc.join(", "))
+        };
 
         let mut template = String::new();
         template.push_str(&format!("From: {}\n", from));
-        template.push_str(&format!("To: {}\n", msg.sender));
+        template.push_str(&format!("To: {}\n", to));
         template.push_str(&format!("Cc: {}\n", cc));
         template.push_str("Bcc: \n");
         template.push_str(&format!("Reply-To: {}\n", reply_to));

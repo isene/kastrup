@@ -175,6 +175,12 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// "Name <email>", or the bare email when the identity has no name.
+    pub fn from_line(&self) -> String {
+        if self.name.is_empty() { self.email.clone() }
+        else { format!("{} <{}>", self.name, self.email) }
+    }
+
     /// Get signature text. If path is executable, run it each time for fresh output.
     /// If it's a file, read it. Preserves leading whitespace.
     pub fn signature(&self) -> String {
