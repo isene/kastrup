@@ -1381,6 +1381,7 @@ fn main() {
         println!("  kastrup:ID | ID       open that message (paste an id straight in)");
         println!("  --compose-to ADDR     open a compose window to ADDR");
         println!("  --subject TEXT        subject for --compose-to");
+        println!("  --backfill-text       fill the decoded body for older messages");
         println!("  --weechat-probe       one-shot relay wire test");
         println!("  -v, --version         print version");
         println!("  -h, --help            this text");
@@ -1392,6 +1393,34 @@ fn main() {
     }
     if std::env::args().skip(1).any(|a| a == "-v" || a == "--version") {
         println!("kastrup {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
+    // --backfill-text: fill `content_text` for rows that predate the
+    // column. Before any TUI init, so progress goes to a plain stdout —
+    // and outside the main loop, because it is a one-off that has no
+    // business costing anything on a normal start.
+    if std::env::args().any(|a| a == "--backfill-text") {
+        let db = match Database::new() {
+            Ok(d) => d,
+            Err(e) => { eprintln!("backfill: {}", e); std::process::exit(1); }
+        };
+        let total = db.content_text_missing();
+        if total == 0 {
+            println!("backfill: nothing to do — every message has a decoded body.");
+            return;
+        }
+        println!("backfill: {} message(s) to decode", total);
+        let start = std::time::Instant::now();
+        let mut done = 0usize;
+        loop {
+            let n = db.backfill_content_text(500);
+            if n == 0 { break; }
+            done += n;
+            print!("\r  {}/{} ({:.0}%)", done, total, done as f64 * 100.0 / total as f64);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        println!("\rbackfill: {} done in {:.1}s", done, start.elapsed().as_secs_f64());
         return;
     }
 

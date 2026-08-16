@@ -282,6 +282,13 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_scheduled_due ON scheduled(send_at);"
         );
+        // The decoded body, so nothing outside kastrup has to reassemble
+        // MIME to read a message. `content` keeps the raw parts, which is
+        // what attachment extraction needs; this is the text a reader
+        // wants — and what `content LIKE '%…%'` has to search to find
+        // anything at all, since most bodies arrive base64'd. Error
+        // ignored: the column is already there on the second run.
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN content_text TEXT", []);
     }
 
     fn create_schema(conn: &Connection) -> Result<(), String> {
@@ -303,6 +310,7 @@ impl Database {
                 bcc TEXT,
                 subject TEXT,
                 content TEXT NOT NULL,
+                content_text TEXT,
                 html_content TEXT,
                 timestamp INTEGER NOT NULL,
                 received_at INTEGER NOT NULL,
@@ -1304,6 +1312,18 @@ impl Database {
                 labels_json, atts_json, meta_json, msg.folder,
             ],
         );
+        // Only for a row that was actually new. The insert is OR IGNORE
+        // and the pollers re-offer what they have already delivered, so
+        // decoding before the insert would decode the same message on
+        // every poll for nothing.
+        if conn.changes() > 0 {
+            let id = conn.last_insert_rowid();
+            let text = decoded_body(&msg.content, msg.html_content.as_deref());
+            let _ = conn.execute(
+                "UPDATE messages SET content_text = ? WHERE id = ?",
+                params![text, id],
+            );
+        }
     }
 
     /// Insert multiple messages in a single transaction (batch mode).
@@ -1337,10 +1357,66 @@ impl Database {
                         labels_json, atts_json, meta_json, msg.folder,
                     ],
                 );
+                // See insert_message: only what the insert actually added.
+                if conn.changes() > 0 {
+                    let id = conn.last_insert_rowid();
+                    let text = decoded_body(&msg.content, msg.html_content.as_deref());
+                    let _ = conn.execute(
+                        "UPDATE messages SET content_text = ? WHERE id = ?",
+                        params![text, id],
+                    );
+                }
             }
             let _ = conn.execute("COMMIT", []);
             // Drop lock between chunks so main thread can acquire it
         }
+    }
+
+    /// Fill `content_text` for rows that predate the column.
+    ///
+    /// Batched, because the decode is the expensive half and a single
+    /// transaction over a quarter of a million messages would hold the
+    /// write lock for minutes. Returns how many it filled; call until it
+    /// returns zero.
+    pub fn backfill_content_text(&self, batch: usize) -> usize {
+        let rows: Vec<(i64, String, Option<String>)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = match conn.prepare(
+                "SELECT id, content, html_content FROM messages \
+                 WHERE content_text IS NULL LIMIT ?"
+            ) { Ok(s) => s, Err(_) => return 0 };
+            let mapped = stmt.query_map(params![batch as i64], |r| {
+                Ok((r.get(0)?, r.get::<_, String>(1).unwrap_or_default(), r.get(2).ok()))
+            });
+            match mapped {
+                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                Err(_) => return 0,
+            }
+        };
+        if rows.is_empty() { return 0; }
+        // Decode outside the lock: the reader thread should not wait on a
+        // megabyte of base64.
+        let decoded: Vec<(i64, String)> = rows.into_iter()
+            .map(|(id, content, html)| (id, decoded_body(&content, html.as_deref())))
+            .collect();
+        let n = decoded.len();
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute("BEGIN", []);
+        for (id, text) in decoded {
+            let _ = conn.execute(
+                "UPDATE messages SET content_text = ? WHERE id = ?",
+                params![text, id],
+            );
+        }
+        let _ = conn.execute("COMMIT", []);
+        n
+    }
+
+    /// How many rows still have no decoded body.
+    pub fn content_text_missing(&self) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT count(*) FROM messages WHERE content_text IS NULL", [], |r| r.get(0))
+            .unwrap_or(0)
     }
 
     /// Add a new source
@@ -1362,6 +1438,16 @@ impl Database {
             params![now, source_id],
         );
     }
+}
+
+/// The body as a person reads it: MIME walked, transfer encoding and
+/// charset decoded, HTML rendered when there is no plain part.
+///
+/// One decode at write time in place of one in every reader, which is
+/// the cheap direction — and the only one that does not depend on each
+/// reader remembering the recipe.
+fn decoded_body(content: &str, html: Option<&str>) -> String {
+    mail::body_text(content, html)
 }
 
 /// True for a "Sent" mailbox in the common maildir / IMAP naming schemes
