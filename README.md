@@ -44,6 +44,24 @@ cargo build --release
 cp target/release/kastrup ~/.local/bin/
 ```
 
+## Reading a message from outside kastrup
+
+`messages.content` holds the raw MIME body, so reading it means walking
+the parts and decoding transfer encoding and charset. `content_text`
+holds the same body already decoded, written at ingest:
+
+```sql
+SELECT content_text FROM messages WHERE id = 7964481;
+SELECT id, subject FROM messages WHERE content_text LIKE '%invoice%';
+```
+
+That second query is the point. Against `content` it finds almost
+nothing, because most bodies arrive base64'd.
+
+`content` stays as it is — attachment extraction needs the raw parts.
+Messages that predate the column are filled by `kastrup --backfill-text`,
+which is a one-off; new mail is decoded as it arrives.
+
 ## Opening one message
 
 ```bash
