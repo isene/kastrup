@@ -1225,6 +1225,12 @@ struct App {
     /// MIME → html_to_text → collapse → linkify pipeline. Invalidated
     /// when msg.id or msg.content hash changes.
     body_cache: Option<(i64, u64, String)>,
+    /// The AI answer currently shown in the right pane: (formatted
+    /// pane text, URLs found in the raw response). While set, x / X
+    /// follow the answer's links instead of the message's, and the
+    /// pane can be restored after the URL picker. Cleared whenever
+    /// the pane goes back to showing a message.
+    ai_pane: Option<(String, Vec<String>)>,
     pending_forward_ids: Vec<i64>,
     pending_forward_attachments: Vec<String>,
     pending_reply_id: Option<i64>,
@@ -1832,6 +1838,7 @@ fn main() {
         right_pane_msg_id: None,
         suppress_automark_read: false,
             body_cache: None,
+            ai_pane: None,
         pending_forward_ids: Vec::new(),
         pending_forward_attachments: Vec::new(),
         pending_reply_id: None,
@@ -2989,6 +2996,8 @@ impl App {
     }
 
     fn render_message_content(&mut self) {
+        // The pane is going back to a message — any AI answer is gone.
+        self.ai_pane = None;
         // Auto-mark as read when displayed in right pane
         let msg_ref = if self.show_threaded {
             self.display_messages.get(self.index)
@@ -6560,6 +6569,19 @@ impl App {
         // file, then — for chat / plain-text messages with neither — the
         // URL(s) found in the body. The last case is what lets you reach a
         // Slack link whose on-screen label is truncated to `host.com/…`.
+        //
+        // An AI answer on screen takes priority: follow ITS links.
+        match self.pick_ai_pane_url() {
+            None => {}                       // no AI answer with links
+            Some(None) => return,            // picker cancelled
+            Some(Some(url)) => {
+                let _ = std::process::Command::new("xdg-open").arg(&url)
+                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+                self.set_feedback(&format!("Opened {}", shorten_url_label(&url)),
+                    self.config.theme_colors.feedback_ok);
+                return;
+            }
+        }
         self.ensure_full_loaded();
         let Some(idx) = self.current_filtered_index() else {
             self.set_feedback("No message selected", self.config.theme_colors.feedback_warn);
@@ -6645,11 +6667,46 @@ impl App {
         }
     }
 
+    /// x / X while an AI answer is on screen: resolve which of ITS
+    /// links to open. Outer None = no AI answer with links (caller
+    /// falls through to the message path); Some(None) = the picker
+    /// was cancelled (caller stops); Some(Some(url)) = open this.
+    fn pick_ai_pane_url(&mut self) -> Option<Option<String>> {
+        let urls = match &self.ai_pane {
+            Some((_, urls)) if !urls.is_empty() => urls.clone(),
+            _ => return None,
+        };
+        if urls.len() == 1 { return Some(Some(urls[0].clone())); }
+        let chosen = self.pick_url(&urls).map(|i| urls[i].clone());
+        self.restore_ai_pane();
+        Some(chosen)
+    }
+
     fn open_html_in_scroll(&mut self) {
         // x key: open the message in scroll (tier 1, no JS) — stays in the
         // terminal. Same source priority as X: link metadata, then HTML
         // rendered to a temp file, then the URL(s) found in a chat / plain
         // body (so a truncated Slack link is reachable here too).
+        //
+        // An AI answer on screen takes priority: follow ITS links.
+        match self.pick_ai_pane_url() {
+            None => {}                       // no AI answer with links
+            Some(None) => return,            // picker cancelled
+            Some(Some(url)) => {
+                Crust::cleanup();
+                let _ = std::process::Command::new("scroll").arg(&url).status();
+                Crust::init();
+                Crust::set_app_identity("Kastrup");
+                Crust::clear_screen();
+                // handle_resize repaints the message pane (which clears
+                // ai_pane) — keep the answer and put it back on top.
+                let saved = self.ai_pane.take();
+                self.handle_resize();
+                self.ai_pane = saved;
+                self.restore_ai_pane();
+                return;
+            }
+        }
         self.ensure_full_loaded();
         let Some(idx) = self.current_filtered_index() else {
             self.set_feedback("No message selected", self.config.theme_colors.feedback_warn);
@@ -12256,12 +12313,36 @@ impl App {
 
         if response.is_empty() { return; }
 
-        self.right.set_text(&format!("{}\n\n{}",
-            style::bold(&style::fg("AI Response", tc.view_custom)), response));
+        self.show_ai_response(
+            &style::bold(&style::fg("AI Response", tc.view_custom)), &response);
+        self.set_feedback("AI response shown in right pane", tc.feedback_ok);
+    }
+
+    /// Show an AI answer in the right pane. URLs become one-row OSC 8
+    /// links (long labels shortened, so glass can click them despite
+    /// its pane-blind row scan); the raw URLs are remembered in
+    /// `ai_pane` so x / X follow the answer's links while it is on
+    /// screen, and so the pane can be restored after the URL picker.
+    fn show_ai_response(&mut self, header: &str, response: &str) {
+        let urls = extract_message_urls(response);
+        let linked: String = response.lines()
+            .map(hyperlink_urls).collect::<Vec<_>>().join("\n");
+        let text = format!("{}\n\n{}", header, linked);
+        self.ai_pane = Some((text.clone(), urls));
+        self.right.set_text(&text);
         self.right.ix = 0;
         self.right.full_refresh();
         if self.right.border { self.right.border_refresh(); }
-        self.set_feedback("AI response shown in right pane", tc.feedback_ok);
+    }
+
+    /// Re-show the stored AI answer (after the URL picker overlay).
+    fn restore_ai_pane(&mut self) {
+        if let Some((text, _)) = &self.ai_pane {
+            let text = text.clone();
+            self.right.set_text(&text);
+            self.right.full_refresh();
+            if self.right.border { self.right.border_refresh(); }
+        }
     }
 
     /// `c` — vim/scribe-style `:claude PROMPT`. Prompts the user, then
@@ -12334,13 +12415,10 @@ impl App {
             return;
         }
 
-        self.right.set_text(&format!("{}\n{}\n\n{}",
+        let header = format!("{}\n{}",
             style::bold(&style::fg("claude", tc.view_custom)),
-            style::fg(&format!("> {}", user_prompt), tc.unread),
-            response.trim_end()));
-        self.right.ix = 0;
-        self.right.full_refresh();
-        if self.right.border { self.right.border_refresh(); }
+            style::fg(&format!("> {}", user_prompt), tc.unread));
+        self.show_ai_response(&header, response.trim_end());
         self.set_feedback("claude response shown in right pane", tc.feedback_ok);
     }
 
