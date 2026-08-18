@@ -606,6 +606,30 @@ fn parse_chat_attachments(data: &str) -> Vec<std::path::PathBuf> {
     out
 }
 
+/// Extract `Attach:` header lines from an EMAIL draft: returns the
+/// draft without them plus the attachment paths. Lets a dropped
+/// `.eml` draft (e.g. queued by a Claude session) carry attachments;
+/// the paths feed the review screen's attachment list and the lines
+/// never reach the wire. Chat drafts keep their `Attach:` lines —
+/// their send functions parse them natively.
+fn take_email_attach_headers(data: &str) -> (String, Vec<String>) {
+    let atts: Vec<String> = parse_chat_attachments(data).into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    if atts.is_empty() { return (data.to_string(), atts); }
+    let mut out = String::with_capacity(data.len());
+    let mut in_body = false;
+    for line in data.lines() {
+        if !in_body {
+            if line.trim().is_empty() { in_body = true; }
+            else if line.to_ascii_lowercase().starts_with("attach:") { continue; }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    (out, atts)
+}
+
 /// `/me <action>` → Some(action) with the prefix stripped; else None.
 /// Single-line body only (multi-line messages with a `/me` first line
 /// are treated as regular messages — Slack's chat.meMessage doesn't
@@ -8876,7 +8900,14 @@ impl App {
                 if self.pending_send.is_some() {
                     return; // a send is already in flight; try again next wake
                 }
-                self.handle_composed_message(&data);
+                let (data, atts) = take_email_attach_headers(&data);
+                let atts: Vec<String> = atts.into_iter()
+                    .filter(|a| std::path::Path::new(a).exists()).collect();
+                if atts.is_empty() {
+                    self.handle_composed_message(&data);
+                } else {
+                    self.handle_composed_message_with_attachments(&data, &atts);
+                }
                 Ok(String::new())
             }
             DraftKind::Slack     => self.send_slack_draft(&data).map(|c| format!("Sent to {}", c)),
@@ -10124,6 +10155,19 @@ impl App {
 
                         // Post-editor loop with compose plugins and attachments
                         let mut attachments: Vec<String> = std::mem::take(&mut self.pending_forward_attachments);
+                        // Email `Attach:` header lines (dropped draft or typed
+                        // in the editor) become real attachments.
+                        if self.compose_kind == DraftKind::Email {
+                            let (stripped, atts) = take_email_attach_headers(&final_content);
+                            if !atts.is_empty() {
+                                final_content = stripped;
+                                let _ = std::fs::write(&tmpfile, &final_content);
+                                for a in atts {
+                                    if std::path::Path::new(&a).exists() { attachments.push(a); }
+                                    else { self.set_feedback(&format!("Attach not found: {}", a), tc.feedback_warn); }
+                                }
+                            }
+                        }
                         let plugins = self.load_compose_plugins();
                         // Last send-attempt error, persisted across the
                         // loop iteration so the review pane can show
@@ -10336,6 +10380,16 @@ impl App {
                                         .unwrap_or_else(|_| pre_edit.clone());
                                     if post_edit.trim() != pre_edit.trim() {
                                         final_content = self.expand_compose_addresses(&post_edit);
+                                        if self.compose_kind == DraftKind::Email {
+                                            let (stripped, atts) = take_email_attach_headers(&final_content);
+                                            if !atts.is_empty() {
+                                                final_content = stripped;
+                                                for a in atts {
+                                                    if std::path::Path::new(&a).exists() { attachments.push(a); }
+                                                    else { self.set_feedback(&format!("Attach not found: {}", a), tc.feedback_warn); }
+                                                }
+                                            }
+                                        }
                                         let _ = std::fs::write(&tmpfile, &final_content);
                                     }
                                     continue;
@@ -10345,8 +10399,16 @@ impl App {
                                         "Send at (08:00, tomorrow 09:00, +2h, 2026-07-28 08:00): ", "");
                                     match parse_send_at(&when) {
                                         Some(at) => {
-                                            let final_content = std::fs::read_to_string(&tmpfile)
+                                            let mut final_content = std::fs::read_to_string(&tmpfile)
                                                 .unwrap_or_else(|_| content.clone());
+                                            // Email: carry the attachments into the
+                                            // scheduled row as Attach: headers;
+                                            // send_due_scheduled re-extracts them.
+                                            if self.compose_kind == DraftKind::Email && !attachments.is_empty() {
+                                                let lines: String = attachments.iter()
+                                                    .map(|a| format!("Attach: {}\n", a)).collect();
+                                                final_content = format!("{}{}", lines, final_content);
+                                            }
                                             let kind = self.compose_kind;
                                             self.schedule_draft(kind, &final_content, at);
                                             break;
@@ -14729,6 +14791,30 @@ mod tests {
         // And a real name is a real name.
         m.sender_name = Some("Rons Org".to_string());
         assert_eq!(m.display_name(), "Rons Org");
+    }
+
+    #[test]
+    fn attach_headers_come_out_of_an_email_draft() {
+        let draft = "From: Geir Isene <geir@isene.com>\n\
+                     To: alice@example.com\n\
+                     Attach: /tmp/one.pdf\n\
+                     Subject: Follow-up\n\
+                     Attach: /tmp/two.png\n\
+                     \n\
+                     Body with an inline Attach: /tmp/not-a-header.pdf mention.\n";
+        let (stripped, atts) = take_email_attach_headers(draft);
+        assert_eq!(atts, vec!["/tmp/one.pdf", "/tmp/two.png"]);
+        assert!(!stripped.contains("Attach: /tmp/one.pdf"));
+        assert!(!stripped.contains("Attach: /tmp/two.png"));
+        // Body text is untouched, headers keep their order.
+        assert!(stripped.contains("not-a-header.pdf"));
+        assert!(stripped.starts_with("From: Geir Isene"));
+        assert!(stripped.contains("Subject: Follow-up\n\nBody"));
+        // No Attach: lines → draft passes through unchanged.
+        let plain = "To: bob@example.com\n\nHi\n";
+        let (same, none) = take_email_attach_headers(plain);
+        assert_eq!(same, plain);
+        assert!(none.is_empty());
     }
 
     #[test]
