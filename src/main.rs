@@ -6942,6 +6942,9 @@ impl App {
         else { format!("/{}", query) };
         self.active_search_label = scope.clone();
         self.active_search_filter = Some(filters);
+        // Threaded view renders display_messages — rebuild it from the
+        // search hits or the pane keeps showing the old sections.
+        self.rebuild_display();
         if n > 0 {
             self.set_feedback(
                 &format!("{} → {} match{}  (Esc clears)",
@@ -12610,6 +12613,9 @@ impl App {
         let summary = self.filter_summary(&filters);
         self.active_search_label = format!(":search “{}”", query);
         self.active_search_filter = Some(filters);
+        // Threaded view renders display_messages — rebuild it from the
+        // search hits or the pane keeps showing the old sections.
+        self.rebuild_display();
         self.set_feedback(
             &format!(":search → {} match{}  [{}]  (Esc clears)",
                 n,
