@@ -630,6 +630,38 @@ fn take_email_attach_headers(data: &str) -> (String, Vec<String>) {
     (out, atts)
 }
 
+/// Extract the kastrup link pseudo-headers from a drop-file email
+/// draft: `X-Kastrup-Reply-To: <id>` and `X-Kastrup-Forward-Of:
+/// <id>[, <id>…]` (kastrup message ids). Returns the draft without
+/// them plus the parsed ids; they feed pending_reply_id /
+/// pending_forward_ids so the ←/→ arrows appear when the send
+/// succeeds. Header block only, case-insensitive.
+fn take_kastrup_link_headers(data: &str) -> (String, Option<i64>, Vec<i64>) {
+    let mut reply: Option<i64> = None;
+    let mut fwd: Vec<i64> = Vec::new();
+    let mut out = String::with_capacity(data.len());
+    let mut in_body = false;
+    for line in data.lines() {
+        if !in_body {
+            if line.trim().is_empty() { in_body = true; }
+            else {
+                let lower = line.to_ascii_lowercase();
+                if let Some(v) = lower.strip_prefix("x-kastrup-reply-to:") {
+                    reply = v.trim().parse::<i64>().ok().or(reply);
+                    continue;
+                }
+                if let Some(v) = lower.strip_prefix("x-kastrup-forward-of:") {
+                    fwd.extend(v.split(',').filter_map(|s| s.trim().parse::<i64>().ok()));
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    (out, reply, fwd)
+}
+
 /// `/me <action>` → Some(action) with the prefix stripped; else None.
 /// Single-line body only (multi-line messages with a `/me` first line
 /// are treated as regular messages — Slack's chat.meMessage doesn't
@@ -9176,7 +9208,20 @@ impl App {
                 DraftPick::Load(i) => {
                     let c = &candidates[i];
                     self.consume_draft(&c.source);
-                    self.run_editor_compose_recalled(&c.data, c.kind);
+                    let mut data = c.data.clone();
+                    let kind = c.kind;
+                    // X-Kastrup-Reply-To / X-Kastrup-Forward-Of pseudo-
+                    // headers let a drop-file draft (e.g. from a Claude
+                    // session) link back to the original message, so the
+                    // ←/→ arrows appear once the send succeeds. Stripped
+                    // here so they never reach the outgoing RFC822.
+                    if kind == DraftKind::Email {
+                        let (stripped, reply_id, fwd_ids) = take_kastrup_link_headers(&data);
+                        data = stripped;
+                        if reply_id.is_some() { self.pending_reply_id = reply_id; }
+                        if !fwd_ids.is_empty() { self.pending_forward_ids = fwd_ids; }
+                    }
+                    self.run_editor_compose_recalled(&data, kind);
                     return;
                 }
                 // q backs all the way out; ESC / n fall through to a
@@ -14893,6 +14938,23 @@ mod tests {
         let (same, none) = take_email_attach_headers(plain);
         assert_eq!(same, plain);
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn kastrup_link_headers_come_out_of_a_drop_draft() {
+        let draft = "From: geir@isene.com\n\
+                     X-Kastrup-Reply-To: 7964934\n\
+                     To: alice@example.com\n\
+                     X-Kastrup-Forward-Of: 11, 12\n\
+                     \n\
+                     X-Kastrup-Reply-To: 99 in the body stays.\n";
+        let (stripped, reply, fwd) = take_kastrup_link_headers(draft);
+        assert_eq!(reply, Some(7964934));
+        assert_eq!(fwd, vec![11, 12]);
+        assert!(!stripped.contains("X-Kastrup-Reply-To: 7964934"));
+        assert!(!stripped.contains("Forward-Of"));
+        assert!(stripped.contains("X-Kastrup-Reply-To: 99 in the body stays."));
+        assert!(stripped.starts_with("From: geir@isene.com\nTo: alice@example.com"));
     }
 
     #[test]
