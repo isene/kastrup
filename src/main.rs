@@ -9210,7 +9210,9 @@ impl App {
             match self.pick_draft(&candidates) {
                 DraftPick::Load(i) => {
                     let c = &candidates[i];
+                    log::info("recall: draft picked, consuming");
                     self.consume_draft(&c.source);
+                    log::info("recall: draft consumed");
                     let mut data = c.data.clone();
                     let kind = c.kind;
                     // X-Kastrup-Reply-To / X-Kastrup-Forward-Of pseudo-
@@ -10225,10 +10227,13 @@ impl App {
         } else {
             format!("{}{}{} {} {}", editor, scribe_extra, vim_extra, args, escaped_file)
         };
+        log::info(&format!("compose: launching editor: {}", cmd_str));
         let status = std::process::Command::new("sh")
             .arg("-c")
             .arg(&cmd_str)
             .status();
+        log::info(&format!("compose: editor returned ok={}",
+            status.as_ref().map(|s| s.success()).unwrap_or(false)));
 
         Crust::init();
         // No explicit clear_screen here: handle_resize() below clears + redraws
@@ -10254,7 +10259,9 @@ impl App {
                         // — they have nothing for the address resolver to expand.
                         let mut final_content = content.clone();
                         if self.compose_kind == DraftKind::Email {
+                            log::info("compose: expanding addresses");
                             final_content = self.expand_compose_addresses(&final_content);
+                            log::info("compose: addresses expanded");
                         }
                         let _ = std::fs::write(&tmpfile, &final_content);
 
