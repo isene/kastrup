@@ -424,10 +424,17 @@ pub fn send_discord(
     let target = target.trim();
     if let Some(name) = target.strip_prefix("webhook:") {
         let key = name.trim().to_ascii_lowercase();
-        let url = secrets.discord_webhooks.get(&key)
-            .ok_or_else(|| format!("no DISCORD_WEBHOOK_{} in ~/.kastrup/.env", key.to_ascii_uppercase()))?;
-        discord_post_webhook(url, text)?;
-        return Ok(format!("webhook:{}", key));
+        if let Some(url) = secrets.discord_webhooks.get(&key) {
+            discord_post_webhook(url, text)?;
+            return Ok(format!("webhook:{}", key));
+        }
+        // No webhook URL for that name — the bot can post to any channel
+        // kastrup already mirrors, so resolve the name and send that way.
+        let cid = discord_channel_for_webhook(secrets, &key)?;
+        let token = secrets.discord_bot_token.as_ref()
+            .ok_or_else(|| "DISCORD_BOT_TOKEN not set".to_string())?;
+        discord_post_bot_channel(token, &cid, text)?;
+        return Ok(format!("channel:{}", cid));
     }
     if let Some(cid) = target.strip_prefix("channel:") {
         let token = secrets.discord_bot_token.as_ref()
@@ -452,6 +459,27 @@ pub fn send_discord(
         return Ok(format!("channel:{}", target));
     }
     Err(format!("unrecognised discord target: {}", target))
+}
+
+/// Channel id to use for a `webhook:<key>` draft that has no URL in
+/// `.env`. On failure the error names both halves of the miss, so the
+/// user isn't left guessing which file to edit.
+pub fn discord_channel_for_webhook(secrets: &Secrets, key: &str) -> Result<String, String> {
+    if let Some(cid) = crate::sources::discord::channel_id_for_name(key) {
+        return Ok(cid);
+    }
+    let webhooks = if secrets.discord_webhooks.is_empty() {
+        "no DISCORD_WEBHOOK_* line is set in ~/.kastrup/.env".to_string()
+    } else {
+        let mut names: Vec<&str> = secrets.discord_webhooks
+            .keys().map(|s| s.as_str()).collect();
+        names.sort();
+        format!("webhooks set: {}", names.join(", "))
+    };
+    Err(format!(
+        "discord '{}': {}, and no channel by that name in ~/.kastrup/discord_channels \
+         — address the draft as Channel: channel:<id> instead",
+        key, webhooks))
 }
 
 fn discord_post_webhook(url: &str, text: &str) -> Result<(), String> {

@@ -9885,11 +9885,15 @@ impl App {
         let target_t = target.trim();
         if let Some(name) = target_t.strip_prefix("webhook:") {
             let key = name.trim().to_ascii_lowercase();
-            let url = secrets.discord_webhooks.get(&key)
-                .ok_or_else(|| format!("no DISCORD_WEBHOOK_{} in ~/.kastrup/.env",
-                    key.to_ascii_uppercase()))?;
-            chat_send::discord_upload_files_to_webhook(url, &effective_body, &live_attachments)?;
-            return Ok(format!("webhook:{}", key));
+            if let Some(url) = secrets.discord_webhooks.get(&key) {
+                chat_send::discord_upload_files_to_webhook(url, &effective_body, &live_attachments)?;
+                return Ok(format!("webhook:{}", key));
+            }
+            let cid = chat_send::discord_channel_for_webhook(&secrets, &key)?;
+            let token = secrets.discord_bot_token.as_ref()
+                .ok_or_else(|| "DISCORD_BOT_TOKEN not set".to_string())?;
+            chat_send::discord_upload_files_to_channel(token, &cid, &effective_body, &live_attachments)?;
+            return Ok(format!("channel:{}", cid));
         }
         if let Some(cid) = target_t.strip_prefix("channel:") {
             let token = secrets.discord_bot_token.as_ref()
