@@ -187,6 +187,43 @@ pub fn folder_for_channel(channel_id: &str) -> Option<String> {
     load_channels().into_iter().find(|(id, _, _)| id == channel_id).map(|(_, f, _)| f)
 }
 
+/// Resolve a human channel name (`tekst`, `PF-Text`, a folder path) to a
+/// configured channel id. Matches the local config first; only if that
+/// misses does it ask Discord for each configured channel's real name.
+/// Cold path — it runs when a `webhook:<name>` send has no URL to use,
+/// never from the poll loop.
+pub fn channel_id_for_name(name: &str) -> Option<String> {
+    let want = name.trim().to_ascii_lowercase();
+    if want.is_empty() { return None; }
+    let channels = load_channels();
+    let local = channels.iter().find(|(id, folder, label)| {
+        let f = folder.to_ascii_lowercase();
+        *id == want
+            || label.to_ascii_lowercase() == want
+            || f == want
+            || f.rsplit('.').next().unwrap_or(&f) == want
+    });
+    if let Some((id, _, _)) = local { return Some(id.clone()); }
+
+    let secrets = crate::chat_send::load_secrets();
+    let token = secrets.discord_bot_token.as_ref()?;
+    let auth = if token.starts_with("Bot ") || token.starts_with("Bearer ") {
+        token.clone()
+    } else { format!("Bot {}", token) };
+    for (id, _, _) in &channels {
+        let Ok(resp) = super::http_agent().get(&format!("{}/channels/{}", API, id))
+            .set("Authorization", &auth)
+            .set("User-Agent", "kastrup (https://github.com/isene/kastrup, 0.1)")
+            .call() else { continue };
+        let Ok(body) = resp.into_string() else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else { continue };
+        if v["name"].as_str().unwrap_or("").to_ascii_lowercase() == want {
+            return Some(id.clone());
+        }
+    }
+    None
+}
+
 /// Best-effort display name for a Discord user id, for the folder of an
 /// outbound DM (so it lands in the same thread as the incoming DMs).
 pub fn peer_name(user_id: &str) -> Option<String> {
