@@ -289,6 +289,16 @@ impl Database {
         // anything at all, since most bodies arrive base64'd. Error
         // ignored: the column is already there on the second run.
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN content_text TEXT", []);
+        // Added after create_schema stopped running for this database. One
+        // full scan the first time, then every unread recount is covered.
+        let t = std::time::Instant::now();
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_messages_source_read ON messages(source_id, read);"
+        );
+        let ms = t.elapsed().as_millis();
+        if ms >= 500 {
+            crate::log::info(&format!("built idx_messages_source_read in {} ms", ms));
+        }
     }
 
     fn create_schema(conn: &Connection) -> Result<(), String> {
@@ -421,6 +431,10 @@ impl Database {
             -- table lookup over the whole DB (folio_wait UI freeze on the F /
             -- folder browser). With it the query is covering: ~30s -> <0.05s.
             CREATE INDEX IF NOT EXISTS idx_messages_folder_read ON messages(folder, read);
+            -- Covers unread_count_by_source, which the 5s idle tick runs on
+            -- the UI thread. Without `read` in the index the group-by does a
+            -- table lookup per unread row across the whole DB.
+            CREATE INDEX IF NOT EXISTS idx_messages_source_read ON messages(source_id, read);
             CREATE INDEX IF NOT EXISTS idx_sources_enabled ON sources(enabled);
             CREATE INDEX IF NOT EXISTS idx_sources_plugin_type ON sources(plugin_type);
             CREATE INDEX IF NOT EXISTS idx_views_key_binding ON views(key_binding);
@@ -1108,7 +1122,7 @@ impl Database {
         let conn = self.read();
         let mut out = std::collections::HashMap::new();
         let mut stmt = match conn.prepare(
-            "SELECT folder, COUNT(*) FROM messages \
+            "SELECT folder, COUNT(*) FROM messages INDEXED BY idx_messages_folder_read \
              WHERE read = 0 \
                AND folder IS NOT NULL \
              GROUP BY folder"
@@ -1139,7 +1153,7 @@ impl Database {
         let conn = self.read();
         let mut out = std::collections::HashMap::new();
         let mut stmt = match conn.prepare(
-            "SELECT source_id, COUNT(*) FROM messages \
+            "SELECT source_id, COUNT(*) FROM messages INDEXED BY idx_messages_source_read \
              WHERE read = 0 \
              GROUP BY source_id"
         ) {
