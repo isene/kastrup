@@ -98,27 +98,28 @@ pub fn organize_messages(
                 }
             }
             _ => {
-                // Email/maildir: group by thread_id or subject
-                let thread_key = msg.thread_id.as_deref()
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| {
-                        // Fall back to subject-based threading (strip Re:/Fwd:)
-                        let subj = msg.subject.as_deref().unwrap_or("");
-                        let clean = subj.trim_start_matches("Re: ").trim_start_matches("Fwd: ")
-                            .trim_start_matches("RE: ").trim_start_matches("FW: ");
-                        format!("subj_{}", clean)
-                    });
+                // Email/maildir: one section per conversation, keyed on the
+                // subject with every Re: / Sv: / Fwd: stripped.
+                //
+                // NOT on thread_id. The maildir importer stores the message's
+                // OWN Message-Id there, so keying on it gave every mail a
+                // thread of one and threads never appeared in a mail view.
+                // Replies are still indented under their parent afterwards,
+                // by build_thread_order walking In-Reply-To.
+                let subj = msg.subject.as_deref().unwrap_or("");
+                let clean = crate::database::normalise_subject(subj);
+                let display = if clean.is_empty() { "(no subject)".to_string() } else { clean.clone() };
+                let thread_key = format!("subj_{}", clean);
                 if let Some(&idx) = thread_map.get(&thread_key) {
                     sections[idx].messages.push(i);
                     if !msg.read { sections[idx].unread_count += 1; }
                 } else {
                     let idx = sections.len();
                     thread_map.insert(thread_key, idx);
-                    let subj = msg.subject.as_deref().unwrap_or("(no subject)").to_string();
                     sections.push(Section {
                         section_type: "thread".to_string(),
-                        name: subj.clone(),
-                        display_name: subj,
+                        name: display.clone(),
+                        display_name: display,
                         source_type: msg.source_type.clone(),
                         messages: vec![i],
                         unread_count: if msg.read { 0 } else { 1 },
@@ -247,5 +248,56 @@ fn sort_sections(sections: &mut [Section], messages: &[Message], sort_order: &st
                 latest_b.cmp(&latest_a)
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::Message;
+
+    fn mail(id: i64, subject: &str, thread_id: Option<&str>, ts: i64) -> Message {
+        Message {
+            id,
+            subject: Some(subject.into()),
+            thread_id: thread_id.map(String::from),
+            timestamp: ts,
+            source_type: "maildir".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_conversation_is_one_section() {
+        // The third mail carries its own Message-Id in thread_id, the way
+        // the current maildir importer writes it. That used to split it off
+        // into a thread of one.
+        let msgs = vec![
+            mail(1, "Dualog Insight", None, 100),
+            mail(2, "RE: Dualog Insight", None, 200),
+            mail(3, "Sv: RE: Dualog Insight", Some("its-own-message-id"), 300),
+            mail(4, "Fwd: Dualog Insight", None, 400),
+            mail(5, "Something else", None, 500),
+        ];
+        let sections = organize_messages(&msgs, "timestamp", false);
+        let thread: Vec<_> = sections.iter()
+            .filter(|s| s.display_name == "Dualog Insight").collect();
+        assert_eq!(thread.len(), 1, "one section for the conversation");
+        assert_eq!(thread[0].messages.len(), 4, "all four mails in it");
+        assert_eq!(sections.len(), 2, "the unrelated mail stays on its own");
+
+        // The section name is what the collapse map keys on, so it has to
+        // be the stripped subject, not whichever mail happened to be first.
+        assert_eq!(thread[0].name, "Dualog Insight");
+        println!("sections: {:?}", sections.iter()
+            .map(|s| (s.display_name.clone(), s.messages.len())).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_missing_subject_still_groups() {
+        let msgs = vec![mail(1, "", None, 100), mail(2, "Re:", None, 200)];
+        let sections = organize_messages(&msgs, "timestamp", false);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].display_name, "(no subject)");
     }
 }

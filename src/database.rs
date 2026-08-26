@@ -40,6 +40,10 @@ pub struct Filters {
     /// (e.g. whatsapp, sms, or a relay "Add app" slug). Lets a view scope
     /// to one platform within the shared gateway source. `=` exact match.
     pub platform: Option<String>,
+    /// Whole conversations: `subject` ending in any of these, so a thread's
+    /// `Re:` and `Sv:` replies come along with the message that matched.
+    /// Search sets it after widening its hits.
+    pub subjects: Option<Vec<String>>,
     /// Optional OR-of-Filters. When present, takes precedence over
     /// the other fields of this struct — each branch is rendered as
     /// its own AND-group and combined with `OR`.
@@ -170,6 +174,16 @@ fn build_branch_where(filters: &Filters) -> (String, Vec<Box<dyn rusqlite::types
     if let Some(ref plat) = filters.platform {
         parts.push("json_extract(metadata, '$.platform') = ?".into());
         params.push(Box::new(plat.clone()));
+    }
+    if let Some(ref subs) = filters.subjects {
+        if !subs.is_empty() {
+            let ors: Vec<&str> = subs.iter().map(|_| "subject LIKE ?").collect();
+            parts.push(format!("({})", ors.join(" OR ")));
+            // Anchored at the end, so "Dualog Insight" catches "RE: Dualog
+            // Insight" and "Sv: Re: Dualog Insight" without catching a
+            // subject that merely mentions it in the middle.
+            for sub in subs { params.push(Box::new(format!("%{}", sub))); }
+        }
     }
     if let Some(ref pattern) = filters.content_pattern {
         parts.push("(content LIKE ? OR subject LIKE ? OR sender LIKE ?)".into());

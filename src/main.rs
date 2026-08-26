@@ -20,6 +20,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 
+/// Widening a search to whole threads costs one `subject LIKE` per thread.
+/// Past this many, the query stops being worth it and the hits stand alone.
+const MAX_SEARCH_THREADS: usize = 40;
+
 /// Background DB write operations (fire-and-forget from main thread).
 /// Some variants (ToggleStar, UpdateFolder/Labels/Metadata,
 /// MarkAllReadBulk) are the async-writer surface for ops the current
@@ -3876,7 +3880,11 @@ impl App {
         match self.db.get_setting(&mode_key).as_deref() {
             Some("threaded") => { self.show_threaded = true; self.group_by_folder = false; }
             Some("folders") => { self.show_threaded = true; self.group_by_folder = true; }
-            _ => { self.show_threaded = false; self.group_by_folder = false; } // "flat" or unset
+            Some("flat") => { self.show_threaded = false; self.group_by_folder = false; }
+            // Never set: thread it. A conversation read as one collapsible
+            // block is what a mail view is for, and the mode key cycles
+            // straight back to flat for anyone who wants the old list.
+            _ => { self.show_threaded = true; self.group_by_folder = false; }
         }
         // Restore per-view manual section order so the Folders view
         // opens with channels in the order the user last arranged.
@@ -4805,6 +4813,31 @@ impl App {
             self.index = self.display_messages.len().saturating_sub(1);
         }
         self.render_all();
+    }
+
+    /// Put every thread away and open only the one holding `id`, cursor on
+    /// that message. What a search hit should look like: the conversation
+    /// in context, the matching mail selected inside it.
+    fn reveal_in_threads(&mut self, id: i64) {
+        if !self.show_threaded { return; }
+        // Which section holds it — read off the expanded layout, because a
+        // collapsed one no longer lists its messages.
+        let mut want: Option<String> = None;
+        for m in &self.display_messages {
+            if m.is_header { want = m.thread_id.clone(); }
+            else if m.id == id { break; }
+        }
+        let Some(want) = want else { return };
+        let names: Vec<String> = self.display_messages.iter()
+            .filter(|m| m.is_header)
+            .filter_map(|m| m.thread_id.clone())
+            .collect();
+        for n in names { self.section_collapsed.insert(n, true); }
+        self.section_collapsed.insert(want, false);
+        self.rebuild_display();
+        self.index = self.display_messages.iter()
+            .position(|m| !m.is_header && m.id == id)
+            .unwrap_or(0);
     }
 
     /// Toggle collapse on every section in the threaded display. If
@@ -6936,6 +6969,43 @@ impl App {
         }
         self.index = 0;
         let n = self.filtered_messages.len();
+        // Threaded view: a hit deep inside a conversation is worth little
+        // without the conversation. Widen to whole threads, keep the first
+        // hit so the cursor can land on the mail that actually matched, and
+        // make the widened set the sticky filter — the five-second
+        // reconciliation re-runs it, and a hand-built list would be blanked.
+        let mut hit = self.filtered_messages.first().map(|m| m.id);
+        let mut threads = 0usize;
+        if self.show_threaded && !self.group_by_folder && n > 0 {
+            let mut subs: Vec<String> = Vec::new();
+            for m in &self.filtered_messages {
+                if matches!(m.source_type.as_str(),
+                    "discord" | "slack" | "weechat" | "workspace" | "rss"
+                    | "messenger" | "instagram" | "whatsapp" | "telegram") { continue; }
+                let sub = database::normalise_subject(m.subject.as_deref().unwrap_or(""));
+                if !sub.is_empty() && !subs.contains(&sub) { subs.push(sub); }
+            }
+            threads = subs.len();
+            if !subs.is_empty() && subs.len() <= MAX_SEARCH_THREADS {
+                let mut wide = self.build_current_filters();
+                wide.is_read = None;
+                wide.is_starred = None;
+                wide.subjects = Some(subs);
+                let widened = self.db.get_messages(&wide, 2000, 0);
+                if !widened.is_empty() {
+                    self.filtered_messages = widened;
+                    for msg in &mut self.filtered_messages {
+                        resolve_source_type(&self.source_type_map, msg);
+                    }
+                    filters = wide;
+                }
+            } else if subs.len() > MAX_SEARCH_THREADS {
+                hit = None;
+                self.set_feedback(
+                    &format!("{} threads matched — showing the hits only", subs.len()),
+                    self.config.theme_colors.feedback_warn);
+            }
+        }
         let scope = if filters.folder.is_some() || filters.folder_pattern.is_some()
                        || filters.source_type.is_some() || filters.source_id.is_some()
         { format!("/{} in [{}]", query, self.current_view) }
@@ -6945,10 +7015,14 @@ impl App {
         // Threaded view renders display_messages — rebuild it from the
         // search hits or the pane keeps showing the old sections.
         self.rebuild_display();
+        if let Some(id) = hit {
+            if !self.group_by_folder { self.reveal_in_threads(id); }
+        }
         if n > 0 {
+            let where_ = if threads > 1 { format!(" in {} threads", threads) } else { String::new() };
             self.set_feedback(
-                &format!("{} → {} match{}  (Esc clears)",
-                    scope, n, if n == 1 { "" } else { "es" }),
+                &format!("{} → {} match{}{}  (Esc clears)",
+                    scope, n, if n == 1 { "" } else { "es" }, where_),
                 self.config.theme_colors.feedback_ok);
         } else {
             self.set_feedback(&format!("{} → no matches", scope),
