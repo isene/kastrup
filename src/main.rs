@@ -2875,6 +2875,18 @@ impl App {
     }
 
     fn format_message_line(&self, msg: &Message, selected: bool, pane_w: usize) -> String {
+        // A thread's top mail carries the fold: an arrow, and how many
+        // messages are behind it. A lone mail gets neither.
+        // Left plain, so it takes the row's own colour like the rest of it.
+        let fold = match (&msg.fold_key, msg.fold_count) {
+            (Some(key), n) if n > 1 => {
+                let collapsed = self.section_collapsed.get(key).copied()
+                    .unwrap_or(self.group_by_folder);
+                let arrow = if collapsed { "\u{25B8}" } else { "\u{25BE}" };
+                format!("{}{} ", arrow, n)
+            }
+            _ => String::new(),
+        };
         // N flag
         let nflag = if !msg.read {
             style::fg("N", self.config.theme_colors.unread)
@@ -2944,7 +2956,8 @@ impl App {
         // 1+1+1+1+6+1+1+1+1+1+12+1 = 29 fixed chars (same as before; avatar
         // takes 1 + gap from sender column).
         let fixed = 29;
-        let subj_w = pane_w.saturating_sub(fixed);
+        let fold_w = crust::display_width(&fold);
+        let subj_w = pane_w.saturating_sub(fixed + fold_w);
         let subject_truncated = truncate_str(&subject, subj_w);
 
         let flags = format!("{}{}{}", nflag, rflag, ind);
@@ -2973,7 +2986,8 @@ impl App {
 
         // Build content. avatar_inline carries its own ANSI; everything
         // else is plain text and gets colored by the outer style::fg below.
-        let content = format!("{} {} {} {}{}", date_padded, icon, avatar_inline, sender_padded, subject_truncated);
+        let content = format!("{} {} {} {}{}{}",
+            date_padded, icon, avatar_inline, sender_padded, fold, subject_truncated);
 
         // Pad to full width — display_width strips ANSI before measuring.
         let flags_w = crust::display_width(&flags);
@@ -3740,10 +3754,40 @@ impl App {
     /// indices stay valid. `pick_last` lands on the last unread within an
     /// expanded section (for prev_unread) instead of the first.
     fn try_select_unread_at(&mut self, i: usize, pick_last: bool) -> bool {
-        let (is_header, read, name) = {
+        let (is_header, read, name, fold, count) = {
             let Some(m) = self.display_messages.get(i) else { return false; };
-            (m.is_header, m.read, m.thread_id.clone())
+            (m.is_header, m.read, m.thread_id.clone(), m.fold_key.clone(), m.fold_count)
         };
+        // A mail thread's own top message. Unread here, take it; otherwise
+        // its replies may be folded away, so fall through and dive in.
+        if let Some(key) = fold {
+            if !read { self.index = i; return true; }
+            if count <= 1 { return false; }
+            let collapsed = self.section_collapsed.get(&key)
+                .copied().unwrap_or(self.group_by_folder);
+            if !collapsed { return false; }
+            let any_unread = self.filtered_messages.iter()
+                .any(|m| !m.read && database::normalise_subject(
+                    m.subject.as_deref().unwrap_or("")) == key);
+            if !any_unread { return false; }
+            self.section_collapsed.insert(key.clone(), false);
+            self.rebuild_display();
+            if let Some(h) = self.display_messages.iter()
+                .position(|m| m.fold_key.as_deref() == Some(key.as_str()))
+            {
+                let mut target = h;
+                for j in (h + 1)..self.display_messages.len() {
+                    let m = &self.display_messages[j];
+                    if m.is_header || m.fold_key.is_some() { break; }
+                    if !m.read {
+                        target = j;
+                        if !pick_last { break; }
+                    }
+                }
+                self.index = target;
+            }
+            return true;
+        }
         if !is_header {
             if !read { self.index = i; return true; }
             return false;
@@ -4689,6 +4733,25 @@ impl App {
             // default for that section.
             let is_collapsed = self.section_collapsed.get(&section.name).copied()
                 .unwrap_or(self.group_by_folder);
+
+            // Mail threads render like mutt: no header line of their own.
+            // The conversation's top message IS the row, it carries the
+            // fold arrow and the count, and the replies indent beneath it.
+            if section.section_type == "thread" {
+                let ordered = build_thread_order(&self.filtered_messages, &section.messages);
+                let total = section.messages.len();
+                for (n, (idx, depth)) in ordered.into_iter().enumerate() {
+                    if n > 0 && is_collapsed { break; }
+                    let mut row = self.display_row(idx, depth);
+                    if n == 0 {
+                        row.fold_key = Some(section.name.clone());
+                        row.fold_count = total;
+                    }
+                    self.display_messages.push(row);
+                }
+                continue;
+            }
+
             let mut header = Message::default_header();
             header.subject = Some(section.display_name.clone());
             // Count UNREAD highlights inside the section so the header
@@ -4734,81 +4797,86 @@ impl App {
                 };
 
                 for (idx, depth) in ordered {
-                    let src = &self.filtered_messages[idx];
-                    self.display_messages.push(Message {
-                        id: src.id,
-                        source_id: src.source_id,
-                        external_id: src.external_id.clone(),
-                        thread_id: src.thread_id.clone(),
-                        parent_id: src.parent_id,
-                        sender: src.sender.clone(),
-                        sender_name: src.sender_name.clone(),
-                        recipients: src.recipients.clone(),
-                        cc: src.cc.clone(),
-                        bcc: src.bcc.clone(),
-                        subject: src.subject.clone(),
-                        content: String::new(),
-                        html_content: None,
-                        timestamp: src.timestamp,
-                        received_at: src.received_at,
-                        read: src.read,
-                        starred: src.starred,
-                        archived: src.archived,
-                        labels: src.labels.clone(),
-                        attachments: src.attachments.clone(),
-                        metadata: serde_json::Value::Null,
-                        folder: src.folder.clone(),
-                        replied: src.replied,
-                        source_type: src.source_type.clone(),
-                        is_header: false,
-                        full_loaded: false,
-                        thread_depth: depth,
-                    });
+                    let row = self.display_row(idx, depth);
+                    self.display_messages.push(row);
                 }
             }
         }
     }
 
+    /// One list row copied off `filtered_messages[idx]`. Bodies are left
+    /// out: the pane loads them on selection.
+    fn display_row(&self, idx: usize, depth: u8) -> Message {
+        let src = &self.filtered_messages[idx];
+        Message {
+            id: src.id,
+            source_id: src.source_id,
+            external_id: src.external_id.clone(),
+            thread_id: src.thread_id.clone(),
+            parent_id: src.parent_id,
+            sender: src.sender.clone(),
+            sender_name: src.sender_name.clone(),
+            recipients: src.recipients.clone(),
+            cc: src.cc.clone(),
+            bcc: src.bcc.clone(),
+            subject: src.subject.clone(),
+            content: String::new(),
+            html_content: None,
+            timestamp: src.timestamp,
+            received_at: src.received_at,
+            read: src.read,
+            starred: src.starred,
+            archived: src.archived,
+            labels: src.labels.clone(),
+            attachments: src.attachments.clone(),
+            metadata: serde_json::Value::Null,
+            folder: src.folder.clone(),
+            replied: src.replied,
+            source_type: src.source_type.clone(),
+            fold_key: None,
+            fold_count: 0,
+            is_header: false,
+            full_loaded: false,
+            thread_depth: depth,
+        }
+    }
+
+    /// The collapse key for the row at `ix`: its own fold if it opens one,
+    /// otherwise the nearest fold or section header above it. Returns the
+    /// row that owns the fold, so the cursor can land there.
+    fn fold_at(&self, ix: usize) -> Option<(usize, String)> {
+        let mut i = ix.min(self.display_messages.len().saturating_sub(1));
+        loop {
+            let m = self.display_messages.get(i)?;
+            if let Some(k) = m.fold_key.clone() { return Some((i, k)); }
+            if m.is_header { return m.thread_id.clone().map(|k| (i, k)); }
+            if i == 0 { return None; }
+            i -= 1;
+        }
+    }
+
+    /// Every collapse key on screen, in display order.
+    fn fold_names(&self) -> Vec<String> {
+        self.display_messages.iter()
+            .filter_map(|m| m.fold_key.clone()
+                .or_else(|| if m.is_header { m.thread_id.clone() } else { None }))
+            .collect()
+    }
+
     fn toggle_collapse(&mut self) {
         if !self.show_threaded { return; }
-        // If cursor is on a child message, walk back to find its section
-        // header and collapse THAT — the user's intent when Space-folding
-        // from inside an expanded section. Also move the cursor to the
-        // header so it's visible after the collapse.
-        let (header_ix, section_name) = {
-            let Some(current) = self.display_messages.get(self.index) else { return };
-            if current.is_header {
-                (self.index, current.thread_id.clone())
-            } else {
-                let mut ix = self.index;
-                while ix > 0 && !self.display_messages[ix].is_header {
-                    ix -= 1;
-                }
-                let name = self.display_messages.get(ix)
-                    .filter(|m| m.is_header)
-                    .and_then(|m| m.thread_id.clone());
-                (ix, name)
-            }
-        };
-        let Some(name) = section_name else { return };
-        let was_on_child = self.index != header_ix;
-        // When invoked from a child, we want to collapse (not toggle) so a
-        // subsequent Space doesn't re-expand the section we just collapsed.
-        // When on the header itself, toggle (expand if collapsed).
-        if was_on_child {
+        let Some((owner_ix, name)) = self.fold_at(self.index) else { return };
+        // From inside a thread, Space closes it rather than toggling, so a
+        // second Space does not immediately reopen what was just shut.
+        if self.index != owner_ix {
             self.section_collapsed.insert(name, true);
         } else {
-            // First touch of a never-toggled section: pretend it was at
-            // the current mode's default so the toggle flips correctly
-            // (collapsed → expanded in Folders mode, expanded → collapsed
-            // everywhere else).
             let default_collapsed = self.group_by_folder;
             let collapsed = self.section_collapsed.entry(name).or_insert(default_collapsed);
             *collapsed = !*collapsed;
         }
-        self.index = header_ix;
+        self.index = owner_ix;
         self.rebuild_display();
-        // Re-find the header post-rebuild in case indices shifted.
         if self.index >= self.display_messages.len() {
             self.index = self.display_messages.len().saturating_sub(1);
         }
@@ -4822,17 +4890,10 @@ impl App {
         if !self.show_threaded { return; }
         // Which section holds it — read off the expanded layout, because a
         // collapsed one no longer lists its messages.
-        let mut want: Option<String> = None;
-        for m in &self.display_messages {
-            if m.is_header { want = m.thread_id.clone(); }
-            else if m.id == id { break; }
-        }
-        let Some(want) = want else { return };
-        let names: Vec<String> = self.display_messages.iter()
-            .filter(|m| m.is_header)
-            .filter_map(|m| m.thread_id.clone())
-            .collect();
-        for n in names { self.section_collapsed.insert(n, true); }
+        let Some(row) = self.display_messages.iter().position(|m| !m.is_header && m.id == id)
+        else { return };
+        let Some((_, want)) = self.fold_at(row) else { return };
+        for n in self.fold_names() { self.section_collapsed.insert(n, true); }
         self.section_collapsed.insert(want, false);
         self.rebuild_display();
         self.index = self.display_messages.iter()
@@ -4848,10 +4909,7 @@ impl App {
     fn toggle_collapse_all(&mut self) {
         if !self.show_threaded { return; }
         // Collect the unique section names in display order.
-        let names: Vec<String> = self.display_messages.iter()
-            .filter(|m| m.is_header)
-            .filter_map(|m| m.thread_id.clone())
-            .collect();
+        let names = self.fold_names();
         if names.is_empty() { return; }
         // If every section is already collapsed, expand them all.
         // Otherwise collapse the lot.
@@ -4863,25 +4921,18 @@ impl App {
         }
         // Snap the cursor to the section it was in so a follow-up
         // expand puts the user back where they were.
-        let cursor_section: Option<String> = {
-            // Clamp before indexing: a background refresh can leave
-            // self.index past the end of display_messages in threaded
-            // mode (it tracks display_messages, but refresh clamps to
-            // filtered_messages). Without this, the [ix] below panics.
-            let mut ix = self.index.min(self.display_messages.len().saturating_sub(1));
-            while ix > 0 && !self.display_messages[ix].is_header { ix -= 1; }
-            self.display_messages.get(ix)
-                .filter(|m| m.is_header)
-                .and_then(|m| m.thread_id.clone())
-        };
+        // Snap back to the thread the cursor was in, so a follow-up expand
+        // puts the user where they were. fold_at clamps the index for us.
+        let cursor_section = self.fold_at(self.index).map(|(_, n)| n);
         self.rebuild_display();
         if self.index >= self.display_messages.len() {
             self.index = self.display_messages.len().saturating_sub(1);
         }
         if let Some(name) = cursor_section {
-            if let Some(pos) = self.display_messages.iter()
-                .position(|m| m.is_header && m.thread_id.as_deref() == Some(name.as_str()))
-            {
+            if let Some(pos) = self.display_messages.iter().position(|m| {
+                m.fold_key.as_deref() == Some(name.as_str())
+                    || (m.is_header && m.thread_id.as_deref() == Some(name.as_str()))
+            }) {
                 self.index = pos;
             }
         }
@@ -4897,16 +4948,14 @@ impl App {
 
     fn collapse_current(&mut self) {
         if !self.show_threaded { return; }
-        if let Some(msg) = self.display_messages.get(self.index) {
-            if msg.is_header {
-                if let Some(ref name) = msg.thread_id {
-                    let name = name.clone();
-                    self.section_collapsed.insert(name, true);
-                    self.rebuild_display();
-                    self.render_all();
-                }
-            }
+        let Some((owner_ix, name)) = self.fold_at(self.index) else { return };
+        self.section_collapsed.insert(name, true);
+        self.index = owner_ix;
+        self.rebuild_display();
+        if self.index >= self.display_messages.len() {
+            self.index = self.display_messages.len().saturating_sub(1);
         }
+        self.render_all();
     }
 
     /// Expand the section the cursor is currently on. Counterpart of
@@ -4914,9 +4963,7 @@ impl App {
     /// navigation in Folders mode.
     fn expand_current(&mut self) {
         if !self.show_threaded { return; }
-        let Some(msg) = self.display_messages.get(self.index) else { return };
-        if !msg.is_header { return; }
-        let Some(name) = msg.thread_id.clone() else { return };
+        let Some((_, name)) = self.fold_at(self.index) else { return };
         self.section_collapsed.insert(name, false);
         self.rebuild_display();
         self.render_all();
@@ -5169,13 +5216,8 @@ impl App {
     /// view filter.
     fn mark_section_read(&mut self) {
         if !self.show_threaded { return; }
-        // Walk back from cursor to the section header.
-        let mut ix = self.index;
-        while ix > 0 && !self.display_messages[ix].is_header { ix -= 1; }
-        let Some(header) = self.display_messages.get(ix).filter(|m| m.is_header) else { return };
-        let label = header.thread_id.clone()
-            .map(|s| s.rsplit_once('.').map(|(_, c)| c.to_string()).unwrap_or(s))
-            .unwrap_or_else(|| "section".to_string());
+        let Some((ix, name)) = self.fold_at(self.index) else { return };
+        let label = name.rsplit_once('.').map(|(_, c)| c.to_string()).unwrap_or(name);
 
         // Collect the unread message ids in this display section
         // (header+1 until the next header). Works in any threaded
@@ -5184,10 +5226,11 @@ impl App {
         // predicate. (The old folder-filter path bailed in non-folder
         // threaded views like RSS, so `a` did nothing there.)
         let mut ids: Vec<i64> = Vec::new();
-        let mut j = ix + 1;
-        while j < self.display_messages.len() && !self.display_messages[j].is_header {
+        let mut j = ix;
+        while j < self.display_messages.len() {
             let m = &self.display_messages[j];
-            if !m.read { ids.push(m.id); }
+            if j > ix && (m.is_header || m.fold_key.is_some()) { break; }
+            if !m.read && !m.is_header { ids.push(m.id); }
             j += 1;
         }
         if ids.is_empty() {
@@ -5578,20 +5621,10 @@ impl App {
                 .min()
             {
                 Some(p) => {
-                    let mut h = p;
-                    while h > 0 && !self.display_messages[h].is_header { h -= 1; }
-                    let own = self.display_messages.get(h)
-                        .filter(|m| m.is_header)
-                        .and_then(|m| m.thread_id.clone());
-                    let mut prev = None;
-                    let mut a = h;
-                    while a > 0 {
-                        a -= 1;
-                        if self.display_messages[a].is_header {
-                            prev = self.display_messages[a].thread_id.clone();
-                            break;
-                        }
-                    }
+                    let owned = self.fold_at(p);
+                    let h = owned.as_ref().map(|(i, _)| *i).unwrap_or(0);
+                    let own = owned.map(|(_, n)| n);
+                    let prev = if h == 0 { None } else { self.fold_at(h - 1).map(|(_, n)| n) };
                     (own, prev)
                 }
                 None => (None, None),
@@ -5609,7 +5642,8 @@ impl App {
             // next keypress), then restore the cursor near the removed thread.
             self.rebuild_display();
             let pos_of = |name: &str, dm: &[Message]| -> Option<usize> {
-                dm.iter().position(|m| m.is_header && m.thread_id.as_deref() == Some(name))
+                dm.iter().position(|m| m.fold_key.as_deref() == Some(name)
+                    || (m.is_header && m.thread_id.as_deref() == Some(name)))
             };
             let len = self.display_messages.len();
             self.index = own_section.as_deref().and_then(|n| pos_of(n, &self.display_messages))
@@ -15030,6 +15064,42 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::build_thread_order;
+    use crate::message::Message;
+
+    fn mail(id: i64, mid: &str, irt: Option<&str>, ts: i64) -> Message {
+        let mut meta = serde_json::json!({});
+        if let Some(v) = irt { meta["in_reply_to"] = serde_json::json!(v); }
+        Message {
+            id,
+            thread_id: Some(mid.into()),
+            metadata: meta,
+            timestamp: ts,
+            ..Default::default()
+        }
+    }
+
+    /// The first entry becomes the row that carries the fold, so a linked
+    /// thread has to start at its own first message.
+    #[test]
+    fn the_thread_starts_at_its_first_message() {
+        let msgs = vec![
+            mail(1, "root", None, 100),
+            mail(2, "r1", Some("root"), 200),
+            mail(3, "r2", Some("r1"), 300),
+            mail(4, "r3", Some("root"), 250),
+        ];
+        let order = build_thread_order(&msgs, &[0, 1, 2, 3]);
+        let ids: Vec<i64> = order.iter().map(|&(i, _)| msgs[i].id).collect();
+        let depths: Vec<u8> = order.iter().map(|&(_, d)| d).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4], "root first, then replies in order");
+        assert_eq!(depths, vec![0, 1, 2, 1], "replies indent under their parent");
+        assert_eq!(order.len(), 4, "every message appears once");
+    }
 }
 
 #[cfg(test)]

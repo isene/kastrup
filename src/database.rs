@@ -1644,6 +1644,8 @@ fn row_to_message(row: &rusqlite::Row) -> Message {
         external_id: row.get(2).unwrap_or_default(),
         thread_id: row.get(3).ok(),
         parent_id: row.get(4).ok(),
+        fold_key: None,
+        fold_count: 0,
         sender: row.get(5).unwrap_or_default(),
         sender_name: row.get(6).ok(),
         recipients: row.get(7).unwrap_or_default(),

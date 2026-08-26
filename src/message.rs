@@ -26,6 +26,13 @@ pub struct Message {
     pub replied: bool,
     // UI state (not from DB)
     pub source_type: String,
+    /// Set on the display row that opens a mail thread: the thread's own
+    /// top message, carrying the collapse key. Mutt's shape — no synthetic
+    /// header line above a conversation, the first mail IS the row you fold.
+    pub fold_key: Option<String>,
+    /// How many messages the fold holds. 1 means a lone mail, which gets no
+    /// arrow and no count.
+    pub fold_count: usize,
     pub is_header: bool,
     pub full_loaded: bool,
     /// 0 for top-level messages, +1 per reply nesting level. Set by
@@ -63,6 +70,7 @@ impl Message {
             labels: Vec::new(), attachments: Vec::new(),
             metadata: serde_json::Value::Null, folder: None,
             replied: false, source_type: String::new(),
+            fold_key: None, fold_count: 0,
             is_header: true, full_loaded: true,
             thread_depth: 0,
         }
@@ -96,6 +104,8 @@ impl Default for Message {
             folder: None,
             replied: false,
             source_type: String::new(),
+            fold_key: None,
+            fold_count: 0,
             is_header: false,
             full_loaded: false,
             thread_depth: 0,
