@@ -293,7 +293,9 @@ impl Database {
         // full scan the first time, then every unread recount is covered.
         let t = std::time::Instant::now();
         let _ = conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_messages_source_read ON messages(source_id, read);"
+            "CREATE INDEX IF NOT EXISTS idx_messages_source_read ON messages(source_id, read);\n\
+             CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id);\n\
+             CREATE INDEX IF NOT EXISTS idx_drafts_reply_to ON drafts(reply_to_id);"
         );
         let ms = t.elapsed().as_millis();
         if ms >= 500 {
@@ -435,6 +437,11 @@ impl Database {
             -- the UI thread. Without `read` in the index the group-by does a
             -- table lookup per unread row across the whole DB.
             CREATE INDEX IF NOT EXISTS idx_messages_source_read ON messages(source_id, read);
+            -- Foreign keys are ON, so deleting a message makes SQLite look for
+            -- rows pointing at it through these two ON DELETE SET NULL links.
+            -- Unindexed, each delete scanned all of messages and all of drafts.
+            CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id);
+            CREATE INDEX IF NOT EXISTS idx_drafts_reply_to ON drafts(reply_to_id);
             CREATE INDEX IF NOT EXISTS idx_sources_enabled ON sources(enabled);
             CREATE INDEX IF NOT EXISTS idx_sources_plugin_type ON sources(plugin_type);
             CREATE INDEX IF NOT EXISTS idx_views_key_binding ON views(key_binding);
@@ -1337,6 +1344,7 @@ impl Database {
                 "UPDATE messages SET content_text = ? WHERE id = ?",
                 params![text, id],
             );
+            link_sent_reply(&conn, id, msg);
         }
     }
 
@@ -1379,6 +1387,7 @@ impl Database {
                         "UPDATE messages SET content_text = ? WHERE id = ?",
                         params![text, id],
                     );
+                    link_sent_reply(&conn, id, msg);
                 }
             }
             let _ = conn.execute("COMMIT", []);
@@ -1469,6 +1478,121 @@ fn decoded_body(content: &str, html: Option<&str>) -> String {
 /// Outlook `Sent Items`). Mail in these folders was written by the user, so
 /// it lands already-read. Deliberately strict so folders like `consent` or
 /// `Presents` don't match.
+/// How far back a subject match may reach when no header names the parent.
+const REPLY_MATCH_WINDOW: i64 = 7 * 24 * 3600;
+
+/// Drop every leading reply / forward prefix so two subjects compare equal.
+/// Covers the English and Norwegian ones the user's mail actually carries.
+pub fn normalise_subject(s: &str) -> String {
+    let mut cur = s.trim();
+    loop {
+        let lower = cur.to_ascii_lowercase();
+        let hit = ["re:", "sv:", "svar:", "fwd:", "fw:", "vs:", "aw:"]
+            .iter()
+            .find(|p| lower.starts_with(**p));
+        match hit {
+            Some(p) => cur = cur[p.len()..].trim_start(),
+            None => return cur.to_string(),
+        }
+    }
+}
+
+/// The message a reply answers.
+///
+/// `In-Reply-To` and `References` settle it when they are there: both hold
+/// the parent's Message-Id, which maildir rows keep in `thread_id` (indexed,
+/// so this is one seek). Failing that, take the newest mail with the same
+/// subject, from someone this reply is addressed to, inside the window.
+///
+/// `exclude_id` is the reply itself, which must never match.
+pub fn find_reply_target(
+    conn: &Connection,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
+    subject: &str,
+    recipients: &str,
+    ts: i64,
+    exclude_id: i64,
+) -> Option<i64> {
+    // Nearest ancestor first: In-Reply-To, then References right to left.
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(v) = in_reply_to {
+        ids.push(v.trim().trim_matches(|c| c == '<' || c == '>').to_string());
+    }
+    if let Some(v) = references {
+        let mut r: Vec<String> = v
+            .split_whitespace()
+            .map(|t| t.trim_matches(|c| c == '<' || c == '>').to_string())
+            .collect();
+        r.reverse();
+        ids.extend(r);
+    }
+    for mid in ids {
+        if mid.is_empty() { continue; }
+        let hit: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM messages WHERE thread_id = ? AND id != ? \
+                 ORDER BY timestamp DESC LIMIT 1",
+                params![mid, exclude_id],
+                |r| r.get(0),
+            )
+            .ok();
+        if hit.is_some() { return hit; }
+    }
+
+    // Subject fallback. Bounded by timestamp, which is indexed, so this
+    // reads a week of rows rather than the whole table.
+    let want = normalise_subject(subject);
+    if want.is_empty() { return None; }
+    let to_lower = recipients.to_ascii_lowercase();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, sender, subject, folder FROM messages \
+             WHERE timestamp BETWEEN ? AND ? AND id != ? AND subject IS NOT NULL \
+             ORDER BY timestamp DESC",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map(params![ts - REPLY_MATCH_WINDOW, ts, exclude_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .ok()?;
+    for (id, sender, subj, folder) in rows.flatten() {
+        // Our own sent copies are not what a reply answers.
+        if is_sent_folder(folder.as_deref()) { continue; }
+        if normalise_subject(&subj) != want { continue; }
+        let addr = sender.to_ascii_lowercase();
+        if addr.is_empty() || !to_lower.contains(&addr) { continue; }
+        return Some(id);
+    }
+    None
+}
+
+/// Give a freshly imported sent mail its arrow: mark what it answers as
+/// replied, and hang the sent copy under it. Only runs for sent folders,
+/// and only for a row the insert actually added.
+fn link_sent_reply(conn: &Connection, id: i64, msg: &crate::sources::MessageData) {
+    if !is_sent_folder(msg.folder.as_deref()) { return; }
+    let irt = msg.metadata.get("in_reply_to").and_then(|v| v.as_str());
+    let refs = msg.metadata.get("references").and_then(|v| v.as_str());
+    let subject = msg.subject.as_deref().unwrap_or("");
+    let recipients = format!(
+        "{} {}",
+        msg.recipients,
+        msg.cc.clone().unwrap_or_default()
+    );
+    let Some(orig) = find_reply_target(
+        conn, irt, refs, subject, &recipients, msg.timestamp, id,
+    ) else { return };
+    let _ = conn.execute("UPDATE messages SET replied = 1 WHERE id = ?", params![orig]);
+    let _ = conn.execute("UPDATE messages SET parent_id = ? WHERE id = ?", params![orig, id]);
+}
+
 fn is_sent_folder(folder: Option<&str>) -> bool {
     let Some(f) = folder else { return false };
     let l = f.to_lowercase();
@@ -1559,4 +1683,125 @@ fn row_to_source(row: &rusqlite::Row) -> Source {
 fn db_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".kastrup").join("kastrup.db")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sources::MessageData;
+
+    fn msg(ext: &str, sender: &str, to: &str, subject: &str, folder: &str,
+           ts: i64, mid: &str, irt: Option<&str>) -> MessageData {
+        let mut meta = serde_json::json!({ "message_id": mid });
+        if let Some(v) = irt { meta["in_reply_to"] = serde_json::json!(v); }
+        MessageData {
+            external_id: ext.into(),
+            sender: sender.into(),
+            sender_name: None,
+            recipients: to.into(),
+            cc: None,
+            bcc: None,
+            subject: Some(subject.into()),
+            content: "body".into(),
+            html_content: None,
+            timestamp: ts,
+            labels: vec![],
+            attachments: vec![],
+            metadata: meta,
+            folder: Some(folder.into()),
+            thread_id: Some(mid.into()),
+        }
+    }
+
+    fn id_of(db: &Database, ext: &str) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row("SELECT id FROM messages WHERE external_id = ?",
+                       params![ext], |r| r.get(0)).unwrap()
+    }
+
+    fn link_of(db: &Database, ext: &str) -> (i64, Option<i64>) {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row("SELECT replied, parent_id FROM messages WHERE external_id = ?",
+                       params![ext], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+    }
+
+    #[test]
+    fn sent_replies_find_their_original() {
+        assert_eq!(normalise_subject("RE: Sv: Dualog Insight"), "Dualog Insight");
+        assert_eq!(normalise_subject("Fwd:  Re: hi"), "hi");
+        assert_eq!(normalise_subject("Dualog Insight"), "Dualog Insight");
+        assert_eq!(normalise_subject("Regarding the report"), "Regarding the report");
+
+        let tmp = std::env::temp_dir().join("kastrup-link-test");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(tmp.join(".kastrup")).unwrap();
+        std::env::set_var("HOME", &tmp);
+        let db = Database::new().unwrap();
+        let t = 1_787_000_000i64;
+        // Foreign keys are enforced on this connection, so messages need a
+        // source row to hang off.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO sources (id, name, plugin_type, config, capabilities, \
+                 created_at, updated_at) VALUES (1,'test','maildir','{}','{}',0,0)", []).unwrap();
+        }
+
+        // 1. Header match: In-Reply-To names the original outright.
+        db.insert_message(1, &msg("in1", "bernd@ess.biz", "geir@dualog.com",
+            "Dualog Insight", "AA.Customers.Dualog", t, "MID-1", None));
+        db.insert_message(1, &msg("out1", "geir@dualog.com", "bernd@ess.biz",
+            "RE: Dualog Insight", "Sent.2026-08", t + 600, "MID-2", Some("MID-1")));
+        assert_eq!(link_of(&db, "in1").0, 1, "original marked replied");
+        assert_eq!(link_of(&db, "out1").1, Some(id_of(&db, "in1")), "sent copy linked");
+
+        // 2. No header at all: same subject, going to the original sender.
+        db.insert_message(1, &msg("in2", "alice@x.com", "geir@isene.com",
+            "Project X", "Geir", t, "MID-3", None));
+        db.insert_message(1, &msg("out2", "geir@isene.com", "alice@x.com",
+            "Re: Project X", "Sent.2026-08", t + 900, "MID-4", None));
+        assert_eq!(link_of(&db, "in2").0, 1, "subject fallback marked replied");
+        assert_eq!(link_of(&db, "out2").1, Some(id_of(&db, "in2")));
+
+        // 3. Same subject, but written to somebody else — no link.
+        db.insert_message(1, &msg("in3", "carol@x.com", "geir@isene.com",
+            "Budget", "Geir", t, "MID-5", None));
+        db.insert_message(1, &msg("out3", "geir@isene.com", "dave@x.com",
+            "Re: Budget", "Sent.2026-08", t + 900, "MID-6", None));
+        assert_eq!(link_of(&db, "in3").0, 0, "wrong recipient must not link");
+        assert_eq!(link_of(&db, "out3").1, None);
+
+        // 4. Same subject and person, but months apart — outside the window.
+        db.insert_message(1, &msg("in4", "erik@x.com", "geir@isene.com",
+            "Old thread", "Geir", t, "MID-7", None));
+        db.insert_message(1, &msg("out4", "geir@isene.com", "erik@x.com",
+            "Re: Old thread", "Sent.2026-08", t + 40 * 86400, "MID-8", None));
+        assert_eq!(link_of(&db, "in4").0, 0, "stale match must not link");
+
+        // 5. An incoming mail is never linked, however it looks.
+        db.insert_message(1, &msg("in5", "frank@x.com", "geir@isene.com",
+            "Re: Project X", "Geir", t + 1200, "MID-9", Some("MID-3")));
+        assert_eq!(link_of(&db, "in5").1, None, "only sent mail links");
+
+        std::fs::remove_dir_all(&tmp).ok();
+        println!("linking ok");
+    }
+
+    #[test]
+    fn the_real_pair_resolves() {
+        // The message DI could not link: 7966396 (Sent) answers 7966391.
+        let home = "/home/geir";
+        let conn = Connection::open_with_flags(
+            format!("{}/.kastrup/kastrup.db", home),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ).unwrap();
+        let (subject, to, cc, ts): (String, String, Option<String>, i64) = conn.query_row(
+            "SELECT subject, recipients, cc, timestamp FROM messages WHERE id = 7966396",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).unwrap();
+        let recipients = format!("{} {}", to, cc.unwrap_or_default());
+        let hit = find_reply_target(&conn, None, None, &subject, &recipients, ts, 7966396);
+        println!("subject {:?} resolved to {:?}", subject, hit);
+        assert_eq!(hit, Some(7966391));
+    }
 }
