@@ -2877,15 +2877,17 @@ impl App {
     fn format_message_line(&self, msg: &Message, selected: bool, pane_w: usize) -> String {
         // A thread's top mail carries the fold: an arrow, and how many
         // messages are behind it. A lone mail gets neither.
-        // Left plain, so it takes the row's own colour like the rest of it.
-        let fold = match (&msg.fold_key, msg.fold_count) {
+        // The fold marker on a thread's top mail. Coloured in a moment,
+        // once the row colour it has to hand back is known; the plain text
+        // is needed here to budget the subject's width.
+        let (fold, fold_collapsed) = match (&msg.fold_key, msg.fold_count) {
             (Some(key), n) if n > 1 => {
                 let collapsed = self.section_collapsed.get(key).copied()
                     .unwrap_or(self.group_by_folder);
                 let arrow = if collapsed { "\u{25B8}" } else { "\u{25BE}" };
-                format!("{}{} ", arrow, n)
+                (format!("{}{} ", arrow, n), collapsed)
             }
-            _ => String::new(),
+            _ => (String::new(), false),
         };
         // N flag
         let nflag = if !msg.read {
@@ -2984,10 +2986,23 @@ impl App {
             style::set_fg(color)
         );
 
+        // A folded thread is the one thing on this row the eye has to catch:
+        // mail is hidden under it. Loud when shut, quiet when open.
+        let fold_inline = if fold.is_empty() {
+            String::new()
+        } else {
+            let fc = if fold_collapsed {
+                self.config.theme_colors.accent
+            } else {
+                self.config.theme_colors.hint_fg
+            };
+            format!("{}{}{}", style::set_fg(fc), fold, style::set_fg(color))
+        };
+
         // Build content. avatar_inline carries its own ANSI; everything
         // else is plain text and gets colored by the outer style::fg below.
         let content = format!("{} {} {} {}{}{}",
-            date_padded, icon, avatar_inline, sender_padded, fold, subject_truncated);
+            date_padded, icon, avatar_inline, sender_padded, fold_inline, subject_truncated);
 
         // Pad to full width — display_width strips ANSI before measuring.
         let flags_w = crust::display_width(&flags);
@@ -3001,6 +3016,13 @@ impl App {
 
         if selected {
             format!("{}{}{}", flags, style::underline(&style::bold(&style::fg(&content, color))), style::bold(&style::fg(&padding, color)))
+        } else if fold_collapsed {
+            // Mail is hidden under this row. The band runs the full width so
+            // a folded conversation is one solid thing, not one more line.
+            let bg = self.config.theme_colors.fold_bg as u8;
+            let body = style::fb(&full_content, color, bg);
+            if msg.read { format!("{}{}", flags, body) }
+            else { format!("{}{}", flags, style::bold(&body)) }
         } else if !msg.read {
             format!("{}{}", flags, style::bold(&style::fg(&full_content, color)))
         } else {
@@ -4467,13 +4489,12 @@ impl App {
         self.active_folder = Some(folder.to_string());
         self.in_source_view = false;
         self.index = 0;
-        // Browsing a specific folder via B / F is always a flat,
-        // chronological list of mails in that folder — no per-channel
-        // sections, no threading rail. Folders / threaded modes only
-        // make sense in the combined Views (3, 4) where multiple
-        // source folders contribute. Reset here so a previous
-        // Views-mode setting doesn't leak in.
-        self.show_threaded = false;
+        // A browsed folder is a mail view like any other, so it threads by
+        // default. Folder-grouping is the one mode that makes no sense here
+        // — every message is already in the same folder — so a browsed
+        // folder only ever remembers threaded or flat, under its own key
+        // rather than leaking into whichever view was open before.
+        self.show_threaded = self.db.get_setting("thread_mode_folder").as_deref() != Some("flat");
         self.group_by_folder = false;
 
         self.set_feedback(
@@ -4583,6 +4604,21 @@ impl App {
 impl App {
     fn cycle_view_mode(&mut self) {
         let tc = &self.config.theme_colors;
+        // Inside a browsed folder there is nothing to group by, so the key
+        // just flips threaded and flat, remembered for browsed folders.
+        if self.active_folder.is_some() {
+            self.show_threaded = !self.show_threaded;
+            self.group_by_folder = false;
+            let mode = if self.show_threaded { "threaded" } else { "flat" };
+            self.set_feedback(
+                &format!("View mode: {}", if self.show_threaded { "Threaded" } else { "Flat" }),
+                tc.feedback_ok);
+            self.db.set_setting("thread_mode_folder", mode);
+            self.index = 0;
+            self.rebuild_display();
+            self.render_all();
+            return;
+        }
         if !self.show_threaded && !self.group_by_folder {
             self.show_threaded = true;
             self.group_by_folder = false;
