@@ -9410,6 +9410,41 @@ impl App {
         self.pending_forward_ids.clear();
     }
 
+    /// `In-Reply-To` and `References` for a reply we are about to send.
+    /// Empty when this is not a reply. Without them the recipient's mail
+    /// client cannot thread the answer, and our own sent copy comes back
+    /// from Gmail with nothing to link it to.
+    fn reply_headers(&self) -> String {
+        let Some(id) = self.pending_reply_id else { return String::new() };
+        let Some(meta) = self.db.get_message_metadata(id) else { return String::new() };
+        let Some(mid) = meta.get("message_id").and_then(|v| v.as_str()) else {
+            return String::new();
+        };
+        if mid.is_empty() { return String::new(); }
+        let mut refs: Vec<String> = meta.get("references")
+            .and_then(|v| v.as_str())
+            .map(|s| s.split_whitespace().map(|t| t.to_string()).collect())
+            .unwrap_or_default();
+        refs.push(format!("<{}>", mid));
+        format!("In-Reply-To: <{}>\nReferences: {}\n", mid, refs.join(" "))
+    }
+
+    /// What this outgoing mail answers, when the draft never said. A
+    /// drop-file written outside kastrup has no `X-Kastrup-Reply-To`, and
+    /// the user still expects the original to show its arrow.
+    ///
+    /// Only for a subject that actually carries a reply prefix — otherwise
+    /// a fresh mail that happens to share a subject would claim a parent.
+    fn infer_reply_target(&self, subject: &str, to: &str, cc: &str) -> Option<i64> {
+        let subject = subject.trim();
+        if database::normalise_subject(subject) == subject { return None; }
+        let recipients = format!("{} {}", to, cc);
+        let conn = self.db.conn.lock().unwrap();
+        database::find_reply_target(
+            &conn, None, None, subject, &recipients, database::now_secs(), 0,
+        )
+    }
+
     fn mark_replied(&mut self) {
         let id = match self.pending_reply_id.take() {
             Some(id) => id,
@@ -10909,6 +10944,7 @@ impl App {
         if !bcc.is_empty() { rfc_msg.push_str(&format!("Bcc: {}\n", bcc)); }
         if !reply_to.is_empty() { rfc_msg.push_str(&format!("Reply-To: {}\n", reply_to)); }
         rfc_msg.push_str(&format!("Subject: {}\n", subject));
+        rfc_msg.push_str(&self.reply_headers());
         rfc_msg.push_str("MIME-Version: 1.0\n");
         rfc_msg.push_str(&format!("Content-Type: multipart/mixed; boundary=\"{}\"\n", boundary));
         rfc_msg.push('\n');
@@ -10955,7 +10991,8 @@ impl App {
         // interactive while the worker does the transport (oauth +
         // TLS for Gmail, or a plain relay connect for smtp:// specs).
         let forward_ids = std::mem::take(&mut self.pending_forward_ids);
-        let reply_id = self.pending_reply_id.take();
+        let reply_id = self.pending_reply_id.take()
+            .or_else(|| self.infer_reply_target(&subject, &to, &cc));
         let att_n = attachments.len();
         self.spawn_smtp_send(
             from_email, recipients, to, smtp_tmpfile, rfc_msg, smtp_spec,
@@ -11038,6 +11075,7 @@ impl App {
             rfc_msg.push_str(&format!("Reply-To: {}\n", reply_to));
         }
         rfc_msg.push_str(&format!("Subject: {}\n", subject));
+        rfc_msg.push_str(&self.reply_headers());
         rfc_msg.push_str("MIME-Version: 1.0\n");
         rfc_msg.push_str("Content-Type: text/plain; charset=UTF-8\n");
         rfc_msg.push('\n');
@@ -11068,7 +11106,8 @@ impl App {
         }
         log::info(&format!("SMTP: {} -> {}", from_email, recipients.join(", ")));
         let forward_ids = std::mem::take(&mut self.pending_forward_ids);
-        let reply_id = self.pending_reply_id.take();
+        let reply_id = self.pending_reply_id.take()
+            .or_else(|| self.infer_reply_target(&subject, &to, &cc));
         self.spawn_smtp_send(
             from_email, recipients, to, smtp_tmpfile, rfc_msg, smtp_spec,
             forward_ids, reply_id, None, content.to_string(),
