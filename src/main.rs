@@ -9332,8 +9332,15 @@ impl App {
             self.source_type_map.get(&msg.source_id).map(String::as_str).unwrap_or(""),
             "email" | "maildir" | "imap" | "gmail"
         );
-        let looks_mime = raw.contains("Content-Type:")
-            || raw.lines().any(|l| l.starts_with("--") && l.len() > 5);
+        // Same test as render_message_content, and it has to stay the same:
+        // a lone `--…` line is not a boundary. A plain-text mail carrying
+        // "---------- Forwarded message ----------" was read as multipart,
+        // extraction found nothing, and the body came back empty — which is
+        // fine in the pane (the attachment list stands in) but silently
+        // dropped the quoted text from every reply. kastrup:7966376.
+        let looks_mime = raw.contains("boundary=")
+            || (raw.contains("Content-Type:")
+                && raw.lines().any(|l| l.starts_with("--") && l.len() > 5));
         let extracted = if !is_email {
             raw.clone()
         } else if looks_mime {
