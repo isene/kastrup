@@ -17,6 +17,9 @@ pub struct ThemeColors {
     pub quote4: u8,
     pub sig: u8,
     pub link: u8,
+    /// Background for a collapsed thread's row, so a folded conversation
+    /// reads as a band rather than one more line of text.
+    pub fold_bg: u16,
     pub top_bg: u16,
     pub bottom_bg: u16,
     pub cmd_bg: u16,
@@ -99,7 +102,7 @@ impl Default for ThemeColors {
             tag: 14, star: 226,
             quote1: 114, quote2: 180, quote3: 139, quote4: 109,
             sig: 242, link: 4,
-            top_bg: 235, bottom_bg: 235, cmd_bg: 17,
+            fold_bg: 236, top_bg: 235, bottom_bg: 235, cmd_bg: 17,
             header_from: 2, header_subj: 1, header_date: 240,
             header_label: 51, separator: 238, attachment: 208,
             html_hint: 51, replied: 45, delete_mark: 88,
@@ -711,6 +714,7 @@ impl Config {
                         "quote4" => self.theme_colors.quote4 = cval as u8,
                         "sig" => self.theme_colors.sig = cval as u8,
                         "link" => self.theme_colors.link = cval as u8,
+                        "fold_bg" => self.theme_colors.fold_bg = cval,
                         "top_bg" => self.theme_colors.top_bg = cval,
                         "bottom_bg" => self.theme_colors.bottom_bg = cval,
                         "cmd_bg" => self.theme_colors.cmd_bg = cval,
