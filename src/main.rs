@@ -4919,9 +4919,9 @@ impl App {
         self.render_all();
     }
 
-    /// Put every thread away and open only the one holding `id`, cursor on
-    /// that message. What a search hit should look like: the conversation
-    /// in context, the matching mail selected inside it.
+    /// Put every thread away and sit on the one that matched. A search
+    /// answers with a list of conversations, not a wall of loose replies;
+    /// Space on the row under the cursor opens the one you came for.
     fn reveal_in_threads(&mut self, id: i64) {
         if !self.show_threaded { return; }
         // Which section holds it — read off the expanded layout, because a
@@ -4930,10 +4930,11 @@ impl App {
         else { return };
         let Some((_, want)) = self.fold_at(row) else { return };
         for n in self.fold_names() { self.section_collapsed.insert(n, true); }
-        self.section_collapsed.insert(want, false);
         self.rebuild_display();
         self.index = self.display_messages.iter()
-            .position(|m| !m.is_header && m.id == id)
+            .position(|m| m.fold_key.as_deref() == Some(want.as_str())
+                || (m.is_header && m.thread_id.as_deref() == Some(want.as_str()))
+                || (!m.is_header && m.id == id))
             .unwrap_or(0);
     }
 
@@ -7021,17 +7022,11 @@ impl App {
         self.render_bottom_bar();
         if query.is_empty() { return; }
 
-        // Seed with the current view's scope (source_type / source_id /
-        // folder / folder_pattern) so `/` in F1 stays inside Slack, `/`
-        // in F2 stays inside IRC, etc. The user expects search to
-        // respect the view they're looking at. View "A" (all) is the
-        // only one with no scope — that gives the old global behaviour.
-        let mut filters = self.build_current_filters();
-        // The view filter may carry `is_read` or `is_starred` from a
-        // view definition. Those constrain who-shows-up, not what-to-
-        // search-for, so we drop them for the search itself.
-        filters.is_read = None;
-        filters.is_starred = None;
+        // `/` searches the whole database, not the view you happen to be in.
+        // Scoping it to the view meant a search in Dualog missed the Dualog
+        // archive, which is where the old mail actually is. To narrow, search
+        // first and then use `\` to walk the results.
+        let mut filters = Filters::default();
         filters.content_pattern = Some(format!("%{}%", query));
         self.filtered_messages = self.db.get_messages(&filters, 500, 0);
         for msg in &mut self.filtered_messages {
@@ -7039,14 +7034,20 @@ impl App {
         }
         self.index = 0;
         let n = self.filtered_messages.len();
-        // Threaded view: a hit deep inside a conversation is worth little
-        // without the conversation. Widen to whole threads, keep the first
-        // hit so the cursor can land on the mail that actually matched, and
-        // make the widened set the sticky filter — the five-second
-        // reconciliation re-runs it, and a hand-built list would be blanked.
+        // Results are conversations, so they arrive the same way every time:
+        // threaded and shut. A Folders-mode view would otherwise file the hits
+        // back under their channels and bury them. Esc restores the view mode.
+        if n > 0 {
+            self.show_threaded = true;
+            self.group_by_folder = false;
+        }
+        // A hit deep inside a conversation is worth little without the
+        // conversation, so widen to whole threads. The widened set becomes the
+        // sticky filter: the five-second reconciliation re-runs it, and a
+        // hand-built list would be blanked.
         let mut hit = self.filtered_messages.first().map(|m| m.id);
         let mut threads = 0usize;
-        if self.show_threaded && !self.group_by_folder && n > 0 {
+        if n > 0 {
             let mut subs: Vec<String> = Vec::new();
             for m in &self.filtered_messages {
                 if matches!(m.source_type.as_str(),
@@ -7057,9 +7058,7 @@ impl App {
             }
             threads = subs.len();
             if !subs.is_empty() && subs.len() <= MAX_SEARCH_THREADS {
-                let mut wide = self.build_current_filters();
-                wide.is_read = None;
-                wide.is_starred = None;
+                let mut wide = Filters::default();
                 wide.subjects = Some(subs);
                 let widened = self.db.get_messages(&wide, 2000, 0);
                 if !widened.is_empty() {
@@ -7076,26 +7075,23 @@ impl App {
                     self.config.theme_colors.feedback_warn);
             }
         }
-        let scope = if filters.folder.is_some() || filters.folder_pattern.is_some()
-                       || filters.source_type.is_some() || filters.source_id.is_some()
-        { format!("/{} in [{}]", query, self.current_view) }
-        else { format!("/{}", query) };
+        let scope = format!("/{}", query);
         self.active_search_label = scope.clone();
         self.active_search_filter = Some(filters);
         // Threaded view renders display_messages — rebuild it from the
         // search hits or the pane keeps showing the old sections.
         self.rebuild_display();
-        if let Some(id) = hit {
-            if !self.group_by_folder { self.reveal_in_threads(id); }
-        }
+        log::info(&format!("search {:?}: {} hit(s), {} thread(s), {} row(s)",
+            query, n, threads, self.filtered_messages.len()));
+        if let Some(id) = hit { self.reveal_in_threads(id); }
         if n > 0 {
             let where_ = if threads > 1 { format!(" in {} threads", threads) } else { String::new() };
             self.set_feedback(
-                &format!("{} → {} match{}{}  (Esc clears)",
+                &format!("{} → {} match{}{}  (\\ to walk them, Esc clears)",
                     scope, n, if n == 1 { "" } else { "es" }, where_),
                 self.config.theme_colors.feedback_ok);
         } else {
-            self.set_feedback(&format!("{} → no matches", scope),
+            self.set_feedback(&format!("{} → no matches anywhere", scope),
                 self.config.theme_colors.feedback_warn);
         }
         self.render_all();
