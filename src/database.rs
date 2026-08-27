@@ -186,7 +186,12 @@ fn build_branch_where(filters: &Filters) -> (String, Vec<Box<dyn rusqlite::types
         }
     }
     if let Some(ref pattern) = filters.content_pattern {
-        parts.push("(content LIKE ? OR subject LIKE ? OR sender LIKE ?)".into());
+        // content_text is the decoded body. Matching `content` matched
+        // base64: it invents hits where the letters happen to fall inside an
+        // encoded blob, and misses real ones. 366 of 269,434 rows predate the
+        // column, so those fall back to raw.
+        parts.push(
+            "(COALESCE(content_text, content) LIKE ? OR subject LIKE ? OR sender LIKE ?)".into());
         let like = format!("%{}%", pattern);
         params.push(Box::new(like.clone()));
         params.push(Box::new(like.clone()));
@@ -640,6 +645,17 @@ impl Database {
             if !parts.is_empty() {
                 sql.push_str(&format!(" AND ({})", parts.join(" OR ")));
             }
+            // A branched view still has to answer a search. The view's own
+            // rules live in `branches`, but `/` sets content_pattern on the
+            // top-level struct, and dropping it turned a search in Dualog or
+            // PassionFruits into a plain re-list of the view — 500 rows and a
+            // match count that meant nothing. AND it onto the branch group.
+            let (frag, params) = build_branch_where(filters);
+            if !frag.is_empty() {
+                sql.push_str(" AND ");
+                sql.push_str(&frag);
+                for p in params { param_values.push(p); }
+            }
         } else {
             let (frag, params) = build_branch_where(filters);
             if !frag.is_empty() {
@@ -707,6 +723,17 @@ impl Database {
             }
             if !parts.is_empty() {
                 sql.push_str(&format!(" AND ({})", parts.join(" OR ")));
+            }
+            // A branched view still has to answer a search. The view's own
+            // rules live in `branches`, but `/` sets content_pattern on the
+            // top-level struct, and dropping it turned a search in Dualog or
+            // PassionFruits into a plain re-list of the view — 500 rows and a
+            // match count that meant nothing. AND it onto the branch group.
+            let (frag, params) = build_branch_where(filters);
+            if !frag.is_empty() {
+                sql.push_str(" AND ");
+                sql.push_str(&frag);
+                for p in params { param_values.push(p); }
             }
         } else {
             let (frag, params) = build_branch_where(filters);
