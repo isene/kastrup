@@ -86,7 +86,8 @@ use message::Message;
 // and reads the same either way.
 use mail::html::html_to_text;
 use mail::mime::{
-    body_after_headers, decode_quoted_printable, latin1_to_utf8, looks_base64,
+    body_after_headers, charset_of, decode_body_bytes, decode_quoted_printable,
+    latin1_to_utf8, looks_base64,
     looks_quoted_printable, normalize_line_endings,
 };
 
@@ -13914,7 +13915,7 @@ fn extract_mime_html_depth(raw: &str, depth: usize) -> Option<String> {
             let is_qp = headers.to_lowercase().contains("quoted-printable");
             let headers_lower = headers.to_lowercase();
             let is_b64 = headers_lower.contains("base64");
-            let is_latin1 = headers_lower.contains("iso-8859") || headers_lower.contains("windows-1252");
+            let charset = charset_of(&headers_lower);
 
             // Recurse into nested multipart
             if headers_lower.contains("multipart/") {
@@ -13926,10 +13927,10 @@ fn extract_mime_html_depth(raw: &str, depth: usize) -> Option<String> {
 
             let decoded = if is_qp {
                 let bytes = decode_qp_bytes_body(body);
-                decode_body_bytes(&bytes, is_latin1)
+                decode_body_bytes(&bytes, charset.as_deref())
             } else if is_b64 {
                 let bytes = sources::maildir::base64_decode(body.trim()).unwrap_or_default();
-                decode_body_bytes(&bytes, is_latin1)
+                decode_body_bytes(&bytes, charset.as_deref())
             } else { body.to_string() };
 
             if lower.contains("text/html") {
@@ -14141,31 +14142,6 @@ fn looks_qp_html(s: &str) -> bool {
 }
 
 
-
-/// Decode a body byte buffer using the declared MIME charset, but
-/// don't blindly trust the declaration. Many senders mark UTF-8
-/// content as `charset=iso-8859-1` or `windows-1252` (this is
-/// rampant on transactional mail). Strategy:
-///
-/// 1. If `declared_latin1` is false (charset says UTF-8 or wasn't
-///    set), interpret as UTF-8, lossy-decode on error.
-/// 2. If `declared_latin1` is true, FIRST try strict UTF-8. If
-///    the bytes happen to be valid UTF-8 that's almost certainly
-///    what they really are — Norwegian "påminnelse" (UTF-8
-///    `0xC3 0xA5`) would otherwise come through as the mojibake
-///    `pÃ¥minnelse` after a literal latin1→utf-8 lift.
-/// 3. Only fall through to `latin1_to_utf8` when strict UTF-8
-///    fails, i.e. the bytes are genuinely 8-bit Latin-1.
-fn decode_body_bytes(bytes: &[u8], declared_latin1: bool) -> String {
-    if declared_latin1 {
-        if let Ok(s) = std::str::from_utf8(bytes) {
-            return s.to_string();
-        }
-        return latin1_to_utf8(bytes);
-    }
-    String::from_utf8(bytes.to_vec())
-        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
-}
 
 /// Decode quoted-printable to raw bytes (for charset-aware conversion).
 fn decode_qp_bytes_body(s: &str) -> Vec<u8> {
