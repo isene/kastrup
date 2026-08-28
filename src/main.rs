@@ -2957,11 +2957,6 @@ impl App {
         // "N r I DDDDDD i a sender        subject"
         // 1+1+1+1+6+1+1+1+1+1+12+1 = 29 fixed chars (same as before; avatar
         // takes 1 + gap from sender column).
-        let fixed = 29;
-        let fold_w = crust::display_width(&fold);
-        let subj_w = pane_w.saturating_sub(fixed + fold_w);
-        let subject_truncated = truncate_str(&subject, subj_w);
-
         let flags = format!("{}{}{}", nflag, rflag, ind);
 
         // Compute outer color first so we can splice the avatar's own color
@@ -2999,13 +2994,24 @@ impl App {
             format!("{}{}{}", style::set_fg(fc), fold, style::set_fg(color))
         };
 
-        // Build content. avatar_inline carries its own ANSI; everything
-        // else is plain text and gets colored by the outer style::fg below.
-        let content = format!("{} {} {} {}{}{}",
-            date_padded, icon, avatar_inline, sender_padded, fold_inline, subject_truncated);
-
-        // Pad to full width — display_width strips ANSI before measuring.
+        // Everything before the subject, MEASURED rather than assumed.
+        //
+        // This used to be a constant 29, a count of the columns the prefix
+        // was believed to take. A source icon that is two columns, or a
+        // reply indent, made it wrong, and the subject then overran the
+        // pane. With a wide character that overrun split a glyph across the
+        // divider into the next pane, because half of it landed in a column
+        // this row does not own.
+        //
+        // avatar_inline carries its own ANSI; display_width strips it.
+        let prefix = format!("{} {} {} {}{}",
+            date_padded, icon, avatar_inline, sender_padded, fold_inline);
         let flags_w = crust::display_width(&flags);
+        let prefix_w = crust::display_width(&prefix);
+        // One column is left unpainted at the right edge, as before.
+        let subj_w = pane_w.saturating_sub(flags_w + prefix_w + 1);
+        let subject_truncated = truncate_str(&subject, subj_w);
+        let content = format!("{}{}", prefix, subject_truncated);
         let content_w = crust::display_width(&content);
         let padding = if pane_w > flags_w + content_w + 1 {
             " ".repeat(pane_w - flags_w - content_w - 1)
@@ -3312,6 +3318,19 @@ impl App {
         }
 
         // Separator
+        // Every header row out to the pane's width, so nothing the previous
+        // message drew can survive under a shorter one.
+        //
+        // A pane paints a row only when the row changed. Two messages in the
+        // same folder share a Labels line character for character, so that
+        // row is skipped, and whatever a longer subject left beyond the end
+        // of it stays on screen. Padding makes each row own its whole width,
+        // which covers every long-to-short transition rather than this one.
+        let hw = self.right.w.saturating_sub(1) as usize;
+        for l in lines.iter_mut() {
+            let w = crust::display_width(l);
+            if w < hw { l.push_str(&" ".repeat(hw - w)); }
+        }
         lines.push(style::fg(&"\u{2500}".repeat(40), tc.separator));
 
         // Body not loaded yet — the DB read worker is fetching it off-thread.
@@ -14821,6 +14840,7 @@ fn local_utc_offset() -> i64 {
 /// budget and the row spilled onto two extra lines. Every CJK character, and
 /// most emoji, take two cells.
 fn truncate_str(s: &str, max: usize) -> String {
+    if max == 0 { return String::new(); }
     if crust::display_width(s) <= max { return s.to_string(); }
     // One column goes to the ellipsis, which is single-width.
     let budget = max.saturating_sub(1);
@@ -15384,6 +15404,24 @@ mod wide_char_tests {
         println!("color_emails -> {:?}", plain);
         assert_eq!(plain, subj, "colouring must not drop characters");
         println!("chars {} columns {}", subj.chars().count(), crust::display_width(subj));
+    }
+
+    #[test]
+    fn a_wide_char_never_straddles_the_last_column() {
+        // The row had one column left and a two-column character went into
+        // it, so half the glyph landed on the pane divider. A budget is a
+        // budget: stop rather than overrun it by one.
+        let jp = "日本語";
+        for budget in 0..=crust::display_width(jp) {
+            let out = crate::truncate_str(jp, budget);
+            let w = crust::display_width(&out);
+            assert!(w <= budget, "{:?} is {} columns, budget {}", out, w, budget);
+        }
+        // One column of room cannot hold a wide character, so it holds the
+        // ellipsis instead.
+        assert_eq!(crust::display_width(&crate::truncate_str(jp, 1)), 1);
+        // No room at all means nothing, not a stray ellipsis.
+        assert_eq!(crate::truncate_str(jp, 0), "");
     }
 
     #[test]
