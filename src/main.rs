@@ -3318,19 +3318,6 @@ impl App {
         }
 
         // Separator
-        // Every header row out to the pane's width, so nothing the previous
-        // message drew can survive under a shorter one.
-        //
-        // A pane paints a row only when the row changed. Two messages in the
-        // same folder share a Labels line character for character, so that
-        // row is skipped, and whatever a longer subject left beyond the end
-        // of it stays on screen. Padding makes each row own its whole width,
-        // which covers every long-to-short transition rather than this one.
-        let hw = self.right.w.saturating_sub(1) as usize;
-        for l in lines.iter_mut() {
-            let w = crust::display_width(l);
-            if w < hw { l.push_str(&" ".repeat(hw - w)); }
-        }
         lines.push(style::fg(&"\u{2500}".repeat(40), tc.separator));
 
         // Body not loaded yet — the DB read worker is fetching it off-thread.
@@ -3578,6 +3565,21 @@ impl App {
         // earlier-computed `current_id`/`msg_changed` so we don't recompute
         // — we already need them for the body cache below.
         self.right_pane_msg_id = current_id;
+
+        // Every row out to the pane's width, headers and body alike, so
+        // nothing a previous message drew can survive under a shorter one.
+        //
+        // A pane paints a row only when that row's text changed, and two
+        // messages often share a row exactly: the same Labels line, the same
+        // blank. Ink that an earlier, wider message left past the end of
+        // such a row is never painted over. Giving every row its full width
+        // covers any long-to-short transition, in the body as well as the
+        // headers, where a stray letter was surviving out at the margin.
+        let pane_w = self.right.w.saturating_sub(1) as usize;
+        for l in lines.iter_mut() {
+            let w = crust::display_width(l);
+            if w < pane_w { l.push_str(&" ".repeat(pane_w - w)); }
+        }
 
         let rendered = lines.join("\n");
         // Stash for next render of the same message + content fingerprint.
