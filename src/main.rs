@@ -2948,7 +2948,7 @@ impl App {
         };
         let sender_display = msg.display_name();
         let sender_truncated = truncate_str(sender_display, sender_cap);
-        let sender_padded = format!("{}{:<width$} ", depth_prefix, sender_truncated, width = sender_cap);
+        let sender_padded = format!("{}{} ", depth_prefix, pad_to_width(&sender_truncated, sender_cap));
 
         // Subject fills remaining width (decode RFC 2047 encoded-words)
         let raw_subject = msg.subject.as_deref().unwrap_or("");
@@ -14814,13 +14814,34 @@ fn local_utc_offset() -> i64 {
 }
 
 /// Truncate a plain string to at most `max` characters
+/// Cut `s` to `max` TERMINAL COLUMNS, not characters.
+///
+/// A Japanese subject is the case that matters: "Fw: Dualogの脆弱性…" is 31
+/// characters but 52 columns, so counting characters let it past a 48-column
+/// budget and the row spilled onto two extra lines. Every CJK character, and
+/// most emoji, take two cells.
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{}\u{2026}", truncated)
+    if crust::display_width(s) <= max { return s.to_string(); }
+    // One column goes to the ellipsis, which is single-width.
+    let budget = max.saturating_sub(1);
+    let mut walker = crust::WidthWalker::new();
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = walker.push(c);
+        if used + w > budget { break; }
+        used += w;
+        out.push(c);
     }
+    out.push('\u{2026}');
+    out
+}
+
+/// Pad `s` out to `width` columns. `{:<width$}` counts characters, which
+/// pads a Japanese name to twice the space it should take.
+fn pad_to_width(s: &str, width: usize) -> String {
+    let w = crust::display_width(s);
+    format!("{}{}", s, " ".repeat(width.saturating_sub(w)))
 }
 
 /// Per-sender ASCII avatar: a single uppercase initial in a deterministic
@@ -15347,5 +15368,56 @@ mod tests {
         for bad in ["", "   ", "later", "+2x", "25:00", "08:99", "banana"] {
             assert!(parse_send_at(bad).is_none(), "accepted {bad:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod wide_char_tests {
+    #[test]
+    fn a_japanese_subject_survives_the_header_path() {
+        let subj = "Fw: Dualogの脆弱性対応に関するアンケート回答のお願い";
+        let decoded = crate::sources::maildir::decode_rfc2047(subj);
+        println!("decode_rfc2047 -> {:?}", decoded);
+        assert_eq!(decoded, subj, "already-decoded UTF-8 must pass through");
+        let coloured = highlight::color_emails(subj, Some(33));
+        let plain = crust::strip_ansi(&coloured);
+        println!("color_emails -> {:?}", plain);
+        assert_eq!(plain, subj, "colouring must not drop characters");
+        println!("chars {} columns {}", subj.chars().count(), crust::display_width(subj));
+    }
+
+    #[test]
+    fn truncation_counts_columns_not_characters() {
+        let subj = "Fw: Dualogの脆弱性対応に関するアンケート回答のお願い";
+        assert_eq!(subj.chars().count(), 31);
+        assert_eq!(crust::display_width(subj), 52, "every CJK char is two cells");
+        // The case from the list pane: 48 columns of room, and counting
+        // characters let all 52 columns through.
+        for budget in [10, 20, 48, 51] {
+            let out = crate::truncate_str(subj, budget);
+            let w = crust::display_width(&out);
+            assert!(w <= budget, "{:?} is {} columns, budget {}", out, w, budget);
+        }
+        // Something that already fits comes back untouched, ellipsis and all.
+        assert_eq!(crate::truncate_str(subj, 52), subj);
+        assert_eq!(crate::truncate_str("plain", 40), "plain");
+        // Never split a character in half.
+        let out = crate::truncate_str(subj, 13);
+        assert!(out.ends_with('\u{2026}'));
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        println!("13 columns -> {:?} = {}", out, crust::display_width(&out));
+    }
+
+    #[test]
+    fn padding_counts_columns_too() {
+        // A 12-column sender column, filled by a name that is 4 characters
+        // and 8 columns: four spaces of padding, not eight.
+        let jp = "山田太郎";
+        assert_eq!(crust::display_width(jp), 8);
+        let padded = crate::pad_to_width(jp, 12);
+        assert_eq!(crust::display_width(&padded), 12);
+        assert_eq!(crate::pad_to_width("abc", 6), "abc   ");
+        // Too long for the column: left alone rather than made shorter.
+        assert_eq!(crate::pad_to_width("abcdef", 3), "abcdef");
     }
 }
