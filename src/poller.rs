@@ -130,6 +130,16 @@ fn poller_loop(
     // worth building if VmRSS actually creeps up — the periodic log
     // below lets us confirm whether that ever matters in practice.
     let mut known_cache: HashMap<i64, HashSet<String>> = HashMap::new();
+    // When each source was last polled, and when that was last written
+    // down. The poll-interval gate only needs the number in memory; a
+    // row rewritten every tick is a database write every tick, and the
+    // UI's unread recount watches the database for changes. So an idle
+    // poller kept the UI recounting a multi-GB table every five
+    // seconds, for nothing. Persist on real news, or every 5 minutes so
+    // a restart does not rescan the world.
+    let mut polled_at: HashMap<i64, i64> = HashMap::new();
+    let mut persisted_at: HashMap<i64, i64> = HashMap::new();
+    const PERSIST_EVERY: i64 = 300;
     log_process_memory("poller startup", &known_cache);
     let mut next_mem_log = std::time::Instant::now()
         + std::time::Duration::from_secs(3600);
@@ -179,7 +189,8 @@ fn poller_loop(
 
         for source in &sources_list {
             let interval = source.poll_interval;
-            let last_sync = source.last_sync.unwrap_or(0);
+            let last_sync = *polled_at.get(&source.id)
+                .unwrap_or(&source.last_sync.unwrap_or(0));
             let is_maildir = source.plugin_type == "maildir";
             // inotify-forced wakes bypass the poll-interval gate for
             // maildir — reacting immediately to a delivery is the
@@ -274,7 +285,13 @@ fn poller_loop(
                 db.insert_messages_batch(source.id, &messages);
             }
 
-            db.update_source_sync_time(source.id);
+            polled_at.insert(source.id, now);
+            let written = *persisted_at.get(&source.id)
+                .unwrap_or(&source.last_sync.unwrap_or(0));
+            if count > 0 || now - written >= PERSIST_EVERY {
+                db.update_source_sync_time(source.id);
+                persisted_at.insert(source.id, now);
+            }
 
             if count > 0 {
                 let _ = tx.send(PollerEvent::NewMessages(count));

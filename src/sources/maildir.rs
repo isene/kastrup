@@ -3,26 +3,20 @@ use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 
-pub fn sync_maildir(maildir_path: &str, known_ids: &HashSet<String>, last_sync: i64) -> Vec<MessageData> {
-    let root = Path::new(maildir_path);
-    if !root.is_dir() { return Vec::new(); }
-
-    let mut messages = Vec::new();
-
-    // Build a folder-agnostic dedup set of bare maildir basenames.
-    // The known_ids set holds full ext_ids like
-    //   `maildir_INBOX_1715407823.M123P12.host:2,RS`
-    // plus the folder-prefixed base without flags
-    //   `maildir_INBOX_1715407823.M123P12.host`
-    // Neither catches the case where the user MOVES the file from
-    // INBOX to a different folder (Save / Archive): the folder
-    // component flips and the prefixed form no longer matches.
-    // Strip both the leading `maildir_<folder>_` AND the trailing
-    // `:2,FLAGS` so we end up with just the maildir basename
-    // (`<epoch>.<unique>.<host>`) and store that. Then a moved file
-    // is recognised as known regardless of which folder it lives in
-    // now.
-    let known_bases: HashSet<String> = known_ids.iter()
+/// A folder-agnostic dedup set of bare maildir basenames.
+///
+/// `known_ids` holds full ext_ids like
+///   `maildir_INBOX_1715407823.M123P12.host:2,RS`
+/// plus the folder-prefixed base without flags
+///   `maildir_INBOX_1715407823.M123P12.host`
+/// Neither catches the case where the user MOVES the file from INBOX
+/// to a different folder (Save / Archive): the folder component flips
+/// and the prefixed form no longer matches. Strip both the leading
+/// `maildir_<folder>_` AND the trailing `:2,FLAGS` and what is left is
+/// the maildir basename (`<epoch>.<unique>.<host>`), which a move does
+/// not change.
+fn build_known_bases(known_ids: &HashSet<String>) -> HashSet<String> {
+    known_ids.iter()
         .filter_map(|k| {
             let no_flags = k.split(":2,").next().unwrap_or(k);
             let no_prefix = no_flags.strip_prefix("maildir_").unwrap_or(no_flags);
@@ -31,7 +25,20 @@ pub fn sync_maildir(maildir_path: &str, known_ids: &HashSet<String>, last_sync: 
             // and take everything from there.
             extract_maildir_basename(no_prefix).map(str::to_string)
         })
-        .collect();
+        .collect()
+}
+
+pub fn sync_maildir(maildir_path: &str, known_ids: &HashSet<String>, last_sync: i64) -> Vec<MessageData> {
+    let root = Path::new(maildir_path);
+    if !root.is_dir() { return Vec::new(); }
+
+    let mut messages = Vec::new();
+
+    // The folder-move dedup set (see `build_known_bases`) costs a
+    // quarter of a million string allocations to build, and an idle
+    // poll needs none of them: the mtime gate below skips every
+    // directory before any file is looked at. Built on first use.
+    let mut known_bases: Option<HashSet<String>> = None;
 
     // Discover folders
     let mut folders: Vec<(String, PathBuf)> = vec![("INBOX".to_string(), root.to_path_buf())];
@@ -94,7 +101,8 @@ pub fn sync_maildir(maildir_path: &str, known_ids: &HashSet<String>, last_sync: 
                 // is the post-Save / post-Archive view of the same
                 // message — skip.
                 if let Some(b) = extract_maildir_basename(base) {
-                    if known_bases.contains(b) { continue; }
+                    let bases = known_bases.get_or_insert_with(|| build_known_bases(known_ids));
+                    if bases.contains(b) { continue; }
                 }
 
                 // Parse email headers
@@ -478,5 +486,30 @@ mod tests {
         let msg = msg.expect("non-UTF-8 mail must still parse (not be dropped)");
         assert_eq!(msg.subject.as_deref(), Some("Your BMW is in need of attention"));
         assert!(msg.sender.contains("bmwuk@service.bmw.com"));
+    }
+}
+
+#[cfg(test)]
+mod lazy_dedup_tests {
+    use super::*;
+
+    /// The dedup set is now built on first use rather than on every
+    /// call. A file the user moved from INBOX to another folder must
+    /// still be recognised as one already known.
+    #[test]
+    fn a_moved_file_is_still_deduped() {
+        let dir = std::env::temp_dir().join(format!("kastrup-maildir-{}", std::process::id()));
+        let cur = dir.join(".Archive").join("cur");
+        std::fs::create_dir_all(&cur).unwrap();
+        std::fs::write(cur.join("1715407823.M123P12.host:2,S"), "Subject: hi\n\nbody\n").unwrap();
+
+        // Known under its OLD folder, with different flags.
+        let mut known = HashSet::new();
+        known.insert("maildir_INBOX_1715407823.M123P12.host:2,RS".to_string());
+
+        let found = sync_maildir(dir.to_str().unwrap(), &known, 0);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(found.is_empty(), "moved file came back as new: {:?}",
+                found.iter().map(|m| &m.external_id).collect::<Vec<_>>());
     }
 }

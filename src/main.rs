@@ -1172,6 +1172,10 @@ struct App {
     config: Config,
     source_type_map: HashMap<i64, String>,
 
+    /// Last window title written, so an idle tick does not re-send it.
+    last_title: String,
+    /// Last seen database write signature; gates the unread recount.
+    last_db_sig: (u64, u128, u128),
     last_db_refresh: std::time::Instant,
     /// Last time the periodic stuck-maildir reconcile ran (see the main
     /// loop). Throttles it to ~once every 2 min on the loop's existing
@@ -1838,6 +1842,8 @@ fn main() {
         db,
         config,
         source_type_map,
+        last_title: String::new(),
+        last_db_sig: (0, 0, 0),
         last_db_refresh: std::time::Instant::now(),
         last_reconcile: std::time::Instant::now(),
         read_sync,
@@ -2123,6 +2129,13 @@ fn main() {
                 // doesn't always trip the dirty flag.
                 if app.last_highlight_refresh.elapsed().as_secs() >= 5 {
                     app.last_highlight_refresh = std::time::Instant::now();
+                    // Both counts are index scans over a multi-GB table, and
+                    // on an idle session they return what they returned five
+                    // seconds ago. Two stat()s say whether any writer ran;
+                    // when none did, there is nothing to recount.
+                    let sig = app.db.write_signature();
+                    if sig != app.last_db_sig {
+                    app.last_db_sig = sig;
                     let new_unread = app.db.unread_count_by_folder();
                     let new_src_unread = app.db.unread_count_by_source();
                     // External writers (the systemd ws-bridge-listen writing
@@ -2151,6 +2164,7 @@ fn main() {
                     app.source_unread_cache = new_src_unread;
                     app.refresh_view_unread_cache();
                     app.render_top_bar();
+                    }
                 }
                 // Periodic stuck-maildir reconcile. A read whose new/→cur/
                 // move slipped through leaves the asmite counting a phantom
@@ -2624,7 +2638,14 @@ impl App {
                 .map(|vw| format!("{} {}", v, vw.name))
                 .unwrap_or_else(|| format!("View {}", v)),
         } };
-        Crust::set_title(&format!("Kastrup - {}", title_name));
+        // The panes diff against their last frame, so an idle session
+        // writes nothing — except this, which used to re-send the same
+        // title every 5 s from the unread-refresh tick. Compare first.
+        let title = format!("Kastrup - {}", title_name);
+        if title != self.last_title {
+            Crust::set_title(&title);
+            self.last_title = title;
+        }
 
         // Capitalize sort label
         let sort_cap = {
@@ -6584,6 +6605,9 @@ impl App {
             // sees "no change" and writes nothing — top/bottom bars stay
             // invisible until something else triggers a re-render. Mark all
             // panes stale so render_all repaints fully.
+            // An external editor (scribe) sets its own window title, so
+            // drop the cached one and let the next render restore ours.
+            self.last_title.clear();
             self.top.invalidate();
             self.left.invalidate();
             self.right.invalidate();
