@@ -1166,6 +1166,27 @@ impl Database {
     /// view-strip badges to flag views (other than the current one)
     /// where new messages have arrived. One query, no per-view loop
     /// on the call site.
+    /// Has any writer committed to this database since last asked?
+    ///
+    /// Two `stat()`s: the WAL takes every write, the main file takes
+    /// the checkpoints. An unread recount is two index scans over a
+    /// multi-GB table; this is the cheap question that says whether
+    /// running them could possibly return anything new.
+    pub fn write_signature(&self) -> (u64, u128, u128) {
+        let path = db_path();
+        let stamp = |p: &std::path::Path| -> (u64, u128) {
+            match std::fs::metadata(p) {
+                Ok(m) => (m.len(), m.modified().ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos()).unwrap_or(0)),
+                Err(_) => (0, 0),
+            }
+        };
+        let (wal_len, wal_mtime) = stamp(&path.with_extension("db-wal"));
+        let (_, db_mtime) = stamp(&path);
+        (wal_len, wal_mtime, db_mtime)
+    }
+
     pub fn unread_count_by_folder(&self) -> std::collections::HashMap<String, i64> {
         let conn = self.read();
         let mut out = std::collections::HashMap::new();
@@ -1848,3 +1869,4 @@ mod tests {
         assert_eq!(hit, Some(7966391));
     }
 }
+
