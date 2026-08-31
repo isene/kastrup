@@ -2427,10 +2427,11 @@ impl App {
             // semantics are identical regardless of entry path.
             ":" => { self.colon_command(); }
             "!" => {
-                self.msg_log.show("Recent messages",
-                    self.config.theme_colors.content_fg as u16,
-                    self.config.theme_colors.content_bg as u16);
-                self.render_all();
+                let (fg, bg) = (self.config.theme_colors.content_fg as u16,
+                                self.config.theme_colors.content_bg as u16);
+                self.msg_log.show("Recent messages", fg, bg,
+                    &mut [&mut self.top, &mut self.left,
+                          &mut self.right, &mut self.bottom]);
             }
             "?" => {
                 if self.showing_help && !self.help_extended {
