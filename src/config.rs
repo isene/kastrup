@@ -217,6 +217,8 @@ pub struct Config {
     pub default_email: String,
     pub smtp_command: String,
     pub confirm_purge: bool,
+    /// How many status lines to keep so a missed one can still be read.
+    pub message_log: usize,
     /// Folder shared with the phone (Syncthing), holding one
     /// `mail-read-<device>.json` per device. Empty disables the exchange
     /// entirely — no stat, no query, no file.
@@ -271,6 +273,7 @@ impl Default for Config {
             default_email: String::new(),
             smtp_command: String::new(),
             confirm_purge: false,
+            message_log: 10,
             read_sync_dir: String::new(),
             read_sync_days: 60,
             load_limit: 500,
@@ -308,6 +311,7 @@ impl Config {
             "sort_order": self.sort_order,
             "sort_inverted": self.sort_inverted,
             "confirm_purge": self.confirm_purge,
+            "message_log": self.message_log,
             "read_sync_dir": self.read_sync_dir,
             "read_sync_days": self.read_sync_days,
             "default_view": self.default_view,
@@ -432,6 +436,9 @@ impl Config {
             }
             if let Some(v) = ui.get("confirm_purge").and_then(|v| v.as_bool()) {
                 self.confirm_purge = v;
+            }
+            if let Some(v) = ui.get("message_log").and_then(|v| v.as_u64()) {
+                self.message_log = v as usize;
             }
             if let Some(v) = ui.get("read_sync_dir").and_then(|v| v.as_str()) {
                 self.read_sync_dir = v.to_string();
@@ -675,6 +682,9 @@ impl Config {
                     "date_format" => { self.date_format = val.to_string(); }
                     "color_theme" => { self.color_theme = val.to_string(); }
                     "confirm_purge" => { self.confirm_purge = val == "true"; }
+                    "message_log" => {
+                        if let Ok(n) = val.parse::<usize>() { self.message_log = n; }
+                    }
                     "read_sync_dir" => { self.read_sync_dir = val.to_string(); }
                     "read_sync_days" => {
                         if let Ok(n) = val.parse::<i64>() { self.read_sync_days = n; }
