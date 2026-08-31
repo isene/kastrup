@@ -137,6 +137,12 @@ fn poller_loop(
     // poller kept the UI recounting a multi-GB table every five
     // seconds, for nothing. Persist on real news, or every 5 minutes so
     // a restart does not rescan the world.
+    // Seeded from the database, not empty: an error written before the
+    // last restart is still on screen, and only a cycle that knows
+    // about it will clear it.
+    let mut failing: HashMap<i64, String> = db.failing_sources().into_iter()
+        .map(|(id, _, err, _)| (id, err))
+        .collect();
     let mut polled_at: HashMap<i64, i64> = HashMap::new();
     let mut persisted_at: HashMap<i64, i64> = HashMap::new();
     const PERSIST_EVERY: i64 = 300;
@@ -186,6 +192,7 @@ fn poller_loop(
         // sync" class of bug, on top of the per-request HTTP timeouts.
         sources_list.sort_by_key(|s| s.plugin_type != "maildir");
         let now = crate::database::now_secs();
+        check_ws_bridge(&db, &sources_list, &mut failing);
 
         for source in &sources_list {
             let interval = source.poll_interval;
@@ -203,6 +210,7 @@ fn poller_loop(
                 db.get_known_external_ids(source.id)
             });
 
+            let _ = sources::take_sync_error();
             // Sync: filesystem/network scan happens WITHOUT holding DB lock
             let messages = match source.plugin_type.as_str() {
                 "maildir" => {
@@ -264,6 +272,8 @@ fn poller_loop(
                             crate::log::info(&format!(
                                 "Poller: {} sync exceeded {}s deadline — skipping this cycle (wedged connection?)",
                                 source.name, NETWORK_SYNC_DEADLINE.as_secs()));
+                            note_error(&db, &source.name, source.id, &mut failing,
+                                &format!("no answer within {}s", NETWORK_SYNC_DEADLINE.as_secs()));
                             continue;
                         }
                     }
@@ -284,6 +294,15 @@ fn poller_loop(
                 // Brief DB lock for batch insert only
                 db.insert_messages_batch(source.id, &messages);
             }
+
+            // A failed sync is not a quiet one. Say why, and leave
+            // last_sync where it was so the next cycle re-covers the
+            // window this one missed.
+            if let Some(err) = sources::take_sync_error() {
+                note_error(&db, &source.name, source.id, &mut failing, &err);
+                continue;
+            }
+            clear_error(&db, source.id, &mut failing);
 
             polled_at.insert(source.id, now);
             let written = *persisted_at.get(&source.id)
@@ -316,6 +335,44 @@ fn poller_loop(
             WakeState::Wake => { *guard = WakeState::Idle; true }
             WakeState::Idle => false, // 10 s timeout — normal gated poll
         };
+    }
+}
+
+/// Write a source's failure down, but only when it is news. A source
+/// that has been failing for an hour should still say "failing since
+/// 05:30", and a row rewritten every ten seconds is a database write
+/// every ten seconds.
+fn note_error(db: &Arc<Database>, name: &str, id: i64,
+              failing: &mut HashMap<i64, String>, err: &str) {
+    if failing.get(&id).map(|e| e.as_str()) == Some(err) { return; }
+    crate::log::info(&format!("Poller: {} sync failed: {}", name, err));
+    db.set_source_error(id, Some(err));
+    failing.insert(id, err.to_string());
+}
+
+/// Clear a source's failure after a sync that worked.
+fn clear_error(db: &Arc<Database>, id: i64, failing: &mut HashMap<i64, String>) {
+    if failing.remove(&id).is_some() {
+        db.set_source_error(id, None);
+    }
+}
+
+/// Dualog Workspace never reaches the poller: an external
+/// `ws-bridge-listen` writes its rows straight into the database. So
+/// the one thing kastrup can check is the breadcrumb ws-bridge leaves
+/// when its refresh token expires. One `stat()` per cycle, and it is
+/// the difference between a silent morning and a line that says to run
+/// `ws-bridge login`.
+fn check_ws_bridge(db: &Arc<Database>, sources: &[crate::source::Source],
+                   failing: &mut HashMap<i64, String>) {
+    let Some(src) = sources.iter().find(|s| s.plugin_type == "workspace") else { return };
+    let home = std::env::var("HOME").unwrap_or_default();
+    let flag = PathBuf::from(&home).join(".ws-bridge").join("token-expired");
+    if flag.exists() {
+        note_error(db, &src.name, src.id, failing,
+                   "login expired, run `ws-bridge login`");
+    } else {
+        clear_error(db, src.id, failing);
     }
 }
 

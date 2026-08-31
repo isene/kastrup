@@ -8,6 +8,27 @@ pub mod slack;
 pub mod weechat_relay;
 pub mod gateway;
 
+/// Why the sync that is running right now failed.
+///
+/// A sync hands back a list of messages, so a failure and a quiet hour
+/// looked identical: empty. That is how an expired Workspace token hid
+/// five hours of mail behind a normal-looking inbox. A source that
+/// gives up sets this on its way out; the poller clears it before each
+/// sync and reads it after, and writes what it finds to the database.
+static SYNC_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Say why this sync is coming back empty. Call it on every path that
+/// returns early: a missing token, an API that says no, a host that
+/// will not resolve.
+pub fn report_sync_error(msg: impl Into<String>) {
+    if let Ok(mut slot) = SYNC_ERROR.lock() { *slot = Some(msg.into()); }
+}
+
+/// Take what the last sync reported, leaving the slot empty.
+pub fn take_sync_error() -> Option<String> {
+    SYNC_ERROR.lock().ok().and_then(|mut s| s.take())
+}
+
 /// Shared HTTP agent for polling network sources (Slack, Discord, …), with
 /// hard connect/read/write timeouts. A bare `ureq::get(...).call()` uses a
 /// default agent with NO read timeout, so a server that accepts the

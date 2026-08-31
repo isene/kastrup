@@ -1515,6 +1515,35 @@ impl Database {
     }
 
     /// Update the last_sync timestamp for a source
+    /// Record why a source's sync failed, or clear it after a success.
+    ///
+    /// `updated_at` moves only when the state changes, so it reads as
+    /// "failing since", which is what the user wants to know. The
+    /// caller only calls this on a transition, so an idle poller
+    /// writes nothing.
+    pub fn set_source_error(&self, source_id: i64, err: Option<&str>) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE sources SET last_error = ?, updated_at = ? WHERE id = ?",
+            params![err, now_secs(), source_id],
+        );
+    }
+
+    /// Enabled sources whose last sync failed: id, name, what went
+    /// wrong, and when it started failing.
+    pub fn failing_sources(&self) -> Vec<(i64, String, String, i64)> {
+        let conn = self.read();
+        let mut stmt = match conn.prepare(
+            "SELECT id, name, last_error, updated_at FROM sources \
+             WHERE enabled = 1 AND last_error IS NOT NULL ORDER BY updated_at"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get(0).unwrap_or(0), r.get(1).unwrap_or_default(),
+                r.get(2).unwrap_or_default(), r.get(3).unwrap_or(0)))
+        });
+        match rows { Ok(rs) => rs.filter_map(|r| r.ok()).collect(), Err(_) => Vec::new() }
+    }
+
     pub fn update_source_sync_time(&self, source_id: i64) {
         let conn = self.conn.lock().unwrap();
         let now = now_secs();

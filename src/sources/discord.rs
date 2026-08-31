@@ -24,6 +24,7 @@ const API: &str = "https://discord.com/api/v10";
 pub fn sync_discord(config: &serde_json::Value, known_ids: &HashSet<String>) -> Vec<MessageData> {
     let secrets = chat_send::load_secrets();
     let Some(token) = secrets.discord_bot_token.as_ref() else {
+        super::report_sync_error("no DISCORD_BOT_TOKEN in ~/.kastrup/.env");
         return Vec::new();
     };
     let auth = if token.starts_with("Bot ") || token.starts_with("Bearer ") {
@@ -35,7 +36,10 @@ pub fn sync_discord(config: &serde_json::Value, known_ids: &HashSet<String>) -> 
     // Bot's own identity — needed to tag incoming-vs-outgoing.
     let bot_user_id = match fetch_self_id(&auth) {
         Some(id) => id,
-        None => return Vec::new(),
+        None => {
+            super::report_sync_error("Discord rejected the bot token (log in again)");
+            return Vec::new();
+        }
     };
 
     // List DM channels the bot already knows. Bots can't actually enumerate
