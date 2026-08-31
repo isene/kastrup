@@ -1178,6 +1178,8 @@ struct App {
     last_db_sig: (u64, u128, u128),
     /// Enabled sources whose sync is failing: name, why, failing since.
     source_errors: Vec<(i64, String, String, i64)>,
+    /// The status lines already shown, so a missed one can still be read.
+    msg_log: crust::MessageLog,
     last_db_refresh: std::time::Instant,
     /// Last time the periodic stuck-maildir reconcile ran (see the main
     /// loop). Throttles it to ~once every 2 min on the loop's existing
@@ -1613,6 +1615,7 @@ fn main() {
     log_phase("crust init + identity + termsize", &mut phase);
 
     let config = Config::load();
+    let msg_log_cap = config.message_log;
     log_phase("config load", &mut phase);
     let db = Arc::new(Database::new().expect("Failed to open kastrup database"));
     log_phase("database open + pragmas (incl. any WAL replay)", &mut phase);
@@ -1847,6 +1850,7 @@ fn main() {
         last_title: String::new(),
         last_db_sig: (0, 0, 0),
         source_errors: Vec::new(),
+        msg_log: crust::MessageLog::new(msg_log_cap),
         last_db_refresh: std::time::Instant::now(),
         last_reconcile: std::time::Instant::now(),
         read_sync,
@@ -2422,6 +2426,12 @@ impl App {
             // `:chat`, `:q`). Each shortcut letter delegates here so the
             // semantics are identical regardless of entry path.
             ":" => { self.colon_command(); }
+            "!" => {
+                self.msg_log.show("Recent messages",
+                    self.config.theme_colors.content_fg as u16,
+                    self.config.theme_colors.content_bg as u16);
+                self.render_all();
+            }
             "?" => {
                 if self.showing_help && !self.help_extended {
                     self.show_extended_help();
@@ -6485,7 +6495,8 @@ impl App {
   Esc            Clear sticky search, return to current view\n\
   z              AI triage → tock calendar or ~/.tasks/todo.hl\n\
   Z              Tock action (regex date capture)\n\
-  :triage        Show triage history (last 20)\n\n\
+  :triage        Show triage history (last 20)\n\
+  !              Recent status messages (what you missed)\n\n\
 {}\n\
   o              Cycle sort order\n\
   i              Invert sort\n\
@@ -6696,6 +6707,7 @@ impl App {
         let is_error = color == 196 || color == self.config.theme_colors.feedback_warn;
         if color == 196 { log::error(msg); }
         else if color == self.config.theme_colors.feedback_warn { log::warn(msg); }
+        self.msg_log.push(msg, color);
         self.feedback_message = Some((msg.to_string(), color));
         if is_error {
             // Errors/warnings must stay readable: persist until the user's
@@ -6720,6 +6732,7 @@ impl App {
     fn set_feedback_sticky(&mut self, msg: &str, color: u8) {
         if color == 196 { log::error(msg); }
         else if color == self.config.theme_colors.feedback_warn { log::warn(msg); }
+        self.msg_log.push(msg, color);
         self.feedback_message = Some((msg.to_string(), color));
         self.feedback_expires = None;
         self.feedback_clear_on_key = true;
