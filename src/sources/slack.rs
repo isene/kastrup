@@ -26,6 +26,7 @@ const API: &str = "https://slack.com/api";
 pub fn sync_slack(config: &serde_json::Value, known_ids: &HashSet<String>) -> Vec<MessageData> {
     let secrets = chat_send::load_secrets();
     let Some(token) = secrets.slack_token.as_ref() else {
+        super::report_sync_error("no SLACK_TOKEN in ~/.kastrup/.env");
         return Vec::new();
     };
     let bearer = format!("Bearer {}", token);
@@ -33,7 +34,10 @@ pub fn sync_slack(config: &serde_json::Value, known_ids: &HashSet<String>) -> Ve
     // Own user id, to skip self-authored messages.
     let self_id = match auth_test(&bearer) {
         Some(id) => id,
-        None => return Vec::new(),
+        None => {
+            super::report_sync_error("Slack rejected the token (log in again)");
+            return Vec::new();
+        }
     };
 
     // 1. DM / group-DM channels (always polled).

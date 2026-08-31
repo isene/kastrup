@@ -1176,6 +1176,8 @@ struct App {
     last_title: String,
     /// Last seen database write signature; gates the unread recount.
     last_db_sig: (u64, u128, u128),
+    /// Enabled sources whose sync is failing: name, why, failing since.
+    source_errors: Vec<(i64, String, String, i64)>,
     last_db_refresh: std::time::Instant,
     /// Last time the periodic stuck-maildir reconcile ran (see the main
     /// loop). Throttles it to ~once every 2 min on the loop's existing
@@ -1844,6 +1846,7 @@ fn main() {
         source_type_map,
         last_title: String::new(),
         last_db_sig: (0, 0, 0),
+        source_errors: Vec::new(),
         last_db_refresh: std::time::Instant::now(),
         last_reconcile: std::time::Instant::now(),
         read_sync,
@@ -2162,6 +2165,7 @@ fn main() {
                     }
                     app.unread_cache = new_unread;
                     app.source_unread_cache = new_src_unread;
+                    app.source_errors = app.db.failing_sources();
                     app.refresh_view_unread_cache();
                     app.render_top_bar();
                     }
@@ -2736,7 +2740,23 @@ impl App {
         } else {
             String::new()
         };
-        let left_part = format!("{}{}{}{}{}{}", prefix, view_label, sort_label, mode_label, pos_label, send_badge);
+        // A source that stopped working says so here, because this is
+        // the one line always on screen. An expired Workspace token
+        // once hid five hours of mail behind a normal-looking inbox.
+        let alert = match self.source_errors.first() {
+            None => String::new(),
+            Some((_, name, err, since)) => {
+                let mins = (crate::database::now_secs() - since).max(0) / 60;
+                let age = if mins >= 1440 { format!("{}d", mins / 1440) }
+                          else if mins >= 60 { format!("{}h", mins / 60) }
+                          else { format!("{}m", mins) };
+                let more = if self.source_errors.len() > 1 {
+                    format!(" +{}", self.source_errors.len() - 1)
+                } else { String::new() };
+                style::fg(&format!("  \u{26A0} {}: {} ({}){}", name, err, age, more), tc.unread)
+            }
+        };
+        let left_part = format!("{}{}{}{}{}{}{}", prefix, view_label, sort_label, mode_label, pos_label, send_badge, alert);
         let left_width = crust::display_width(&left_part);
         let right_width = crust::display_width(&right_info);
         let padding = if self.cols as usize > left_width + right_width + 1 {
