@@ -12649,6 +12649,11 @@ impl App {
     /// `ai_pane` so x / X follow the answer's links while it is on
     /// screen, and so the pane can be restored after the URL picker.
     fn show_ai_response(&mut self, header: &str, response: &str) {
+        // The answer goes into the `!` log whole, not just the line that
+        // says it was shown: one stray key replaces the right pane, and
+        // "I unsubscribed you" is worth being able to read again.
+        self.msg_log.push(&format!("AI: {}", response.trim()),
+                          self.config.theme_colors.content_fg);
         let urls = extract_message_urls(response);
         let linked: String = response.lines()
             .map(hyperlink_urls).collect::<Vec<_>>().join("\n");
