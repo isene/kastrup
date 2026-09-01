@@ -171,8 +171,10 @@ enum DraftKind {
     Gateway,
     /// A conversation reachable through the external `ws-bridge` CLI.
     /// `Conv:` header carries the conversation UUID (the send target);
-    /// optional `Channel:` is a display label only; `Attach:` lines
-    /// upload files with the body as the caption.
+    /// optional `Channel:` is a display label only; optional `ReplyTo:`
+    /// is the UUID of the message the answer belongs under, so it lands
+    /// in that thread rather than the channel; `Attach:` lines upload
+    /// files with the body as the caption.
     Workspace,
 }
 
@@ -324,6 +326,26 @@ fn parse_chat_channel(data: &str) -> Option<String> {
 /// Extract the `Conv:` header value from a workspace draft (the
 /// conversation UUID, the send target). Same header-block scan as
 /// `parse_chat_channel`. Returns None if missing.
+/// Extract the `ReplyTo:` header from a workspace draft: the UUID of
+/// the message the answer belongs under (a kastrup row's `thread_id`
+/// or `external_id`, both are message UUIDs). ws-bridge resolves a
+/// nested id to the thread root itself. Without it a draft answer
+/// landed in the channel's main thread and notified everyone.
+fn parse_chat_reply_to(data: &str) -> Option<String> {
+    for line in data.lines() {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() { break; }
+        let lower = trimmed.to_ascii_lowercase();
+        let rest = lower.strip_prefix("replyto:").or_else(|| lower.strip_prefix("reply-to:"));
+        if let Some(rest) = rest {
+            let val_start = trimmed.len() - rest.len();
+            let v = trimmed[val_start..].trim();
+            if !v.is_empty() { return Some(v.to_string()); }
+        }
+    }
+    None
+}
+
 fn parse_chat_conv(data: &str) -> Option<String> {
     for line in data.lines() {
         let trimmed = line.trim_end_matches(['\r', '\n']);
@@ -10284,6 +10306,7 @@ impl App {
 
         let conv = parse_chat_conv(data)
             .ok_or_else(|| "missing Conv: header (conversation UUID)".to_string())?;
+        let reply_to = parse_chat_reply_to(data);
         let body = parse_chat_body(data);
         let live: Vec<std::path::PathBuf> = parse_chat_attachments(data).into_iter()
             .filter(|p| {
@@ -10296,10 +10319,16 @@ impl App {
             return Err("body is empty".to_string());
         }
 
-        // Text-only: `ws-bridge send --conv <UUID> --stdin` (body on stdin).
+        // Text-only: `ws-bridge send --conv <UUID> --stdin` (body on stdin),
+        // or `reply --to <MSG>` when the draft names what it answers.
         if live.is_empty() {
+            let mut args: Vec<String> = match &reply_to {
+                Some(msg) => vec!["reply".into(), "--conv".into(), conv.clone(), "--to".into(), msg.clone()],
+                None => vec!["send".into(), "--conv".into(), conv.clone()],
+            };
+            args.push("--stdin".into());
             let mut child = Command::new("ws-bridge")
-                .args(["send", "--conv", &conv, "--stdin"])
+                .args(&args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -10325,6 +10354,10 @@ impl App {
                 "upload".into(), "--conv".into(), conv.clone(),
                 "--file".into(), path.to_string_lossy().into_owned(),
             ];
+            if let Some(msg) = &reply_to {
+                args.push("--to".into());
+                args.push(msg.clone());
+            }
             if i == 0 && !body.is_empty() {
                 args.push("--caption".into());
                 args.push(body.clone());
@@ -15506,5 +15539,23 @@ mod wide_char_tests {
         assert_eq!(crate::pad_to_width("abc", 6), "abc   ");
         // Too long for the column: left alone rather than made shorter.
         assert_eq!(crate::pad_to_width("abcdef", 3), "abcdef");
+    }
+}
+
+#[cfg(test)]
+mod reply_to_header_tests {
+    use super::*;
+
+    #[test]
+    fn reply_to_is_read_from_the_header_block_only() {
+        let d = "Conv: 019d958e-3258-7ea6-892c-37e437178723\nReplyTo: 01a05d3d-1158-76cd-9c38-48c7934177d1\n\nbody\nReplyTo: not-a-header";
+        assert_eq!(parse_chat_reply_to(d).as_deref(), Some("01a05d3d-1158-76cd-9c38-48c7934177d1"));
+        assert_eq!(parse_chat_body(d), "body\nReplyTo: not-a-header");
+    }
+
+    #[test]
+    fn reply_to_is_case_insensitive_and_optional() {
+        assert_eq!(parse_chat_reply_to("Conv: x\nreply-to:  abc \n\nhi").as_deref(), Some("abc"));
+        assert_eq!(parse_chat_reply_to("Conv: x\n\nhi"), None);
     }
 }
