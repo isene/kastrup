@@ -2121,10 +2121,18 @@ fn main() {
                 // timestamp, so this is one integer compare when nothing
                 // is waiting — no new timer, no query per wake.
                 app.send_due_scheduled();
-                // Periodic DB refresh (skip when showing inline images).
+                // Periodic DB refresh (skip when showing inline images: a
+                // rebuild would wipe the picture the user is looking at).
                 // Gated on messages_dirty so an idle kastrup doesn't rerun
                 // get_messages() every 5s for no reason.
-                if !app.showing_image && app.delete_marked.is_empty() && app.last_db_refresh.elapsed().as_secs() >= 5 {
+                //
+                // Not gated on pending delete marks any more. Marks are a
+                // set of message ids and rows read them from that set, so
+                // a refresh keeps them. Gating on them held the list still
+                // for as long as anything was marked, and a Workspace reply
+                // that ws-bridge-listen had already written stayed
+                // invisible until Ctrl-R.
+                if !app.showing_image && app.last_db_refresh.elapsed().as_secs() >= 5 {
                     app.last_db_refresh = std::time::Instant::now();
                     if app.messages_dirty.swap(false, Ordering::Relaxed) {
                         app.refresh_current_view();
