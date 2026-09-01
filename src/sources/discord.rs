@@ -147,13 +147,17 @@ fn build_message(
 
     // Channel + author IDs let the reply path build a `.discord` template
     // (channel:<id> for channels, dm:<author> for DMs) without re-querying.
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "discord_channel_id": cid,
         "discord_author_id": author_id.clone(),
         "discord_message_id": mid,
         "source_type": "discord",
         "is_channel": is_channel,
     });
+    // A reply names the message it answers; the list nests it there.
+    if let Some(r) = m["message_reference"]["message_id"].as_str() {
+        metadata["reply_to"] = serde_json::json!(r);
+    }
 
     let subject = if content.is_empty() {
         if is_channel { format!("{} in {}", author_name, label) }
