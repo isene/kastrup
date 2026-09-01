@@ -360,50 +360,63 @@ fn parse_chat_conv(data: &str) -> Option<String> {
     None
 }
 
-/// Build a (message_index, depth) ordering for an email thread
-/// section. Walks the In-Reply-To tree depth-first so a reply appears
-/// directly under its parent at one extra indent level. Falls back to
-/// chronological order for messages whose parent isn't in this section
-/// (orphans become extra roots at depth 0).
+/// What a message calls itself and what it says it answers, for the
+/// thread tree. Mail identifies by RFC822 Message-Id (kept in
+/// `thread_id`) and answers by `In-Reply-To`. A chat message identifies
+/// by the platform's own id (`external_id`) and answers by whatever
+/// the source stored: Workspace's `parent_message_id`, or the
+/// `reply_to` that the Discord and Slack syncs write.
+fn thread_link(msg: &Message) -> (Option<String>, Option<String>) {
+    let strip = |s: &str| s.trim().trim_matches(['<', '>']).to_string();
+    let meta = &msg.metadata;
+    if let Some(p) = meta.get("in_reply_to").and_then(|v| v.as_str()) {
+        return (msg.thread_id.clone().filter(|m| !m.is_empty()), Some(strip(p)));
+    }
+    let parent = meta.get("parent_message_id").or_else(|| meta.get("reply_to"))
+        .and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(strip);
+    let own = if msg.external_id.is_empty() {
+        msg.thread_id.clone().filter(|m| !m.is_empty())
+    } else {
+        Some(msg.external_id.clone())
+    };
+    (own, parent)
+}
+
+/// Build a (message_index, depth) ordering for a section. Walks the
+/// reply tree depth-first so a reply appears directly under its parent
+/// at one extra indent level. A message whose parent isn't in this
+/// section becomes a root at depth 0.
 ///
-/// Lookup chain:
-/// * `msg.thread_id` carries the RFC822 Message-Id (maildir source
-///   convention; set on insert).
-/// * `msg.metadata.in_reply_to` carries the parent's Message-Id when
-///   the mail has the header.
+/// Mail roots come out newest-first, which is the order a mail section
+/// has always had. A chat channel keeps the order it was handed, so a
+/// channel with no replies in it looks exactly as it did.
 fn build_thread_order(messages: &[Message], section_indices: &[usize]) -> Vec<(usize, u8)> {
     use std::collections::HashMap;
-    // message_id → position in section_indices (so we can resolve a
-    // parent's index quickly).
     let mut by_id: HashMap<String, usize> = HashMap::new();
+    let mut is_mail = false;
     for &i in section_indices {
-        if let Some(ref mid) = messages[i].thread_id {
-            if !mid.is_empty() { by_id.insert(mid.clone(), i); }
-        }
+        let (own, _) = thread_link(&messages[i]);
+        if let Some(id) = own { by_id.insert(id, i); }
+        if messages[i].metadata.get("in_reply_to").is_some() { is_mail = true; }
     }
-    // Children per parent index; roots are messages whose
-    // `in_reply_to` doesn't resolve to anything in this section.
     let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut roots: Vec<usize> = Vec::new();
     for &i in section_indices {
-        let parent_mid = messages[i].metadata
-            .get("in_reply_to")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().trim_matches(['<', '>']).to_string());
-        match parent_mid.and_then(|pid| by_id.get(&pid).copied()) {
+        let (_, parent) = thread_link(&messages[i]);
+        match parent.and_then(|pid| by_id.get(&pid).copied()) {
             Some(parent_idx) if parent_idx != i => {
                 children.entry(parent_idx).or_default().push(i);
             }
             _ => roots.push(i),
         }
     }
-    // Sort children chronologically (oldest reply first under the
-    // parent — natural reading order).
+    // Oldest reply first under its parent: natural reading order.
     for kids in children.values_mut() {
         kids.sort_by(|&a, &b| messages[a].timestamp.cmp(&messages[b].timestamp));
     }
-    // Sort roots newest-first to match the existing section ordering.
-    roots.sort_by(|&a, &b| messages[b].timestamp.cmp(&messages[a].timestamp));
+    if is_mail {
+        roots.sort_by(|&a, &b| messages[b].timestamp.cmp(&messages[a].timestamp));
+    }
 
     // Iterative DFS to avoid recursion-depth panics on degenerate
     // chains (mailing-list threads can be hundreds of replies long).
@@ -4924,17 +4937,13 @@ impl App {
             self.display_messages.push(header);
 
             if !is_collapsed {
-                // For email/maildir thread sections, replace the flat
-                // chronological ordering with a DFS over the
-                // In-Reply-To tree so replies appear indented under
-                // the parent they answered. Other section types stay
-                // flat — chat sources don't carry reliable parent
-                // metadata in the current relay protocol.
-                let ordered: Vec<(usize, u8)> = if section.section_type == "thread" {
-                    build_thread_order(&self.filtered_messages, &section.messages)
-                } else {
-                    section.messages.iter().map(|&i| (i, 0u8)).collect()
-                };
+                // Replies nest under what they answer, for mail and for
+                // chat alike. Workspace stores the parent's id on every
+                // reply; Discord and Slack do from the day their syncs
+                // started writing `reply_to`. A channel with nothing to
+                // nest keeps its order untouched (see build_thread_order).
+                let ordered: Vec<(usize, u8)> =
+                    build_thread_order(&self.filtered_messages, &section.messages);
 
                 for (idx, depth) in ordered {
                     let row = self.display_row(idx, depth);
@@ -15254,6 +15263,34 @@ mod fold_tests {
         assert_eq!(ids, vec![1, 2, 3, 4], "root first, then replies in order");
         assert_eq!(depths, vec![0, 1, 2, 1], "replies indent under their parent");
         assert_eq!(order.len(), 4, "every message appears once");
+    }
+
+    fn chat(id: i64, ext: &str, parent: Option<&str>, ts: i64) -> Message {
+        let mut meta = serde_json::json!({});
+        if let Some(v) = parent { meta["parent_message_id"] = serde_json::json!(v); }
+        Message { id, external_id: ext.into(), metadata: meta, timestamp: ts, ..Default::default() }
+    }
+
+    /// A Workspace channel: replies indent under their root, roots keep
+    /// the order the section was handed (newest first, as the list
+    /// shows them), and a channel with no replies is untouched.
+    #[test]
+    fn chat_replies_nest_and_roots_keep_their_order() {
+        let msgs = vec![
+            chat(1, "b", None, 300),
+            chat(2, "a", None, 100),
+            chat(3, "a1", Some("a"), 200),
+            chat(4, "a2", Some("a"), 250),
+        ];
+        let order = build_thread_order(&msgs, &[0, 1, 2, 3]);
+        let ids: Vec<i64> = order.iter().map(|&(i, _)| msgs[i].id).collect();
+        let depths: Vec<u8> = order.iter().map(|&(_, d)| d).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        assert_eq!(depths, vec![0, 0, 1, 1]);
+
+        let flat = vec![chat(1, "x", None, 300), chat(2, "y", None, 100)];
+        let order = build_thread_order(&flat, &[0, 1]);
+        assert_eq!(order, vec![(0, 0), (1, 0)], "no replies: order as handed");
     }
 }
 

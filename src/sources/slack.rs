@@ -106,12 +106,18 @@ pub fn sync_slack(config: &serde_json::Value, known_ids: &HashSet<String>) -> Ve
                 })).collect())
                 .unwrap_or_default();
 
-            let metadata = serde_json::json!({
+            // A thread reply carries the root's ts. Stored in the same
+            // `<channel>:<ts>` shape as ext_id so the list can nest it.
+            let reply_to = m["thread_ts"].as_str()
+                .filter(|t| !t.is_empty() && *t != ts)
+                .map(|t| format!("{}:{}", cid, t));
+            let mut metadata = serde_json::json!({
                 "slack_channel_id": cid,
                 "slack_user_id":    user_id,
                 "slack_ts":         ts,
                 "source_type":      "slack",
             });
+            if let Some(r) = reply_to { metadata["reply_to"] = serde_json::json!(r); }
 
             let subject = if content.is_empty() {
                 format!("Message from {}", author_name)
