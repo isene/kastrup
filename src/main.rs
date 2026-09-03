@@ -1564,10 +1564,11 @@ fn main() {
         };
         let db = match Database::new() { Ok(d) => std::sync::Arc::new(d), Err(e) => { eprintln!("{}", e); std::process::exit(1); } };
         match feeder::push_new(&db, &cfg) {
-            Some((n, ms)) => println!("push: {} rows in {} ms", n, ms),
+            Some((n, ms, d)) => println!("push: {} rows in {} ms, {} draft(s) back", n, ms, d),
             None => println!("push: nothing to send (watermark {})",
                 db.get_setting("push_sent_up_to").unwrap_or_else(|| "unset".into())),
         }
+        println!("outbox: {} draft(s) written to ~/.kastrup/drafts", feeder::pull_outbox(&db, &cfg));
         return;
     }
     if std::env::args().any(|a| a == "--backfill-text") {
@@ -2200,14 +2201,25 @@ fn main() {
                 let tick_start = std::time::Instant::now();
                 // Check for new messages from poller
                 let mut new_count = 0usize;
+                let mut new_drafts = 0usize;
                 if let Some(ref rx) = app.poller_rx {
                     while let Ok(event) = rx.try_recv() {
                         match event {
                             poller::PollerEvent::NewMessages(count) => {
                                 new_count += count;
                             }
+                            poller::PollerEvent::Drafts(count) => {
+                                new_drafts += count;
+                            }
                         }
                     }
+                }
+                if new_drafts > 0 {
+                    app.set_feedback(
+                        &format!("{} approved repl{} from the indexer queued as draft(s): press +",
+                            new_drafts, if new_drafts == 1 { "y" } else { "ies" }),
+                        app.config.theme_colors.feedback_ok,
+                    );
                 }
                 if new_count > 0 {
                     app.set_feedback(
@@ -9583,6 +9595,14 @@ impl App {
     /// the relay matches it to a live notification, or sends natively
     /// for SMS. Carried as `<platform>:<thread_key>`.
     fn chat_target(&self, msg: &Message) -> Option<Result<(DraftKind, String, String), String>> {
+        chat_target(msg)
+    }
+}
+
+/// See App::chat_target. A free function so the feeder can route the
+/// indexer's approved replies the same way.
+fn chat_target(msg: &Message) -> Option<Result<(DraftKind, String, String), String>> {
+    {
         let gateway = msg.metadata.get("source").and_then(|v| v.as_str()) == Some("gateway");
         if msg.source_type == "weechat-relay" {
             let folder = msg.folder.clone().filter(|f| !f.is_empty())?;
@@ -9623,7 +9643,9 @@ impl App {
         }
         None
     }
+}
 
+impl App {
     /// Get displayable text content from a message, converting HTML if needed.
     fn get_display_content(&self, msg: &Message) -> String {
         let raw = &msg.content;
