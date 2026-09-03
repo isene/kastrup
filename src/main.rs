@@ -4986,7 +4986,10 @@ impl App {
                 .filter(|m| !m.read
                     && m.metadata.get("highlight").and_then(|v| v.as_bool()) == Some(true))
                 .count() as u64;
-            header.metadata = serde_json::json!({ "highlight_count": highlight_count });
+            let first_id = section.messages.first()
+                .and_then(|&i| self.filtered_messages.get(i)).map(|m| m.id);
+            header.metadata = serde_json::json!({
+                "highlight_count": highlight_count, "first_id": first_id });
             // Compact `[N/M]` counter so a wall of collapsed channels
             // stays readable. The `*` unread marker on the right is
             // appended by `format_section_header`.
@@ -8681,100 +8684,26 @@ impl App {
         self.compose_source_type = Some(msg.source_type.clone());
         self.pending_reply_id = Some(msg.id);
 
-        // Weechat-relay reply: route EVERY relay buffer (Slack, IRC,
-        // Discord-bridge, Matrix, WhatsApp, …) through the relay's
-        // `input` command (kind=Weechat). weechat posts the line under
-        // its own identity, so a Slack reply appears AS THE USER with
-        // no "via wee-slack" app badge — exactly like typing in weechat.
-        //
-        // (We used to send `python.slack.*` via the Slack Web API, but
-        // an xoxp token stamps a bot-style "via wee-slack" attribution
-        // and the clean xoxc/xoxd browser pair rotates every few hours.
-        // The relay path sidesteps both: weechat owns the auth.)
-        //
-        // Caveat: if wee-slack has auto-closed an inactive Slack DM
-        // buffer, the relay drops input to it silently — the same limit
-        // weechat itself has (you'd reopen the DM there too).
-        if msg.source_type == "weechat-relay" {
-            if let Some(folder) = msg.folder.clone() {
-                self.set_feedback(
-                    &format!("Reply target: {} (relay)", folder),
-                    self.config.theme_colors.feedback_info,
-                );
-                self.compose_kind = DraftKind::Weechat;
-                let template = format!("Channel: {}\n\n", folder);
+        // Chat sources (relay buffers, Discord, the phone gateway) get a
+        // `Channel:` template and post through their own sender; see
+        // chat_target for the routing notes.
+        match self.chat_target(msg) {
+            Some(Ok((kind, channel, desc))) => {
+                self.set_feedback(&format!("Reply to {}", desc),
+                    self.config.theme_colors.feedback_info);
+                self.compose_kind = kind;
+                let template = format!("Channel: {}\n\n", channel);
                 self.run_editor_compose_at_full(&template, Some(3), Some(1), true);
                 self.compose_kind = DraftKind::Email;
                 return;
             }
-        }
-
-        // Discord (native bot). A channel reply posts inline via channel:<id> —
-        // exactly what the weechat/discord-irc bridge did, as the bot in the
-        // channel. A DM reply posts via dm:<author> (the bot-DM path).
-        //
-        // Skip gateway-relayed Discord: resolve_source_type maps a gateway
-        // message with platform=discord to source_type "discord", but the
-        // phone relay only captured a display name — there's no
-        // discord_channel_id/author_id for the bot API. Let it fall through
-        // to the gateway reply path below (reply via the live notification).
-        if msg.source_type == "discord"
-            && msg.metadata.get("source").and_then(|v| v.as_str()) != Some("gateway") {
-            let chan = msg.metadata.get("discord_channel_id").and_then(|v| v.as_str()).unwrap_or("");
-            let author = msg.metadata.get("discord_author_id").and_then(|v| v.as_str()).unwrap_or("");
-            let is_channel = msg.metadata.get("is_channel").and_then(|v| v.as_bool()).unwrap_or(false);
-            let target = if is_channel && !chan.is_empty() {
-                format!("channel:{}", chan)
-            } else if !author.is_empty() {
-                format!("dm:{}", author)
-            } else if !chan.is_empty() {
-                format!("channel:{}", chan)
-            } else {
-                self.set_feedback("Discord reply: message missing channel/author",
-                    self.config.theme_colors.feedback_warn);
-                return;
-            };
-            let label = msg.recipients.clone();
-            self.set_feedback(
-                &format!("Reply to {} (Discord)", if label.is_empty() { target.clone() } else { label }),
-                self.config.theme_colors.feedback_info);
-            self.compose_kind = DraftKind::Discord;
-            let template = format!("Channel: {}\n\n", target);
-            self.run_editor_compose_at_full(&template, Some(3), Some(1), true);
-            self.compose_kind = DraftKind::Email;
-            return;
-        }
-
-        // Phone gateway reply (Instagram / Messenger / WhatsApp / Telegram
-        // / Signal / SMS). The reply target is the thread_key the phone
-        // captured; the relay matches it to a live notification (chat
-        // apps) or sends natively (SMS). Carried as `Channel:
-        // <platform>:<thread_key>`; sent via the gateway outbox.
-        if msg.metadata.get("source").and_then(|v| v.as_str()) == Some("gateway") {
-            let platform = msg.metadata.get("platform").and_then(|v| v.as_str())
-                .unwrap_or("").to_string();
-            let thread_key = msg.metadata.get("thread_key").and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| msg.thread_id.clone())
-                .unwrap_or_default();
-            if platform.is_empty() || thread_key.is_empty() {
-                self.set_feedback("Gateway reply: message missing platform/thread",
-                    self.config.theme_colors.feedback_warn);
+            Some(Err(why)) => {
+                self.set_feedback(&why, self.config.theme_colors.feedback_warn);
                 return;
             }
-            let hint = if platform == "sms" {
-                format!("SMS reply to {} (native — any number)", thread_key)
-            } else {
-                format!("Reply to {} on {} — needs a live notification on the phone",
-                    thread_key, platform)
-            };
-            self.set_feedback(&hint, self.config.theme_colors.feedback_info);
-            self.compose_kind = DraftKind::Gateway;
-            let template = format!("Channel: {}:{}\n\n", platform, thread_key);
-            self.run_editor_compose_at_full(&template, Some(3), Some(1), true);
-            self.compose_kind = DraftKind::Email;
-            return;
+            None => {}
         }
+        let msg = &self.filtered_messages[idx];
 
         let sender = msg.display_name();
         let subject = msg.subject.as_deref().unwrap_or("");
@@ -9575,18 +9504,18 @@ impl App {
         // current_filtered_index() handles threaded-view's display_messages
         // indirection — using self.index directly into filtered_messages
         // sampled the wrong message's source_type in conversation view.
-        self.compose_source_type = match self.current_filtered_index() {
-            Some(idx) => Some(self.filtered_messages[idx].source_type.clone()),
-            None => Some("email".to_string())
-        };
+        let ctx = self.compose_context_index();
+        self.compose_source_type = Some(match ctx {
+            Some(idx) => self.filtered_messages[idx].source_type.clone(),
+            None => "email".to_string(),
+        });
 
-        // Weechat-relay compose: route every relay buffer (Slack, IRC,
-        // Discord-bridge, Matrix, …) through the relay `input` command
-        // so weechat posts under the user's own identity — Slack lines
-        // appear as the user, no "via wee-slack" badge (see reply()).
-        let weechat_target = self.compose_weechat_target_from_context();
-        if let Some(channel) = weechat_target {
-            self.compose_kind = DraftKind::Weechat;
+        // A chat channel under the cursor (a message in it, or its header)
+        // gets a new message to that channel, not an email template.
+        if let Some(Ok((kind, channel, desc))) = ctx.and_then(|i| self.chat_target(&self.filtered_messages[i])) {
+            self.set_feedback(&format!("New message to {}", desc),
+                self.config.theme_colors.feedback_info);
+            self.compose_kind = kind;
             let template = format!("Channel: {}\n\n", channel);
             self.run_editor_compose_at_full(&template, Some(3), Some(1), true);
             self.compose_kind = DraftKind::Email;  // reset for next time
@@ -9620,33 +9549,77 @@ impl App {
         self.run_editor_compose_at_full(&template, Some(2), Some(5), true);
     }
 
-    /// If the currently-selected message or the current view points
-    /// at a weechat-relay buffer, return that buffer's `full_name`
-    /// (the value the relay's `input` command expects). Otherwise
-    /// `None` so the caller falls through to the email compose path.
-    fn compose_weechat_target_from_context(&self) -> Option<String> {
-        // Selected message wins — it's the most specific signal. Route
-        // through current_filtered_index() so threaded view resolves through
-        // display_messages.
-        if let Some(idx) = self.current_filtered_index() {
-            let msg = self.filtered_messages.get(idx)?;
-            if msg.source_type == "weechat-relay" {
-                if let Some(folder) = msg.folder.as_deref() {
-                    if !folder.is_empty() { return Some(folder.to_string()); }
-                }
-            }
-            return None;
-        }
-        // No selected message — the cursor may be on a channel header
-        // (folders/threaded mode). Compose to that channel: a weechat-relay
-        // header carries its source_type and stashes the buffer full_name in
-        // thread_id. This is what lets `+` on a Slack channel header start a
-        // new message to the channel (not a reply to anyone).
+    /// The message that names the channel a new message goes to: the
+    /// selected one, or the first message under the channel header the
+    /// cursor sits on (headers stash it as metadata.first_id). `None`
+    /// on an empty header or an empty view.
+    fn compose_context_index(&self) -> Option<usize> {
+        if let Some(idx) = self.current_filtered_index() { return Some(idx); }
         let h = self.display_messages.get(self.index).filter(|m| m.is_header)?;
-        if h.source_type == "weechat-relay" {
-            if let Some(folder) = h.thread_id.as_deref() {
-                if !folder.is_empty() { return Some(folder.to_string()); }
+        let first = h.metadata.get("first_id").and_then(|v| v.as_i64())?;
+        self.filtered_messages.iter().position(|m| m.id == first)
+    }
+
+    /// Where a chat message posts: the draft kind, the `Channel:` value
+    /// and a description for the status line. `None` for mail and for
+    /// sources with their own sender (Workspace); `Err` when the message
+    /// is a chat message that lacks the ids the sender needs.
+    ///
+    /// Weechat relay: EVERY relay buffer (Slack, IRC, Discord-bridge,
+    /// Matrix, WhatsApp, …) goes through the relay's `input` command, so
+    /// weechat posts under its own identity: a Slack line appears AS THE
+    /// USER with no "via wee-slack" badge, exactly like typing in weechat.
+    /// (The Slack Web API with an xoxp token stamps a bot-style
+    /// attribution, and the clean xoxc/xoxd browser pair rotates every
+    /// few hours.) If wee-slack has auto-closed an inactive DM buffer the
+    /// relay drops the line silently, as weechat itself would.
+    ///
+    /// Discord (native bot): a channel post goes via channel:<id>, a DM
+    /// via dm:<author>. Gateway-relayed Discord has neither id (the phone
+    /// captured a display name only) and falls to the gateway path.
+    ///
+    /// Phone gateway (Instagram / Messenger / WhatsApp / Telegram /
+    /// Signal / SMS): the target is the thread_key the phone captured;
+    /// the relay matches it to a live notification, or sends natively
+    /// for SMS. Carried as `<platform>:<thread_key>`.
+    fn chat_target(&self, msg: &Message) -> Option<Result<(DraftKind, String, String), String>> {
+        let gateway = msg.metadata.get("source").and_then(|v| v.as_str()) == Some("gateway");
+        if msg.source_type == "weechat-relay" {
+            let folder = msg.folder.clone().filter(|f| !f.is_empty())?;
+            return Some(Ok((DraftKind::Weechat, folder.clone(), format!("{} (relay)", folder))));
+        }
+        if msg.source_type == "discord" && !gateway {
+            let chan = msg.metadata.get("discord_channel_id").and_then(|v| v.as_str()).unwrap_or("");
+            let author = msg.metadata.get("discord_author_id").and_then(|v| v.as_str()).unwrap_or("");
+            let is_channel = msg.metadata.get("is_channel").and_then(|v| v.as_bool()).unwrap_or(false);
+            let target = if is_channel && !chan.is_empty() {
+                format!("channel:{}", chan)
+            } else if !author.is_empty() {
+                format!("dm:{}", author)
+            } else if !chan.is_empty() {
+                format!("channel:{}", chan)
+            } else {
+                return Some(Err("Discord: message missing channel/author".to_string()));
+            };
+            let label = if msg.recipients.is_empty() { target.clone() } else { msg.recipients.clone() };
+            return Some(Ok((DraftKind::Discord, target, format!("{} (Discord)", label))));
+        }
+        if gateway {
+            let platform = msg.metadata.get("platform").and_then(|v| v.as_str())
+                .unwrap_or("").to_string();
+            let thread_key = msg.metadata.get("thread_key").and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| msg.thread_id.clone())
+                .unwrap_or_default();
+            if platform.is_empty() || thread_key.is_empty() {
+                return Some(Err("Gateway: message missing platform/thread".to_string()));
             }
+            let desc = if platform == "sms" {
+                format!("{} (SMS, native — any number)", thread_key)
+            } else {
+                format!("{} on {} — needs a live notification on the phone", thread_key, platform)
+            };
+            return Some(Ok((DraftKind::Gateway, format!("{}:{}", platform, thread_key), desc)));
         }
         None
     }
