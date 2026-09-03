@@ -13303,10 +13303,19 @@ impl App {
                     let email = msg.sender.clone();
                     let conn = self.db.conn.lock().unwrap();
                     let now = database::now_secs();
-                    let _ = conn.execute(
-                        "INSERT OR IGNORE INTO contacts (name, primary_email, message_count, last_contact) VALUES (?, ?, 1, ?)",
-                        rusqlite::params![name, email, now],
-                    );
+                    // created_at and updated_at are NOT NULL, so the insert
+                    // without them failed and the "Added" line lied. One row
+                    // per address: an address already there gets its name
+                    // and last_contact refreshed instead.
+                    let exists: bool = conn.query_row(
+                        "SELECT 1 FROM contacts WHERE primary_email = ?1", rusqlite::params![email], |_| Ok(true)).unwrap_or(false);
+                    let _ = if exists {
+                        conn.execute("UPDATE contacts SET name = ?1, last_contact = ?2, updated_at = ?2 WHERE primary_email = ?3",
+                            rusqlite::params![name, now, email])
+                    } else {
+                        conn.execute("INSERT INTO contacts (name, primary_email, message_count, last_contact, created_at, updated_at) VALUES (?1, ?2, 1, ?3, ?3, ?3)",
+                            rusqlite::params![name, email, now])
+                    };
                     drop(conn);
                     self.set_feedback(&format!("Added: {} <{}>", name, email), tc.feedback_ok);
                 }
