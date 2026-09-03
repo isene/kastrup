@@ -1568,6 +1568,19 @@ impl Database {
     /// Non-mail rows newer than `after`, oldest first, at most `limit`,
     /// with the body decoded the way the search index has it. What the
     /// push feeder sends.
+    /// The newest message from `who` (address or name, substring) on a
+    /// source of `plugin_type`; where a new message to that person goes.
+    pub fn latest_message_from(&self, who: &str, plugin_type: &str) -> Option<i64> {
+        let conn = self.read();
+        conn.query_row(
+            "SELECT m.id FROM messages m JOIN sources s ON s.id = m.source_id \
+             WHERE s.plugin_type = ?1 AND (m.sender LIKE ?2 OR m.sender_name LIKE ?2) \
+             ORDER BY m.timestamp DESC LIMIT 1",
+            params![plugin_type, format!("%{}%", who)],
+            |r| r.get(0),
+        ).ok()
+    }
+
     pub fn rows_after(&self, after: i64, limit: usize) -> Vec<PushRow> {
         let conn = self.read();
         let mut stmt = match conn.prepare(
