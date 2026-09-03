@@ -50,13 +50,13 @@ pub struct Poller {
 }
 
 impl Poller {
-    pub fn start(db: Arc<Database>, tx: mpsc::Sender<PollerEvent>) -> Self {
+    pub fn start(db: Arc<Database>, tx: mpsc::Sender<PollerEvent>, push: Option<crate::feeder::PushConfig>) -> Self {
         let wake = Arc::new((Mutex::new(WakeState::Idle), Condvar::new()));
         let wake_clone = wake.clone();
         let db_for_poller = db.clone();
 
         let thread = std::thread::spawn(move || {
-            poller_loop(db_for_poller, tx, wake_clone);
+            poller_loop(db_for_poller, tx, wake_clone, push);
         });
 
         // Inotify watcher on maildir new/ dirs (Linux only — inotify
@@ -124,6 +124,7 @@ fn poller_loop(
     db: Arc<Database>,
     tx: mpsc::Sender<PollerEvent>,
     wake: Arc<(Mutex<WakeState>, Condvar)>,
+    push: Option<crate::feeder::PushConfig>,
 ) {
     // Cache known_ids per source (loaded once, updated incrementally).
     // This HashSet grows for the process lifetime but eviction is only
@@ -193,6 +194,8 @@ fn poller_loop(
         sources_list.sort_by_key(|s| s.plugin_type != "maildir");
         let now = crate::database::now_secs();
         check_ws_bridge(&db, &sources_list, &mut failing);
+        // Did this cycle insert anything the outside indexer wants?
+        let mut new_non_mail = false;
 
         for source in &sources_list {
             let interval = source.poll_interval;
@@ -293,6 +296,7 @@ fn poller_loop(
                 }
                 // Brief DB lock for batch insert only
                 db.insert_messages_batch(source.id, &messages);
+                if !is_maildir { new_non_mail = true; }
             }
 
             // A failed sync is not a quiet one. Say why, and leave
@@ -315,6 +319,12 @@ fn poller_loop(
             if count > 0 {
                 let _ = tx.send(PollerEvent::NewMessages(count));
             }
+        }
+
+        // One POST per cycle, and only a cycle that inserted non-mail
+        // rows. Idle cycles never reach this line.
+        if new_non_mail {
+            if let Some(cfg) = &push { crate::feeder::push_new(&db, cfg); }
         }
 
         // Park until 10s elapse, inotify nudges Wake, or stop is
