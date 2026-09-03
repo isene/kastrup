@@ -1216,6 +1216,8 @@ struct App {
     source_errors: Vec<(i64, String, String, i64)>,
     /// The status lines already shown, so a missed one can still be read.
     msg_log: crust::MessageLog,
+    /// Plugins with a top-level key of their own (`top:` in the plugin file).
+    top_plugins: Vec<(String, String, String)>,
     last_db_refresh: std::time::Instant,
     /// Last time the periodic stuck-maildir reconcile ran (see the main
     /// loop). Throttles it to ~once every 2 min on the loop's existing
@@ -1904,6 +1906,7 @@ fn main() {
         last_db_sig: (0, 0, 0),
         source_errors: Vec::new(),
         msg_log: crust::MessageLog::new(msg_log_cap),
+        top_plugins: Vec::new(),
         last_db_refresh: std::time::Instant::now(),
         last_reconcile: std::time::Instant::now(),
         read_sync,
@@ -2036,6 +2039,7 @@ fn main() {
 
     // Start background poller
     let (poller_tx, poller_rx) = std::sync::mpsc::channel();
+    app.top_plugins = app.load_top_plugins();
     let poller = poller::Poller::start(app.db.clone(), poller_tx, app.config.push.clone());
     app.poller = Some(poller);
     app.poller_rx = Some(poller_rx);
@@ -2453,6 +2457,12 @@ impl App {
             // Search / filter
             "/" => { self.search_prompt(); }
             "\\" => { self.find_in_view(); }
+            // A plugin that asked for a key of its own (`top:` in its file).
+            k if self.top_plugins.iter().any(|(pk, _, _)| pk == k) => {
+                if let Some((_, l, c)) = self.top_plugins.iter().find(|(pk, _, _)| pk == k).cloned() {
+                    self.run_ai_plugin(&l, &c);
+                }
+            }
             "@" => { self.address_book_menu(); }
 
             // Sort
@@ -12634,6 +12644,29 @@ impl App {
             }
         }
         plugins
+    }
+
+    /// Plugins that also want a key of their own at the top level: a
+    /// `top: 'X'` line in the plugin file. Read once at startup, so a
+    /// keypress costs one comparison, not a directory read.
+    fn load_top_plugins(&self) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        let top_re = regex::Regex::new(r"top:\s*'([^']+)'").ok();
+        let label_re = regex::Regex::new(r"label:\s*'([^']+)'").ok();
+        let cmd_re = regex::Regex::new(r"command:\s*'([^']+)'").ok();
+        let (Some(top_re), Some(label_re), Some(cmd_re)) = (top_re, label_re, cmd_re) else { return out };
+        if let Ok(entries) = std::fs::read_dir(home_dir().join(".kastrup/plugins")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() { continue; }
+                let Ok(content) = std::fs::read_to_string(&path) else { continue };
+                let grab = |r: &regex::Regex| r.captures(&content).and_then(|c| c.get(1)).map(|m| m.as_str().to_string());
+                if let (Some(k), Some(l), Some(c)) = (grab(&top_re), grab(&label_re), grab(&cmd_re)) {
+                    out.push((k, l, c));
+                }
+            }
+        }
+        out
     }
 
     // Batch J: AI Assistant + plugins
