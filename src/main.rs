@@ -3,6 +3,7 @@ mod completion_ipc;
 mod config;
 mod database;
 mod email_send;
+mod feeder;
 mod log;
 mod mailfile;
 mod message;
@@ -1510,6 +1511,23 @@ fn main() {
     // column. Before any TUI init, so progress goes to a plain stdout —
     // and outside the main loop, because it is a one-off that has no
     // business costing anything on a normal start.
+    // --push-now: hand everything since the watermark to the outside
+    // indexer once, and exit. For testing the feeder and for catching up
+    // after the indexer was down.
+    if std::env::args().any(|a| a == "--push-now") {
+        let config = Config::load();
+        let Some(cfg) = config.push else {
+            eprintln!("push: no `push:` block in ~/.kastrup/config.yml");
+            std::process::exit(1);
+        };
+        let db = match Database::new() { Ok(d) => std::sync::Arc::new(d), Err(e) => { eprintln!("{}", e); std::process::exit(1); } };
+        match feeder::push_new(&db, &cfg) {
+            Some((n, ms)) => println!("push: {} rows in {} ms", n, ms),
+            None => println!("push: nothing to send (watermark {})",
+                db.get_setting("push_sent_up_to").unwrap_or_else(|| "unset".into())),
+        }
+        return;
+    }
     if std::env::args().any(|a| a == "--backfill-text") {
         let db = match Database::new() {
             Ok(d) => d,
@@ -2018,7 +2036,7 @@ fn main() {
 
     // Start background poller
     let (poller_tx, poller_rx) = std::sync::mpsc::channel();
-    let poller = poller::Poller::start(app.db.clone(), poller_tx);
+    let poller = poller::Poller::start(app.db.clone(), poller_tx, app.config.push.clone());
     app.poller = Some(poller);
     app.poller_rx = Some(poller_rx);
     log_phase("poller spawn", &mut phase);
@@ -13128,7 +13146,23 @@ impl App {
         log::info(&format!("Running plugin: {}", label));
         let pick_file = format!("/tmp/kastrup_plugin_{}.txt", std::process::id());
         let _ = std::fs::remove_file(&pick_file);
-        let cmd = command.replace("%{pick_file}", &pick_file);
+        // The selected message, for plugins that act on it: its id, and
+        // its body as the reader sees it in a file (raw MIME helps nobody).
+        let (msg_id, msg_text) = match self.current_filtered_index()
+            .and_then(|i| self.filtered_messages.get(i))
+            .filter(|m| !m.is_header)
+        {
+            Some(m) => (m.id, self.get_display_content(m)),
+            None => (0, String::new()),
+        };
+        let msg_file = format!("/tmp/kastrup_plugin_msg_{}.txt", std::process::id());
+        if command.contains("%{msg_file}") {
+            let _ = std::fs::write(&msg_file, &msg_text);
+        }
+        let cmd = command
+            .replace("%{pick_file}", &pick_file)
+            .replace("%{msg_id}", &msg_id.to_string())
+            .replace("%{msg_file}", &msg_file);
         Crust::cleanup();
         Crust::clear_screen();
         let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -13157,7 +13191,16 @@ impl App {
                 .collect();
         }
         let _ = std::fs::remove_file(&pick_file);
+        let _ = std::fs::remove_file(&msg_file);
         self.handle_resize();
+        // A plugin may hand back a message rather than files: a line the
+        // `#` key would accept (`kastrup:<id>` or a bare id) opens it.
+        if picked.len() == 1 {
+            if let Some(id) = parse_message_id(&picked[0]) {
+                self.goto_message(id);
+                return;
+            }
+        }
         if picked.is_empty() {
             self.set_feedback(&format!("{}: done", label), self.config.theme_colors.feedback_info);
         } else {

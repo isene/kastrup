@@ -249,6 +249,13 @@ pub struct Config {
     ///       unreact: "ws-bridge unreact --conv @conv --msg @msg --emoji @emoji"
     ///       sync:    "ws-bridge sync"
     pub senders: HashMap<String, HashMap<String, String>>,
+    /// Hand new non-mail rows to an outside indexer after each poll
+    /// cycle. See `feeder.rs`. Example:
+    ///   push:
+    ///     url: http://localhost:8100
+    ///     connector: <uuid>
+    ///     key_file: /home/.safe/corpintel-push.key
+    pub push: Option<crate::feeder::PushConfig>,
     /// Deliver a phone-gateway reply for `<platform>:<thread_key>` through a
     /// native chat target instead of the (phone-drained) gateway outbox.
     /// Key = `<platform>:<thread_key>`, value = a chat_send target:
@@ -284,6 +291,7 @@ impl Default for Config {
             channel_names: HashMap::new(),
             save_folders: HashMap::new(),
             senders: HashMap::new(),
+            push: None,
             gateway_routes: HashMap::new(),
             theme_colors: ThemeColors::default(),
         }
@@ -469,6 +477,14 @@ impl Config {
                         self.save_folders.insert(key.to_string(), val.to_string());
                     }
                 }
+            }
+        }
+
+        if let Some(p) = yaml.get("push").and_then(|p| p.as_mapping()) {
+            let get = |k: &str| p.get(serde_yaml::Value::String(k.into()))
+                .and_then(|v| v.as_str()).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+            if let (Some(url), Some(connector), Some(key_file)) = (get("url"), get("connector"), get("key_file")) {
+                self.push = Some(crate::feeder::PushConfig { url, connector, key_file });
             }
         }
 

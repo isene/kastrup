@@ -65,6 +65,21 @@ pub struct View {
 }
 
 /// Thread-safe wrapper around the SQLite database
+/// One row as the push feeder reads it.
+pub struct PushRow {
+    pub id: i64,
+    pub sender: String,
+    pub sender_name: Option<String>,
+    pub recipients: Option<String>,
+    pub subject: Option<String>,
+    pub body: String,
+    pub timestamp: i64,
+    pub thread_id: Option<String>,
+    pub folder: Option<String>,
+    pub source_name: String,
+    pub plugin_type: String,
+}
+
 pub struct Database {
     pub conn: Mutex<Connection>,
     /// A small pool of independent connections used for *reads*. A
@@ -1544,6 +1559,46 @@ impl Database {
         match rows { Ok(rs) => rs.filter_map(|r| r.ok()).collect(), Err(_) => Vec::new() }
     }
 
+    /// The newest message id, for the push feeder's first watermark.
+    pub fn max_message_id(&self) -> i64 {
+        let conn = self.read();
+        conn.query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| r.get(0)).unwrap_or(0)
+    }
+
+    /// Non-mail rows newer than `after`, oldest first, at most `limit`,
+    /// with the body decoded the way the search index has it. What the
+    /// push feeder sends.
+    pub fn rows_after(&self, after: i64, limit: usize) -> Vec<PushRow> {
+        let conn = self.read();
+        let mut stmt = match conn.prepare(
+            "SELECT m.id, m.sender, m.sender_name, m.recipients, m.subject, \
+                    m.content, m.html_content, m.content_text, m.timestamp, m.thread_id, \
+                    m.folder, s.name, s.plugin_type \
+             FROM messages m JOIN sources s ON s.id = m.source_id \
+             WHERE m.id > ? AND s.plugin_type != 'maildir' \
+             ORDER BY m.id LIMIT ?"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };
+        let rows = stmt.query_map(params![after, limit as i64], |r| {
+            let content: String = r.get::<_, String>(5).unwrap_or_default();
+            let html: Option<String> = r.get(6).ok();
+            let text: Option<String> = r.get(7).ok();
+            Ok(PushRow {
+                id: r.get(0)?,
+                sender: r.get::<_, String>(1).unwrap_or_default(),
+                sender_name: r.get(2).ok(),
+                recipients: r.get(3).ok(),
+                subject: r.get(4).ok(),
+                body: text.unwrap_or_else(|| decoded_body(&content, html.as_deref())),
+                timestamp: r.get(8).unwrap_or(0),
+                thread_id: r.get(9).ok(),
+                folder: r.get(10).ok(),
+                source_name: r.get::<_, String>(11).unwrap_or_default(),
+                plugin_type: r.get::<_, String>(12).unwrap_or_default(),
+            })
+        });
+        match rows { Ok(rs) => rs.filter_map(|r| r.ok()).collect(), Err(_) => Vec::new() }
+    }
+
     pub fn update_source_sync_time(&self, source_id: i64) {
         let conn = self.conn.lock().unwrap();
         let now = now_secs();
@@ -1560,7 +1615,7 @@ impl Database {
 /// One decode at write time in place of one in every reader, which is
 /// the cheap direction — and the only one that does not depend on each
 /// reader remembering the recipe.
-fn decoded_body(content: &str, html: Option<&str>) -> String {
+pub(crate) fn decoded_body(content: &str, html: Option<&str>) -> String {
     mail::body_text(content, html)
 }
 
