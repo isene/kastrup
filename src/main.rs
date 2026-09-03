@@ -1218,6 +1218,8 @@ struct App {
     msg_log: crust::MessageLog,
     /// Plugins with a top-level key of their own (`top:` in the plugin file).
     top_plugins: Vec<(String, String, String)>,
+    /// The alias file, parsed: lowercase key to its full expansion.
+    aliases: HashMap<String, String>,
     last_db_refresh: std::time::Instant,
     /// Last time the periodic stuck-maildir reconcile ran (see the main
     /// loop). Throttles it to ~once every 2 min on the loop's existing
@@ -1476,6 +1478,44 @@ fn ensure_slack_source(db: &Arc<Database>) {
 /// how one gets copied out of a note or a chat, and the bare number is
 /// what is left after trimming it. One parser, so the command line and
 /// the `#` prompt cannot disagree about what counts.
+/// Where the aliases live: the config's `alias_file`, else `~/.kastrup/aliases`.
+fn alias_path(cfg: &Config) -> std::path::PathBuf {
+    if cfg.alias_file.trim().is_empty() {
+        home_dir().join(".kastrup").join("aliases")
+    } else {
+        std::path::PathBuf::from(cfg.alias_file.replace("~/", &format!("{}/", home_dir().display())))
+    }
+}
+
+/// mutt's alias file: `alias KEY value`, where value is an address, a
+/// `Name <address>`, or a comma-separated list of those and of other
+/// keys. Keys are matched case-insensitively. A key that names other
+/// keys expands through them, five levels deep at most, so a typo
+/// loop cannot hang a send.
+fn load_aliases(path: &std::path::Path) -> HashMap<String, String> {
+    let mut raw: HashMap<String, String> = HashMap::new();
+    let Ok(text) = std::fs::read_to_string(path) else { return raw };
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("alias ") else { continue };
+        let mut parts = rest.trim().splitn(2, char::is_whitespace);
+        let (Some(key), Some(val)) = (parts.next(), parts.next()) else { continue };
+        let val = val.trim();
+        if key.is_empty() || val.is_empty() { continue; }
+        raw.insert(key.to_lowercase(), val.to_string());
+    }
+    fn expand(raw: &HashMap<String, String>, val: &str, depth: u8) -> String {
+        val.split(',').map(|t| {
+            let t = t.trim();
+            match raw.get(&t.to_lowercase()) {
+                Some(v) if depth < 5 && !t.contains('@') && !t.contains('<') => expand(raw, v, depth + 1),
+                _ => t.to_string(),
+            }
+        }).filter(|t| !t.is_empty()).collect::<Vec<_>>().join(", ")
+    }
+    raw.keys().map(|k| (k.clone(), expand(&raw, &raw[k], 0))).collect()
+}
+
 fn parse_message_id(s: &str) -> Option<i64> {
     let s = s.trim();
     s.strip_prefix("kastrup:").unwrap_or(s).trim().parse().ok()
@@ -1907,6 +1947,7 @@ fn main() {
         source_errors: Vec::new(),
         msg_log: crust::MessageLog::new(msg_log_cap),
         top_plugins: Vec::new(),
+        aliases: HashMap::new(),
         last_db_refresh: std::time::Instant::now(),
         last_reconcile: std::time::Instant::now(),
         read_sync,
@@ -2040,6 +2081,7 @@ fn main() {
     // Start background poller
     let (poller_tx, poller_rx) = std::sync::mpsc::channel();
     app.top_plugins = app.load_top_plugins();
+    app.aliases = load_aliases(&alias_path(&app.config));
     let poller = poller::Poller::start(app.db.clone(), poller_tx, app.config.push.clone());
     app.poller = Some(poller);
     app.poller_rx = Some(poller_rx);
@@ -6550,6 +6592,7 @@ impl App {
 {}\n\
   /              Search messages (DB content substring, sticky)\n\
   #              Go to message by id (kastrup:7957849 or 7957849)\n\
+  @              Address book: the alias file in your editor (mutt style, groups too)\n\
   S              :search (claude → Filters → message list)\n\
   l              Label message\n\
   s              File/save message\n\
@@ -9856,6 +9899,11 @@ impl App {
             let addr = addr.trim();
             if addr.is_empty() || addr.contains('@') || addr.contains('<') {
                 return addr.to_string();
+            }
+            // An alias key wins over every lookup: it is what the user
+            // wrote down, and a group key becomes its whole list here.
+            if let Some(full) = self.aliases.get(&addr.to_lowercase()) {
+                return full.clone();
             }
             let expanded = self.expand_address_field(addr);
             if expanded != addr {
@@ -13291,88 +13339,30 @@ impl App {
     }
 
     // Batch K: Address Book
+    /// `@`: the address book is a file, mutt style, and the editor is the
+    /// UI for it. Add, remove, regroup; it is re-read when the editor
+    /// closes, and `To: key` expands when a message is sent.
     fn address_book_menu(&mut self) {
-        let tc = self.config.theme_colors.clone();
-        self.set_feedback("Address book: a=Add sender  s=Search  l=List", tc.unread);
-        let Some(key) = Input::getchr(Some(5)) else { self.render_bottom_bar(); return };
-
-        match key.as_str() {
-            "a" => {
-                if let Some(msg) = self.filtered_messages.get(self.index) {
-                    let name = msg.display_name().to_string();
-                    let email = msg.sender.clone();
-                    let conn = self.db.conn.lock().unwrap();
-                    let now = database::now_secs();
-                    // created_at and updated_at are NOT NULL, so the insert
-                    // without them failed and the "Added" line lied. One row
-                    // per address: an address already there gets its name
-                    // and last_contact refreshed instead.
-                    let exists: bool = conn.query_row(
-                        "SELECT 1 FROM contacts WHERE primary_email = ?1", rusqlite::params![email], |_| Ok(true)).unwrap_or(false);
-                    let _ = if exists {
-                        conn.execute("UPDATE contacts SET name = ?1, last_contact = ?2, updated_at = ?2 WHERE primary_email = ?3",
-                            rusqlite::params![name, now, email])
-                    } else {
-                        conn.execute("INSERT INTO contacts (name, primary_email, message_count, last_contact, created_at, updated_at) VALUES (?1, ?2, 1, ?3, ?3, ?3)",
-                            rusqlite::params![name, email, now])
-                    };
-                    drop(conn);
-                    self.set_feedback(&format!("Added: {} <{}>", name, email), tc.feedback_ok);
-                }
-            }
-            "s" => {
-                let query = self.prompt("Search contacts: ", "");
-                if query.is_empty() { return; }
-                let conn = self.db.conn.lock().unwrap();
-                let mut stmt = conn.prepare(
-                    "SELECT name, primary_email FROM contacts WHERE name LIKE ? OR primary_email LIKE ? ORDER BY name LIMIT 50"
-                ).unwrap();
-                let like = format!("%{}%", query);
-                let results: Vec<String> = stmt.query_map(rusqlite::params![&like, &like], |r| {
-                    let name: String = r.get(0)?;
-                    let email: String = r.get(1)?;
-                    Ok(format!("{} <{}>", name, email))
-                }).unwrap().filter_map(|r| r.ok()).collect();
-                drop(stmt);
-                drop(conn);
-
-                if results.is_empty() {
-                    self.set_feedback("No contacts found", tc.feedback_info);
-                } else {
-                    self.right.set_text(&format!("{}\n\n{}",
-                        style::bold(&style::fg("Contacts", tc.view_custom)),
-                        results.join("\n")));
-                    self.right.ix = 0;
-                    self.right.full_refresh();
-                    if self.right.border { self.right.border_refresh(); }
-                }
-            }
-            "l" => {
-                let conn = self.db.conn.lock().unwrap();
-                let mut stmt = conn.prepare("SELECT name, primary_email FROM contacts ORDER BY name LIMIT 100").unwrap();
-                let results: Vec<String> = stmt.query_map([], |r| {
-                    let name: String = r.get(0)?;
-                    let email: String = r.get(1)?;
-                    Ok(format!("{} <{}>", name, email))
-                }).unwrap().filter_map(|r| r.ok()).collect();
-                drop(stmt);
-                drop(conn);
-                self.right.set_text(&format!("{}\n\n{}",
-                    style::bold(&style::fg("All Contacts", tc.view_custom)),
-                    if results.is_empty() { "(none)".to_string() } else { results.join("\n") }));
-                self.right.ix = 0;
-                self.right.full_refresh();
-                if self.right.border { self.right.border_refresh(); }
-            }
-            _ => { self.render_bottom_bar(); }
+        let path = alias_path(&self.config);
+        if !path.exists() {
+            let _ = std::fs::write(&path,
+                "# kastrup aliases, mutt style: alias KEY Name <address>\n\
+                 # A group is a KEY whose value lists addresses or other keys, comma-separated.\n\n");
         }
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".into());
+        Crust::cleanup();
+        Crust::clear_screen();
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let _ = std::process::Command::new("sh").arg("-c")
+            .arg(&format!("{} {}", editor, crust::shell_escape(&path.to_string_lossy())))
+            .status();
+        Crust::init();
+        Crust::clear_screen();
+        self.handle_resize();
+        self.aliases = load_aliases(&path);
+        self.set_feedback(&format!("{} aliases", self.aliases.len()), self.config.theme_colors.feedback_ok);
     }
 
-    /// Read Tock's calendar list and let the user pick one. Returns the
-    /// chosen calendar id (Enter on empty input = the configured
-    /// default), or None if the user cancels with ESC. Returns Some(1)
-    /// silently when Tock's DB or config can't be read so Z still
-    /// works in fresh installs.
     fn pick_tock_calendar(&mut self, tock_home: &std::path::Path) -> Option<i64> {
         // Calendars from tock.db
         let db_path = tock_home.join("tock.db");
@@ -15679,5 +15669,25 @@ mod reply_to_header_tests {
     fn reply_to_is_case_insensitive_and_optional() {
         assert_eq!(parse_chat_reply_to("Conv: x\nreply-to:  abc \n\nhi").as_deref(), Some("abc"));
         assert_eq!(parse_chat_reply_to("Conv: x\n\nhi"), None);
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::load_aliases;
+
+    #[test]
+    fn keys_expand_and_groups_follow_keys() {
+        let dir = std::env::temp_dir().join(format!("kastrup-aliases-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("aliases");
+        std::fs::write(&f, "# comment\nalias jakob  Jakob Treland <jakob@example.com>\nalias jorn Jørn <jorn@example.com>\n\
+                            alias infra  jakob, jorn, extra@example.com\nalias loop1 loop2\nalias loop2 loop1\n").unwrap();
+        let a = load_aliases(&f);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(a["jakob"], "Jakob Treland <jakob@example.com>");
+        assert_eq!(a["infra"], "Jakob Treland <jakob@example.com>, Jørn <jorn@example.com>, extra@example.com");
+        assert!(a.get("JAKOB").is_none(), "keys are stored lowercase; lookups lowercase the query");
+        assert!(a["loop1"].len() < 40, "a key loop ends, it does not hang: {}", a["loop1"]);
     }
 }

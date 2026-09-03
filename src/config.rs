@@ -217,6 +217,9 @@ pub struct Config {
     pub default_email: String,
     pub smtp_command: String,
     pub confirm_purge: bool,
+    /// The mutt-style alias file `@` opens and sending expands. Default
+    /// `~/.kastrup/aliases`.
+    pub alias_file: String,
     /// How many status lines to keep so a missed one can still be read.
     pub message_log: usize,
     /// Folder shared with the phone (Syncthing), holding one
@@ -280,6 +283,7 @@ impl Default for Config {
             default_email: String::new(),
             smtp_command: String::new(),
             confirm_purge: false,
+            alias_file: String::new(),
             message_log: 10,
             read_sync_dir: String::new(),
             read_sync_days: 60,
@@ -444,6 +448,9 @@ impl Config {
             }
             if let Some(v) = ui.get("confirm_purge").and_then(|v| v.as_bool()) {
                 self.confirm_purge = v;
+            }
+            if let Some(v) = ui.get("alias_file").and_then(|v| v.as_str()) {
+                self.alias_file = v.to_string();
             }
             if let Some(v) = ui.get("message_log").and_then(|v| v.as_u64()) {
                 self.message_log = v as usize;
