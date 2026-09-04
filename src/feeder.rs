@@ -46,13 +46,26 @@ fn record(r: &crate::database::PushRow) -> serde_json::Value {
         "container": container,
         "title": r.subject.clone().unwrap_or_default(),
         "author": author,
-        "recipients": r.recipients.clone().unwrap_or_default(),
+        "recipients": recipients(r),
         "body": r.body,
         "occurred_at": iso8601_utc(r.timestamp),
         "thread_id": r.thread_id.clone().unwrap_or_default(),
         "url": ext,
         "attributes": attributes(r),
     })
+}
+
+/// Who the message went to. The column holds a JSON array for every
+/// chat source, so sending it as text made the indexer read the whole
+/// `["Ada Lovelace"]` as one person's name. A real list goes as a list;
+/// anything that is not JSON goes as the plain string it is.
+fn recipients(r: &crate::database::PushRow) -> serde_json::Value {
+    let raw = r.recipients.as_deref().unwrap_or("").trim();
+    if raw.is_empty() { return serde_json::Value::String(String::new()); }
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(v @ serde_json::Value::Array(_)) => v,
+        _ => serde_json::Value::String(raw.to_string()),
+    }
 }
 
 /// What the row is, and the ids an answer would need: the conversation
