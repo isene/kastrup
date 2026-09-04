@@ -491,8 +491,7 @@ impl Config {
             let get = |k: &str| p.get(serde_yaml::Value::String(k.into()))
                 .and_then(|v| v.as_str()).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
             if let (Some(url), Some(connector), Some(key_file)) = (get("url"), get("connector"), get("key_file")) {
-                self.push = Some(crate::feeder::PushConfig {
-                    url, connector, key_file, from: self.default_email.clone() });
+                self.push = Some(crate::feeder::PushConfig { url, connector, key_file });
             }
         }
 
