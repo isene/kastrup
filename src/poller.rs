@@ -7,8 +7,6 @@ use crate::sources;
 
 pub enum PollerEvent {
     NewMessages(usize),
-    /// Approved replies the indexer handed back, now draft files.
-    Drafts(usize),
 }
 
 /// Hard wall-clock deadline for a single network source's sync. A healthy
@@ -326,11 +324,7 @@ fn poller_loop(
         // One POST per cycle, and only a cycle that inserted non-mail
         // rows. Idle cycles never reach this line.
         if new_non_mail {
-            if let Some(cfg) = &push {
-                if let Some((_, _, drafts)) = crate::feeder::push_new(&db, cfg) {
-                    if drafts > 0 { let _ = tx.send(PollerEvent::Drafts(drafts)); }
-                }
-            }
+            if let Some(cfg) = &push { crate::feeder::push_new(&db, cfg); }
         }
 
         // Park until 10s elapse, inotify nudges Wake, or stop is

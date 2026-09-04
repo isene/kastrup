@@ -68,6 +68,8 @@ pub struct View {
 /// One row as the push feeder reads it.
 pub struct PushRow {
     pub id: i64,
+    pub external_id: String,
+    pub metadata: serde_json::Value,
     pub sender: String,
     pub sender_name: Option<String>,
     pub recipients: Option<String>,
@@ -1568,25 +1570,12 @@ impl Database {
     /// Non-mail rows newer than `after`, oldest first, at most `limit`,
     /// with the body decoded the way the search index has it. What the
     /// push feeder sends.
-    /// The newest message from `who` (address or name, substring) on a
-    /// source of `plugin_type`; where a new message to that person goes.
-    pub fn latest_message_from(&self, who: &str, plugin_type: &str) -> Option<i64> {
-        let conn = self.read();
-        conn.query_row(
-            "SELECT m.id FROM messages m JOIN sources s ON s.id = m.source_id \
-             WHERE s.plugin_type = ?1 AND (m.sender LIKE ?2 OR m.sender_name LIKE ?2) \
-             ORDER BY m.timestamp DESC LIMIT 1",
-            params![plugin_type, format!("%{}%", who)],
-            |r| r.get(0),
-        ).ok()
-    }
-
     pub fn rows_after(&self, after: i64, limit: usize) -> Vec<PushRow> {
         let conn = self.read();
         let mut stmt = match conn.prepare(
             "SELECT m.id, m.sender, m.sender_name, m.recipients, m.subject, \
                     m.content, m.html_content, m.content_text, m.timestamp, m.thread_id, \
-                    m.folder, s.name, s.plugin_type \
+                    m.folder, s.name, s.plugin_type, m.external_id, m.metadata \
              FROM messages m JOIN sources s ON s.id = m.source_id \
              WHERE m.id > ? AND s.plugin_type != 'maildir' \
              ORDER BY m.id LIMIT ?"
@@ -1597,6 +1586,10 @@ impl Database {
             let text: Option<String> = r.get(7).ok();
             Ok(PushRow {
                 id: r.get(0)?,
+                external_id: r.get::<_, String>(13).unwrap_or_default(),
+                metadata: r.get::<_, String>(14).ok()
+                    .and_then(|m| serde_json::from_str(&m).ok())
+                    .unwrap_or(serde_json::Value::Null),
                 sender: r.get::<_, String>(1).unwrap_or_default(),
                 sender_name: r.get(2).ok(),
                 recipients: r.get(3).ok(),
