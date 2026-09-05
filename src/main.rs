@@ -112,6 +112,10 @@ struct QueuedSend {
     reply_id: Option<i64>,
     attachment_count: Option<usize>,
     compose_draft: String,
+    /// The `postponed` row holding this message. Deleted when the wire
+    /// confirms the send, kept on failure, and left alone if kastrup
+    /// dies first, which is the point.
+    postponed_id: Option<i64>,
 }
 
 struct PendingSend {
@@ -133,6 +137,8 @@ struct PendingSend {
     /// the success toast for the attach path. `None` keeps the plain
     /// "Sent to X" wording.
     attachment_count: Option<usize>,
+    /// See `QueuedSend::postponed_id`.
+    postponed_id: Option<i64>,
     /// The compose-format draft (From/To/Cc/Bcc/Reply-To/Subject + body),
     /// NOT the assembled RFC. On send failure this is re-filed into the
     /// `postponed` table so the draft survives (VPN down, SMTP
@@ -163,6 +169,7 @@ struct ComposeTarget {
 
 // --- Draft drop / recall ---
 
+#[derive(Clone)]
 enum DraftSource {
     Postponed(i64),
     File(std::path::PathBuf),
@@ -1347,6 +1354,13 @@ struct App {
     /// Sends made while another was on the wire, oldest first. Drained
     /// by `pump_pending_send` as each transaction finishes.
     send_queue: std::collections::VecDeque<QueuedSend>,
+    /// The `postponed` row holding the email being composed right now.
+    /// Written the first time the editor hands the text back and kept
+    /// until the send is confirmed, so a force quit, a closed terminal
+    /// or a power cut leaves the message in the `m` picker rather than
+    /// nowhere. Cleared when the user cancels, which is a decision, and
+    /// deleted when the wire says the mail went.
+    draft_row: Option<i64>,
     /// Earliest `scheduled.send_at`, cached so the idle loop costs one
     /// integer compare instead of a query per wake. `None` = nothing
     /// scheduled. Refreshed whenever the table changes.
@@ -2011,6 +2025,7 @@ fn main() {
         pending_reply_id: None,
         pending_send: None,
         send_queue: std::collections::VecDeque::new(),
+        draft_row: None,
         next_send_at: None,
         last_sched_check: 0,
         compose_source_type: None,
@@ -9125,9 +9140,16 @@ impl App {
             let rows = stmt.query_map([], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
             });
+            // A draft whose send is on the wire or waiting behind one is
+            // still in `postponed` on purpose. Hide it, or recalling it
+            // would send the same mail twice.
+            let in_flight: Vec<i64> = self.pending_send.iter().filter_map(|p| p.postponed_id)
+                .chain(self.send_queue.iter().filter_map(|q| q.postponed_id))
+                .collect();
             if let Ok(rows) = rows {
                 for row in rows.flatten() {
                     let (id, data, ts) = row;
+                    if in_flight.contains(&id) { continue; }
                     let kind = DraftKind::Email;
                     let (subject, body_preview) = parse_draft_preview(&data, kind);
                     out.push(DraftCandidate {
@@ -9321,19 +9343,26 @@ impl App {
     }
 
     /// Drop a draft from its backing store after the user loads it.
-    fn consume_draft(&self, source: &DraftSource) {
+    /// Take a draft out of the picker and into the compose. An email
+    /// keeps a durable copy the whole way: the `postponed` row it came
+    /// from is held, and a drop-file or scheduled row becomes one. It is
+    /// deleted when the send is confirmed, not before, so nothing is
+    /// lost between here and the wire. Chat drafts send inline in one
+    /// step and keep the old behaviour; the `postponed` table is
+    /// email-shaped and would lose their kind.
+    fn consume_draft(&mut self, source: &DraftSource, data: &str, kind: DraftKind) {
+        let email = kind == DraftKind::Email;
         match source {
             DraftSource::Postponed(id) => {
-                let conn = self.db.conn.lock().unwrap();
-                let _ = conn.execute(
-                    "DELETE FROM postponed WHERE id = ?",
-                    rusqlite::params![id],
-                );
+                if email { self.draft_row = Some(*id); return; }
+                self.delete_postponed(*id);
             }
             DraftSource::File(path) => {
+                if email { self.save_draft_row(data); }
                 let _ = std::fs::remove_file(path);
             }
             DraftSource::Scheduled(id) => {
+                if email { self.save_draft_row(data); }
                 let conn = self.db.conn.lock().unwrap();
                 let _ = conn.execute(
                     "DELETE FROM scheduled WHERE id = ?",
@@ -9341,6 +9370,51 @@ impl App {
                 );
             }
         }
+    }
+
+    /// Throw a draft away. What `d` in the picker does, and the only
+    /// path that still deletes without a send behind it.
+    fn delete_draft(&self, source: &DraftSource) {
+        match source {
+            DraftSource::Postponed(id) => self.delete_postponed(*id),
+            DraftSource::File(path) => { let _ = std::fs::remove_file(path); }
+            DraftSource::Scheduled(id) => {
+                let conn = self.db.conn.lock().unwrap();
+                let _ = conn.execute("DELETE FROM scheduled WHERE id = ?", rusqlite::params![id]);
+            }
+        }
+    }
+
+    /// Write the message being composed to the `postponed` table, or
+    /// update the row already holding it.
+    fn save_draft_row(&mut self, data: &str) {
+        let now = database::now_secs();
+        let id = self.draft_row;
+        let new_id = {
+            let conn = self.db.conn.lock().unwrap();
+            match id {
+                Some(id) => {
+                    let _ = conn.execute(
+                        "UPDATE postponed SET data = ?, created_at = ? WHERE id = ?",
+                        rusqlite::params![data, now, id]);
+                    None
+                }
+                None => conn.execute(
+                    "INSERT INTO postponed (data, created_at) VALUES (?, ?)",
+                    rusqlite::params![data, now]).ok().map(|_| conn.last_insert_rowid()),
+            }
+        };
+        if new_id.is_some() { self.draft_row = new_id; }
+    }
+
+    fn delete_postponed(&self, id: i64) {
+        let conn = self.db.conn.lock().unwrap();
+        let _ = conn.execute("DELETE FROM postponed WHERE id = ?", rusqlite::params![id]);
+    }
+
+    /// The user said no. A decision, unlike a crash, so the copy goes.
+    fn drop_draft_row(&mut self) {
+        if let Some(id) = self.draft_row.take() { self.delete_postponed(id); }
     }
 
     /// Render the draft picker into the right pane. Pure draw.
@@ -9432,7 +9506,7 @@ impl App {
                     };
                     if let Some(i) = idx {
                         if i < list.len() {
-                            self.consume_draft(&list[i].source);
+                            self.delete_draft(&list[i].source);
                             list.remove(i);
                             if list.is_empty() { return DraftPick::New; }
                             self.render_draft_picker(&list);
@@ -9493,10 +9567,10 @@ impl App {
                 DraftPick::Load(i) => {
                     let c = &candidates[i];
                     log::info("recall: draft picked, consuming");
-                    self.consume_draft(&c.source);
-                    log::info("recall: draft consumed");
+                    let (source, kind) = (c.source.clone(), c.kind);
                     let mut data = c.data.clone();
-                    let kind = c.kind;
+                    self.consume_draft(&source, &data, kind);
+                    log::info("recall: draft consumed");
                     // X-Kastrup-Reply-To / X-Kastrup-Forward-Of pseudo-
                     // headers let a drop-file draft (e.g. from a Claude
                     // session) link back to the original message, so the
@@ -10687,7 +10761,14 @@ impl App {
                         // and disappears — leaving the user thinking
                         // "nothing happened" after Enter.
                         let mut last_send_error: Option<String> = None;
+                        // What the durable copy holds. The text is written
+                        // when it changes, not on every keypress.
+                        let mut saved = String::new();
                         loop {
+                            if self.compose_kind == DraftKind::Email && final_content != saved {
+                                self.save_draft_row(&final_content);
+                                saved = final_content.clone();
+                            }
                             // Show message summary in right pane
                             self.show_compose_review(&final_content, &attachments);
                             if let Some(ref err) = last_send_error {
@@ -10921,6 +11002,8 @@ impl App {
                                             }
                                             let kind = self.compose_kind;
                                             self.schedule_draft(kind, &final_content, at);
+                                            // It is durable in `scheduled` now.
+                                            self.drop_draft_row();
                                             break;
                                         }
                                         None => {
@@ -10962,10 +11045,10 @@ impl App {
                                             }
                                         }
                                         DraftKind::Email => {
-                                            let conn = self.db.conn.lock().unwrap();
-                                            let _ = conn.execute("INSERT INTO postponed (data, created_at) VALUES (?, ?)",
-                                                rusqlite::params![content, now]);
-                                            drop(conn);
+                                            // The compose already keeps a row; postponing
+                                            // is just letting go of it with the final text.
+                                            self.save_draft_row(&content);
+                                            self.draft_row = None;
                                             self.set_feedback("Message postponed", tc.feedback_ok);
                                         }
                                     }
@@ -11008,6 +11091,7 @@ impl App {
                                     continue;
                                 }
                                 "ESC" => {
+                                    self.drop_draft_row();
                                     self.set_feedback("Cancelled", tc.feedback_info);
                                     break;
                                 }
@@ -11133,6 +11217,7 @@ impl App {
         self.send_queue.push_back(QueuedSend {
             from_email, recipients, to_display, tmpfile, rfc_msg, smtp_spec,
             forward_ids, reply_id, attachment_count, compose_draft,
+            postponed_id: self.draft_row.take(),
         });
         self.start_next_send();
     }
@@ -11167,6 +11252,7 @@ impl App {
             reply_id: q.reply_id,
             attachment_count: q.attachment_count,
             compose_draft: q.compose_draft,
+            postponed_id: q.postponed_id,
         });
         // Persistent "Sending..." badge in the top bar — survives any
         // bottom-bar feedback the user might trigger while the send is
@@ -11202,6 +11288,9 @@ impl App {
             Ok(()) => {
                 self.save_to_sent(&ps.rfc_msg);
                 let _ = std::fs::remove_file(&ps.tmpfile);
+                // The wire said it went. Now, and not before, the draft
+                // stops existing.
+                if let Some(id) = ps.postponed_id { self.delete_postponed(id); }
                 log::info(&format!("SMTP sent OK to {}", ps.to_display));
                 let toast = if let Some(n) = ps.attachment_count {
                     format!("Sent to {} ({} attachment(s))", ps.to_display, n)
@@ -11233,7 +11322,9 @@ impl App {
                 // The compose-format text is used (NOT rfc_msg / tmpfile,
                 // which hold assembled MIME that won't round-trip).
                 log::info(&format!("SMTP send failed for {}: {}", ps.to_display, msg));
-                let saved = if !ps.compose_draft.trim().is_empty() {
+                let saved = if ps.postponed_id.is_some() {
+                    true                      // already on disk since the compose
+                } else if !ps.compose_draft.trim().is_empty() {
                     let now = database::now_secs();
                     let conn = self.db.conn.lock().unwrap();
                     let ok = conn.execute(
