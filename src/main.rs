@@ -97,6 +97,23 @@ use mail::mime::{
 /// it exits; main thread picks the result up in `pump_pending_send`
 /// and finishes the transaction (sent-folder copy, tempfile cleanup,
 /// reply / forward flag updates, feedback toast).
+/// A send waiting its turn. One SMTP transaction runs at a time, so a
+/// second send made while the first is on the wire waits here instead of
+/// being refused. A refusal used to lose the message: the drop-file
+/// draft was consumed on load and only the failure path re-filed it.
+struct QueuedSend {
+    from_email: String,
+    recipients: Vec<String>,
+    to_display: String,
+    tmpfile: String,
+    rfc_msg: String,
+    smtp_spec: String,
+    forward_ids: Vec<i64>,
+    reply_id: Option<i64>,
+    attachment_count: Option<usize>,
+    compose_draft: String,
+}
+
 struct PendingSend {
     result_rx: std::sync::mpsc::Receiver<SendOutcome>,
     /// "To: …" display string for the toast.
@@ -1327,6 +1344,9 @@ struct App {
     /// We only allow one at a time — UI feedback when a second
     /// attempt starts before the first completes.
     pending_send: Option<PendingSend>,
+    /// Sends made while another was on the wire, oldest first. Drained
+    /// by `pump_pending_send` as each transaction finishes.
+    send_queue: std::collections::VecDeque<QueuedSend>,
     /// Earliest `scheduled.send_at`, cached so the idle loop costs one
     /// integer compare instead of a query per wake. `None` = nothing
     /// scheduled. Refreshed whenever the table changes.
@@ -1990,6 +2010,7 @@ fn main() {
         pending_forward_attachments: Vec::new(),
         pending_reply_id: None,
         pending_send: None,
+        send_queue: std::collections::VecDeque::new(),
         next_send_at: None,
         last_sched_check: 0,
         compose_source_type: None,
@@ -2147,7 +2168,7 @@ fn main() {
         // succeeding). Otherwise sleep longer. New-mail toasts and DB
         // refreshes lag by up to this many seconds, which is fine for
         // a background-poll inbox.
-        let timeout_secs: u64 = if app.feedback_expires.is_some() || app.pending_send.is_some() || !app.content_loading.is_empty() { 1 } else { 10 };
+        let timeout_secs: u64 = if app.feedback_expires.is_some() || app.sends_outstanding() > 0 || !app.content_loading.is_empty() { 1 } else { 10 };
         let key = Input::getchr(Some(timeout_secs));
 
         // Resume watchdog. Battery-free: one vDSO clock read per turn, no new
@@ -2600,7 +2621,7 @@ impl App {
             // confirmation prompt — the user gets a clear toast naming
             // what's still running.
             "q" => {
-                if self.pending_send.is_some() {
+                if self.sends_outstanding() > 0 {
                     self.set_feedback(
                         "A send is still in flight — wait for it to finish, or press Q to force-quit",
                         self.config.theme_colors.feedback_warn,
@@ -2860,7 +2881,9 @@ impl App {
                 who = who.chars().take(28).collect::<String>();
                 who.push_str("\u{2026}");
             }
-            style::fg(&format!("  \u{2191} Sending to {}\u{2026}", who), tc.feedback_warn)
+            let waiting = self.send_queue.len();
+            let tail = if waiting > 0 { format!(" (+{} waiting)", waiting) } else { String::new() };
+            style::fg(&format!("  \u{2191} Sending to {}\u{2026}{}", who, tail), tc.feedback_warn)
         } else {
             String::new()
         };
@@ -9248,8 +9271,8 @@ impl App {
         // interactive path uses; the chat kinds send inline and report.
         let outcome: Result<String, String> = match kind {
             DraftKind::Email => {
-                if self.pending_send.is_some() {
-                    return; // a send is already in flight; try again next wake
+                if self.sends_outstanding() > 0 {
+                    return; // a send is already on the wire; try again next wake
                 }
                 let (data, atts) = take_email_attach_headers(&data);
                 let atts: Vec<String> = atts.into_iter()
@@ -11090,9 +11113,10 @@ impl App {
     /// value): `smtp://host:port` → native plain relay, anything else
     /// → Gmail XOAUTH2. Both paths live in `src/email_send.rs`.
     ///
-    /// Returns `true` when the send was queued; `false` if another
-    /// send is already in flight (caller should leave the tempfile
-    /// alone and surface a "busy" toast).
+    /// Every send is accepted. One goes on the wire at a time; the rest
+    /// wait in `send_queue` and leave as each finishes. Press send and
+    /// it goes, which is the model the user already has.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_smtp_send(
         &mut self,
         from_email: String,
@@ -11105,16 +11129,24 @@ impl App {
         reply_id: Option<i64>,
         attachment_count: Option<usize>,
         compose_draft: String,
-    ) -> bool {
-        if self.pending_send.is_some() {
-            self.set_feedback(
-                "Another send is already in flight — wait for it to finish",
-                self.config.theme_colors.feedback_warn,
-            );
-            return false;
-        }
+    ) {
+        self.send_queue.push_back(QueuedSend {
+            from_email, recipients, to_display, tmpfile, rfc_msg, smtp_spec,
+            forward_ids, reply_id, attachment_count, compose_draft,
+        });
+        self.start_next_send();
+    }
+
+    /// Put the oldest waiting send on the wire, if the wire is free.
+    fn start_next_send(&mut self) {
+        if self.pending_send.is_some() { return; }
+        let Some(q) = self.send_queue.pop_front() else { return; };
+        let waiting = self.send_queue.len();
+        log::info(&format!("SMTP sending to {}{}", q.to_display,
+            if waiting > 0 { format!(" ({} waiting behind it)", waiting) } else { String::new() }));
         let (tx, rx) = std::sync::mpsc::channel::<SendOutcome>();
-        let worker_rfc = rfc_msg.clone();
+        let worker_rfc = q.rfc_msg.clone();
+        let (from_email, recipients, smtp_spec) = (q.from_email, q.recipients, q.smtp_spec);
         std::thread::spawn(move || {
             let safedir = email_send::default_safedir();
             let transport = email_send::transport_for(&smtp_spec);
@@ -11128,20 +11160,25 @@ impl App {
         });
         self.pending_send = Some(PendingSend {
             result_rx: rx,
-            to_display: to_display.clone(),
-            tmpfile,
-            rfc_msg,
-            forward_ids,
-            reply_id,
-            attachment_count,
-            compose_draft,
+            to_display: q.to_display,
+            tmpfile: q.tmpfile,
+            rfc_msg: q.rfc_msg,
+            forward_ids: q.forward_ids,
+            reply_id: q.reply_id,
+            attachment_count: q.attachment_count,
+            compose_draft: q.compose_draft,
         });
         // Persistent "Sending..." badge in the top bar — survives any
         // bottom-bar feedback the user might trigger while the send is
         // in flight. Render now so it appears the instant the worker
         // starts (the worker thread itself doesn't touch the UI).
         self.render_top_bar();
-        true
+    }
+
+    /// Sends not yet confirmed on the wire: the one in flight plus any
+    /// waiting behind it.
+    fn sends_outstanding(&self) -> usize {
+        usize::from(self.pending_send.is_some()) + self.send_queue.len()
     }
 
     /// Check whether the pending SMTP send has finished. Called from
@@ -11221,8 +11258,9 @@ impl App {
                 self.set_feedback_sticky(&note, 196);
             }
         }
-        // Clear the in-flight badge from the top bar.
-        self.render_top_bar();
+        // Next one straight onto the wire; it repaints the badge itself.
+        self.start_next_send();
+        if self.pending_send.is_none() { self.render_top_bar(); }
     }
 
     fn handle_composed_message_with_attachments(&mut self, content: &str, attachments: &[String]) {
@@ -11315,7 +11353,7 @@ impl App {
             } else { addr.to_string() };
             if email.contains('@') { recipients.push(email); }
         }
-        log::info(&format!("SMTP (with attachments): {} -> {} ({} att)", from_email, recipients.join(", "), attachments.len()));
+        log::info(&format!("SMTP accepted (with attachments): {} -> {} ({} att)", from_email, recipients.join(", "), attachments.len()));
         // Hand off to the worker thread — native SMTP; main loop stays
         // interactive while the worker does the transport (oauth +
         // TLS for Gmail, or a plain relay connect for smtp:// specs).
@@ -11433,7 +11471,7 @@ impl App {
             } else { addr.to_string() };
             if email.contains('@') { recipients.push(email); }
         }
-        log::info(&format!("SMTP: {} -> {}", from_email, recipients.join(", ")));
+        log::info(&format!("SMTP accepted: {} -> {}", from_email, recipients.join(", ")));
         let forward_ids = std::mem::take(&mut self.pending_forward_ids);
         let reply_id = self.pending_reply_id.take()
             .or_else(|| self.infer_reply_target(&subject, &to, &cc));
@@ -13118,7 +13156,7 @@ impl App {
             "triage" => { self.show_triage_history(); }
             "views" => { self.show_views_screen(); }
             "q" | "quit" => {
-                if self.pending_send.is_some() {
+                if self.sends_outstanding() > 0 {
                     self.set_feedback(
                         "A send is still in flight — :Q to force-quit, or wait",
                         self.config.theme_colors.feedback_warn,
