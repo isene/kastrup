@@ -412,10 +412,13 @@ fn thread_link(msg: &Message) -> (Option<String>, Option<String>) {
 /// at one extra indent level. A message whose parent isn't in this
 /// section becomes a root at depth 0.
 ///
-/// Mail roots come out newest-first, which is the order a mail section
-/// has always had. A chat channel keeps the order it was handed, so a
-/// channel with no replies in it looks exactly as it did.
-fn build_thread_order(messages: &[Message], section_indices: &[usize]) -> Vec<(usize, u8)> {
+/// With `one_root` (a mail conversation, keyed on subject) every root
+/// after the oldest hangs under it at depth 1, in time order: a
+/// calendar update or a resend carries no In-Reply-To but belongs to
+/// the same conversation, and the fold row should be the first mail.
+/// Otherwise mail roots come out newest-first, and a chat channel keeps
+/// the order it was handed, so a channel with no replies looks as it did.
+fn build_thread_order(messages: &[Message], section_indices: &[usize], one_root: bool) -> Vec<(usize, u8)> {
     use std::collections::HashMap;
     let mut by_id: HashMap<String, usize> = HashMap::new();
     let mut is_mail = false;
@@ -434,6 +437,11 @@ fn build_thread_order(messages: &[Message], section_indices: &[usize]) -> Vec<(u
             }
             _ => roots.push(i),
         }
+    }
+    if one_root && roots.len() > 1 {
+        roots.sort_by(|&a, &b| messages[a].timestamp.cmp(&messages[b].timestamp));
+        let rest = roots.split_off(1);
+        children.entry(roots[0]).or_default().extend(rest);
     }
     // Oldest reply first under its parent: natural reading order.
     for kids in children.values_mut() {
@@ -4999,7 +5007,7 @@ impl App {
             // The conversation's top message IS the row, it carries the
             // fold arrow and the count, and the replies indent beneath it.
             if section.section_type == "thread" {
-                let ordered = build_thread_order(&self.filtered_messages, &section.messages);
+                let ordered = build_thread_order(&self.filtered_messages, &section.messages, true);
                 let total = section.messages.len();
                 for (n, (idx, depth)) in ordered.into_iter().enumerate() {
                     if n > 0 && is_collapsed { break; }
@@ -5054,7 +5062,7 @@ impl App {
                 // started writing `reply_to`. A channel with nothing to
                 // nest keeps its order untouched (see build_thread_order).
                 let ordered: Vec<(usize, u8)> =
-                    build_thread_order(&self.filtered_messages, &section.messages);
+                    build_thread_order(&self.filtered_messages, &section.messages, false);
 
                 for (idx, depth) in ordered {
                     let row = self.display_row(idx, depth);
@@ -15444,7 +15452,7 @@ mod fold_tests {
             mail(3, "r2", Some("r1"), 300),
             mail(4, "r3", Some("root"), 250),
         ];
-        let order = build_thread_order(&msgs, &[0, 1, 2, 3]);
+        let order = build_thread_order(&msgs, &[0, 1, 2, 3], true);
         let ids: Vec<i64> = order.iter().map(|&(i, _)| msgs[i].id).collect();
         let depths: Vec<u8> = order.iter().map(|&(_, d)| d).collect();
         assert_eq!(ids, vec![1, 2, 3, 4], "root first, then replies in order");
@@ -15469,15 +15477,34 @@ mod fold_tests {
             chat(3, "a1", Some("a"), 200),
             chat(4, "a2", Some("a"), 250),
         ];
-        let order = build_thread_order(&msgs, &[0, 1, 2, 3]);
+        let order = build_thread_order(&msgs, &[0, 1, 2, 3], false);
         let ids: Vec<i64> = order.iter().map(|&(i, _)| msgs[i].id).collect();
         let depths: Vec<u8> = order.iter().map(|&(_, d)| d).collect();
         assert_eq!(ids, vec![1, 2, 3, 4]);
         assert_eq!(depths, vec![0, 0, 1, 1]);
 
         let flat = vec![chat(1, "x", None, 300), chat(2, "y", None, 100)];
-        let order = build_thread_order(&flat, &[0, 1]);
+        let order = build_thread_order(&flat, &[0, 1], false);
         assert_eq!(order, vec![(0, 0), (1, 0)], "no replies: order as handed");
+    }
+
+    /// Two invites with the same subject and no In-Reply-To (an Outlook
+    /// calendar update) still form one conversation: the older mail is
+    /// the root and the update hangs under it. A linked reply and an
+    /// orphan share the root in time order.
+    #[test]
+    fn mail_without_reply_headers_hangs_under_the_oldest() {
+        let msgs = vec![mail(1, "update", None, 300), mail(2, "invite", None, 100)];
+        let order = build_thread_order(&msgs, &[0, 1], true);
+        assert_eq!(order, vec![(1, 0), (0, 1)]);
+
+        let msgs = vec![
+            mail(1, "root", None, 100),
+            mail(2, "orphan", None, 300),
+            mail(3, "r1", Some("root"), 200),
+        ];
+        let order = build_thread_order(&msgs, &[0, 1, 2], true);
+        assert_eq!(order, vec![(0, 0), (2, 1), (1, 1)]);
     }
 }
 
