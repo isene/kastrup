@@ -412,20 +412,26 @@ fn thread_link(msg: &Message) -> (Option<String>, Option<String>) {
 /// at one extra indent level. A message whose parent isn't in this
 /// section becomes a root at depth 0.
 ///
-/// With `one_root` (a mail conversation, keyed on subject) every root
-/// after the oldest hangs under it at depth 1, in time order: a
-/// calendar update or a resend carries no In-Reply-To but belongs to
-/// the same conversation, and the fold row should be the first mail.
-/// Otherwise mail roots come out newest-first, and a chat channel keeps
-/// the order it was handed, so a channel with no replies looks as it did.
-fn build_thread_order(messages: &[Message], section_indices: &[usize], one_root: bool) -> Vec<(usize, u8)> {
+/// A mail with no In-Reply-To hangs under the oldest mail with the same
+/// subject (Re:/Fwd: stripped), at depth 1 in time order: a calendar
+/// update or a copy delivered to two addresses belongs to that
+/// conversation. In a conversation section this leaves one root, so
+/// the first mail carries the fold; in a folder section each subject
+/// becomes its own little tree.
+///
+/// Mail roots come out newest-first, which is the order a mail section
+/// has always had. A chat channel keeps the order it was handed, so a
+/// channel with no replies in it looks exactly as it did.
+fn build_thread_order(messages: &[Message], section_indices: &[usize]) -> Vec<(usize, u8)> {
     use std::collections::HashMap;
+    let is_email = |i: usize| matches!(messages[i].source_type.as_str(),
+        "email" | "maildir" | "imap" | "gmail");
     let mut by_id: HashMap<String, usize> = HashMap::new();
     let mut is_mail = false;
     for &i in section_indices {
         let (own, _) = thread_link(&messages[i]);
         if let Some(id) = own { by_id.insert(id, i); }
-        if messages[i].metadata.get("in_reply_to").is_some() { is_mail = true; }
+        if is_email(i) { is_mail = true; }
     }
     let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut roots: Vec<usize> = Vec::new();
@@ -438,17 +444,26 @@ fn build_thread_order(messages: &[Message], section_indices: &[usize], one_root:
             _ => roots.push(i),
         }
     }
-    if one_root && roots.len() > 1 {
-        roots.sort_by(|&a, &b| messages[a].timestamp.cmp(&messages[b].timestamp));
-        let rest = roots.split_off(1);
-        children.entry(roots[0]).or_default().extend(rest);
+    // Same subject, no reply header: the oldest is the parent.
+    let mut by_subject: HashMap<String, Vec<usize>> = HashMap::new();
+    for &r in &roots {
+        if is_email(r) {
+            let subj = crate::database::normalise_subject(messages[r].subject.as_deref().unwrap_or(""));
+            by_subject.entry(subj).or_default().push(r);
+        }
+    }
+    for group in by_subject.into_values().filter(|g| g.len() > 1) {
+        let head = *group.iter()
+            .min_by_key(|&&i| (messages[i].timestamp, messages[i].id)).unwrap();
+        roots.retain(|&r| r == head || !group.contains(&r));
+        children.entry(head).or_default().extend(group.into_iter().filter(|&r| r != head));
     }
     // Oldest reply first under its parent: natural reading order.
     for kids in children.values_mut() {
-        kids.sort_by(|&a, &b| messages[a].timestamp.cmp(&messages[b].timestamp));
+        kids.sort_by_key(|&i| (messages[i].timestamp, messages[i].id));
     }
     if is_mail {
-        roots.sort_by(|&a, &b| messages[b].timestamp.cmp(&messages[a].timestamp));
+        roots.sort_by(|&a, &b| (messages[b].timestamp, messages[b].id).cmp(&(messages[a].timestamp, messages[a].id)));
     }
 
     // Iterative DFS to avoid recursion-depth panics on degenerate
@@ -5008,7 +5023,7 @@ impl App {
             // The conversation's top message IS the row, it carries the
             // fold arrow and the count, and the replies indent beneath it.
             if section.section_type == "thread" {
-                let ordered = build_thread_order(&self.filtered_messages, &section.messages, true);
+                let ordered = build_thread_order(&self.filtered_messages, &section.messages);
                 let total = section.messages.len();
                 for (n, (idx, depth)) in ordered.into_iter().enumerate() {
                     if n > 0 && is_collapsed { break; }
@@ -5063,7 +5078,7 @@ impl App {
                 // started writing `reply_to`. A channel with nothing to
                 // nest keeps its order untouched (see build_thread_order).
                 let ordered: Vec<(usize, u8)> =
-                    build_thread_order(&self.filtered_messages, &section.messages, false);
+                    build_thread_order(&self.filtered_messages, &section.messages);
 
                 for (idx, depth) in ordered {
                     let row = self.display_row(idx, depth);
@@ -15432,6 +15447,10 @@ mod fold_tests {
     use crate::message::Message;
 
     fn mail(id: i64, mid: &str, irt: Option<&str>, ts: i64) -> Message {
+        mail_s(id, mid, irt, ts, "Same")
+    }
+
+    fn mail_s(id: i64, mid: &str, irt: Option<&str>, ts: i64, subject: &str) -> Message {
         let mut meta = serde_json::json!({});
         if let Some(v) = irt { meta["in_reply_to"] = serde_json::json!(v); }
         Message {
@@ -15439,6 +15458,8 @@ mod fold_tests {
             thread_id: Some(mid.into()),
             metadata: meta,
             timestamp: ts,
+            subject: Some(subject.into()),
+            source_type: "maildir".into(),
             ..Default::default()
         }
     }
@@ -15453,7 +15474,7 @@ mod fold_tests {
             mail(3, "r2", Some("r1"), 300),
             mail(4, "r3", Some("root"), 250),
         ];
-        let order = build_thread_order(&msgs, &[0, 1, 2, 3], true);
+        let order = build_thread_order(&msgs, &[0, 1, 2, 3]);
         let ids: Vec<i64> = order.iter().map(|&(i, _)| msgs[i].id).collect();
         let depths: Vec<u8> = order.iter().map(|&(_, d)| d).collect();
         assert_eq!(ids, vec![1, 2, 3, 4], "root first, then replies in order");
@@ -15478,14 +15499,14 @@ mod fold_tests {
             chat(3, "a1", Some("a"), 200),
             chat(4, "a2", Some("a"), 250),
         ];
-        let order = build_thread_order(&msgs, &[0, 1, 2, 3], false);
+        let order = build_thread_order(&msgs, &[0, 1, 2, 3]);
         let ids: Vec<i64> = order.iter().map(|&(i, _)| msgs[i].id).collect();
         let depths: Vec<u8> = order.iter().map(|&(_, d)| d).collect();
         assert_eq!(ids, vec![1, 2, 3, 4]);
         assert_eq!(depths, vec![0, 0, 1, 1]);
 
         let flat = vec![chat(1, "x", None, 300), chat(2, "y", None, 100)];
-        let order = build_thread_order(&flat, &[0, 1], false);
+        let order = build_thread_order(&flat, &[0, 1]);
         assert_eq!(order, vec![(0, 0), (1, 0)], "no replies: order as handed");
     }
 
@@ -15496,7 +15517,7 @@ mod fold_tests {
     #[test]
     fn mail_without_reply_headers_hangs_under_the_oldest() {
         let msgs = vec![mail(1, "update", None, 300), mail(2, "invite", None, 100)];
-        let order = build_thread_order(&msgs, &[0, 1], true);
+        let order = build_thread_order(&msgs, &[0, 1]);
         assert_eq!(order, vec![(1, 0), (0, 1)]);
 
         let msgs = vec![
@@ -15504,8 +15525,28 @@ mod fold_tests {
             mail(2, "orphan", None, 300),
             mail(3, "r1", Some("root"), 200),
         ];
-        let order = build_thread_order(&msgs, &[0, 1, 2], true);
+        let order = build_thread_order(&msgs, &[0, 1, 2]);
         assert_eq!(order, vec![(0, 0), (2, 1), (1, 1)]);
+    }
+
+    /// A folder holds many subjects. Only mails sharing a subject nest;
+    /// the rest stay roots, newest first. A copy delivered twice at the
+    /// same second nests under the lower id.
+    #[test]
+    fn in_a_folder_only_same_subject_mail_nests() {
+        let msgs = vec![
+            mail_s(1, "b", None, 400, "B"),
+            mail_s(2, "a-copy", None, 300, "A"),
+            mail_s(3, "a-re", Some("a"), 200, "Re: A"),
+            mail_s(4, "a", None, 100, "A"),
+            mail_s(5, "c2", None, 500, "C"),
+            mail_s(6, "c1", None, 500, "C"),
+        ];
+        let order = build_thread_order(&msgs, &[0, 1, 2, 3, 4, 5]);
+        let ids: Vec<i64> = order.iter().map(|&(i, _)| msgs[i].id).collect();
+        let depths: Vec<u8> = order.iter().map(|&(_, d)| d).collect();
+        assert_eq!(ids, vec![5, 6, 1, 4, 3, 2]);
+        assert_eq!(depths, vec![0, 1, 0, 0, 1, 1]);
     }
 }
 
