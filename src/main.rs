@@ -3141,6 +3141,20 @@ impl App {
         let stype = &msg.source_type;
         let (icon, scolor) = source_info(stype, &self.config.theme_colors);
 
+        // Compute outer color first so the rail and the avatar can splice
+        // their own colors inline and re-open the outer color afterward.
+        // An inner SGR close would reset to default fg for the rest of
+        // the line: a tagged reply row went white after its "└ ".
+        let color = if self.delete_marked.contains(&msg.id) {
+            self.config.theme_colors.delete_mark
+        } else if self.tagged.contains(&msg.id) {
+            self.config.theme_colors.tag
+        } else if msg.starred {
+            self.config.theme_colors.star
+        } else {
+            scolor
+        };
+
         // Sender column: 12 chars, plus a 1-char per-sender avatar in front
         // (own deterministic color). 12 + 1 (gap) + 1 (avatar) + 1 (gap) =
         // same 15-cell budget as the previous bare-sender layout.
@@ -3155,7 +3169,7 @@ impl App {
             let mut s = String::new();
             for _ in 0..depth_indent.saturating_sub(1) { s.push_str("  "); }
             s.push_str("└ ");
-            (style::fg(&s, self.config.theme_colors.hint_fg),
+            (format!("{}{}{}", style::set_fg(self.config.theme_colors.hint_fg), s, style::set_fg(color)),
              12usize.saturating_sub(depth_indent * 2))
         };
         let sender_display = msg.display_name();
@@ -3170,19 +3184,6 @@ impl App {
         // 1+1+1+1+6+1+1+1+1+1+12+1 = 29 fixed chars (same as before; avatar
         // takes 1 + gap from sender column).
         let flags = format!("{}{}{}", nflag, rflag, ind);
-
-        // Compute outer color first so we can splice the avatar's own color
-        // inline and then re-open the outer color afterward (an inner SGR
-        // close would otherwise reset to default fg for the rest of the line).
-        let color = if self.delete_marked.contains(&msg.id) {
-            self.config.theme_colors.delete_mark
-        } else if self.tagged.contains(&msg.id) {
-            self.config.theme_colors.tag
-        } else if msg.starred {
-            self.config.theme_colors.star
-        } else {
-            scolor
-        };
 
         // Per-sender avatar: 1 colored char between source icon and sender.
         let (avatar_ch, avatar_color) = sender_avatar(&msg.sender, msg.sender_name.as_deref());
