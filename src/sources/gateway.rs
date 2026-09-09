@@ -14,7 +14,14 @@ use std::path::PathBuf;
 /// Source `config`: { "gateway_dir": "~/.kastrup/gateway" } (default if unset).
 /// `~/` and `$HOME` expand. Files are drained (deleted) on read, mirroring
 /// tock's `incoming/` import — `known_ids` still dedups within a batch.
-pub fn sync_gateway(config: &serde_json::Value, known_ids: &HashSet<String>) -> Vec<MessageData> {
+///
+/// `covered` holds the plugin types of the other enabled sources. A
+/// platform in it (Workspace through its bridge, Discord through its own
+/// sync) is dropped here: the phone copy would be a second row at best,
+/// and with the screen locked Android hands the relay only "Sensitive
+/// notification content hidden". That stand-in is dropped for every
+/// platform; there is nothing in it to read.
+pub fn sync_gateway(config: &serde_json::Value, known_ids: &HashSet<String>, covered: &HashSet<String>) -> Vec<MessageData> {
     let base = config
         .get("gateway_dir")
         .and_then(|v| v.as_str())
@@ -75,9 +82,12 @@ pub fn sync_gateway(config: &serde_json::Value, known_ids: &HashSet<String>) -> 
         let _ = std::fs::remove_file(&path);
 
         // Allow media-only messages through (e.g. a photo with empty text):
-        // require text OR at least one media file.
+        // require text OR at least one media file. Drop what another
+        // source already brings in, and Android's hidden-content stand-in.
         if platform.is_empty() || thread_key.is_empty()
             || (body.is_empty() && media_refs.is_empty())
+            || covered.contains(platform)
+            || body == "Sensitive notification content hidden"
         {
             for (p, _) in &media_refs { let _ = std::fs::remove_file(p); }
             continue;
