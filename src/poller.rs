@@ -197,6 +197,11 @@ fn poller_loop(
         // Did this cycle insert anything the outside indexer wants?
         let mut new_non_mail = false;
 
+        // Platforms another enabled source brings in itself. The phone relay
+        // must not add a second copy of those (see gateway.rs).
+        let covered: HashSet<String> = sources_list.iter()
+            .filter(|s| s.plugin_type != "gateway")
+            .map(|s| s.plugin_type.clone()).collect();
         for source in &sources_list {
             let interval = source.poll_interval;
             let last_sync = *polled_at.get(&source.id)
@@ -251,6 +256,7 @@ fn poller_loop(
                           | "gateway" | "discord" | "slack") => {
                     let cfg = source.config.clone();
                     let known_snapshot = known.clone();
+                    let covered_snapshot = covered.clone();
                     let plugin = plugin.to_string();
                     match run_with_timeout(NETWORK_SYNC_DEADLINE, move || {
                         match plugin.as_str() {
@@ -264,7 +270,7 @@ fn poller_loop(
                             "weechat" => sources::weechat::sync_weechat(&cfg, &known_snapshot),
                             "messenger" => sources::messenger::sync_messenger(&cfg, &known_snapshot),
                             "instagram" => sources::instagram::sync_instagram(&cfg, &known_snapshot),
-                            "gateway" => sources::gateway::sync_gateway(&cfg, &known_snapshot),
+                            "gateway" => sources::gateway::sync_gateway(&cfg, &known_snapshot, &covered_snapshot),
                             "discord" => sources::discord::sync_discord(&cfg, &known_snapshot),
                             "slack" => sources::slack::sync_slack(&cfg, &known_snapshot),
                             _ => Vec::new(),
