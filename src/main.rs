@@ -782,6 +782,47 @@ fn quote_into_draft(data: &str, quote: &str) -> String {
     out
 }
 
+/// A raw RFC822 mail as pane lines: From, To, Cc, Date and Subject as
+/// header rows, a blank, then the body through the same MIME path a
+/// message takes (text part first, HTML rendered to text otherwise).
+fn eml_lines(raw: &str, addr_color: u8, date_color: u8, subj_color: u8) -> Vec<String> {
+    let head_end = raw.find("\n\n").or_else(|| raw.find("\r\n\r\n")).unwrap_or(raw.len());
+    let head = raw[..head_end].replace("\r\n", "\n");
+    // Folded header lines join their first line before lookup.
+    let mut unfolded: Vec<String> = Vec::new();
+    for line in head.lines() {
+        match unfolded.last_mut() {
+            Some(last) if line.starts_with(' ') || line.starts_with('\t') => {
+                last.push(' ');
+                last.push_str(line.trim());
+            }
+            _ => unfolded.push(line.to_string()),
+        }
+    }
+    let header = |key: &str| -> String {
+        unfolded.iter().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            if k.eq_ignore_ascii_case(key) { Some(sources::maildir::decode_rfc2047(v.trim())) } else { None }
+        }).unwrap_or_default()
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for (key, color) in [("From", addr_color), ("To", addr_color), ("Cc", addr_color),
+                         ("Date", date_color), ("Subject", subj_color)] {
+        let v = header(key);
+        if !v.is_empty() { lines.push(header_row(&format!("{}:", key), &v, color)); }
+    }
+    lines.push(String::new());
+    let mut body = extract_mime_text(raw).unwrap_or_default();
+    if body.trim().is_empty() {
+        body = extract_mime_html(raw).map(|h| html_to_text(&h)).unwrap_or_default();
+    } else if body.contains("<html") || body.contains("<body") || body.contains("<div") {
+        body = html_to_text(&body);
+    }
+    if body.trim().is_empty() { body = "(no readable text in this mail)".to_string(); }
+    lines.extend(body.lines().map(|l| l.to_string()));
+    lines
+}
+
 /// `/me <action>` → Some(action) with the prefix stripped; else None.
 /// Single-line body only (multi-line messages with a `/me` first line
 /// are treated as regular messages — Slack's chat.meMessage doesn't
@@ -11892,6 +11933,10 @@ impl App {
     /// run it in-terminal instead (suspend the TUI, run, restore). GUI
     /// handlers (images, PDFs) still go through xdg-open, detached.
     fn open_attachment_file(&mut self, path: &str, name: &str) {
+        if name.to_ascii_lowercase().ends_with(".eml") {
+            self.view_eml(path, name);
+            return;
+        }
         if let Some(exec) = Self::terminal_handler_exec(path) {
             let esc = crust::shell_escape(path);
             let has_field = ["%f", "%F", "%u", "%U"].iter().any(|f| exec.contains(f));
@@ -11912,6 +11957,36 @@ impl App {
                 .spawn();
         }
         self.set_feedback(&format!("Opened {}", name), self.config.theme_colors.feedback_ok);
+    }
+
+    /// An attached mail (.eml) is read here rather than handed to the
+    /// desktop, which knows no reader for it: its headers, then the body
+    /// through the same MIME path a message takes. j/k scroll, ESC or q
+    /// go back to the attachment list.
+    fn view_eml(&mut self, path: &str, name: &str) {
+        let raw = std::fs::read(path)
+            .map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+        let tc = &self.config.theme_colors;
+        let lines = eml_lines(&raw, tc.header_from, tc.header_date, tc.header_subj);
+        self.right.set_text(&lines.join("\n"));
+        self.right.ix = 0;
+        self.right.full_refresh();
+        if self.right.border { self.right.border_refresh(); }
+        self.bottom.say(&style::fg(&format!(" {}   j/k:Scroll  Space/b:Page  ESC:Back", name),
+            self.config.theme_colors.hint_fg));
+        loop {
+            let Some(key) = Input::getchr(None) else { continue };
+            match key.as_str() {
+                "j" | "DOWN" => self.right.linedown(),
+                "k" | "UP" => self.right.lineup(),
+                " " | "PgDOWN" | "TAB" => self.right.pagedown(),
+                "b" | "PgUP" | "S-TAB" => self.right.pageup(),
+                "g" | "HOME" => self.right.top(),
+                "G" | "END" => self.right.bottom(),
+                "ESC" | "q" => break,
+                _ => {}
+            }
+        }
     }
 
     /// If the default desktop handler for `path`'s MIME type is a terminal
@@ -15480,6 +15555,23 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod eml_tests {
+    use super::eml_lines;
+
+    #[test]
+    fn an_attached_mail_shows_its_headers_and_text() {
+        let raw = "From: =?UTF-8?Q?B=C3=B8rge?= <b@example.com>\r\nTo: g@isene.com\r\nSubject: Re:\r\n hello\r\nDate: Thu, 11 Sep 2026 09:00:00 +0200\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"b1\"\r\n\r\n--b1\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nPlain body here.\r\n--b1\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><p>Html body</p></body></html>\r\n--b1--\r\n";
+        let lines = eml_lines(raw, 1, 2, 3);
+        let plain: Vec<String> = lines.iter().map(|l| crust::strip_ansi(l)).collect();
+        assert!(plain[0].starts_with("From: Børge"), "{}", plain[0]);
+        assert!(plain.iter().any(|l| l == "Subject: Re: hello"), "{:?}", plain);
+        // The body comes through the same MIME path a message takes,
+        // which may pick either part; one of them must be there.
+        assert!(plain.iter().any(|l| l.contains("body")), "{:?}", plain);
+    }
 }
 
 #[cfg(test)]
