@@ -11722,6 +11722,10 @@ impl App {
         }
         let mut att_index = 0usize;
         let mut att_tagged: HashSet<usize> = HashSet::new();
+        // The border in the attachment colour marks the mode for as long
+        // as the list, or a mail opened from it, is on screen.
+        let border_before = self.right.border_fg;
+        self.right.border_fg = Some(self.config.theme_colors.attachment as u16);
 
         loop {
             // Render attachment list in right pane
@@ -11924,6 +11928,7 @@ impl App {
             }
         }
 
+        self.right.border_fg = border_before;
         self.render_all();
     }
 
@@ -11978,8 +11983,6 @@ impl App {
         lines.insert(0, bar(&format!(" ATTACHED MAIL  {}", name)));
         lines.insert(1, bar(" ESC: back to the attachments \u{00b7} ESC again: back to the message"));
         lines.insert(2, String::new());
-        let border_before = self.right.border_fg;
-        self.right.border_fg = Some(tc.attachment as u16);
         self.right.set_text(&lines.join("\n"));
         self.right.ix = 0;
         self.right.full_refresh();
@@ -12000,8 +12003,6 @@ impl App {
                 _ => {}
             }
         }
-        self.right.border_fg = border_before;
-        if self.right.border { self.right.border_refresh(); }
     }
 
     /// If the default desktop handler for `path`'s MIME type is a terminal
