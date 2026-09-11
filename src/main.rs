@@ -11972,17 +11972,21 @@ impl App {
         // a banner across the top and the border in the attachment
         // colour say so until ESC takes the view down.
         let inner_w = (self.right.w as usize).saturating_sub(if self.right.border { 2 } else { 0 });
-        let banner = format!(" ATTACHED MAIL  {}   ESC: back to the attachments, ESC again: back to the message", name);
-        lines.insert(0, style::bold(&style::fb(&format!("{:<w$}", banner, w = inner_w), 232, tc.attachment)));
-        lines.insert(1, String::new());
+        let bar = |text: &str| -> String {
+            style::bold(&style::fb(&pad_to_width(&truncate_str(text, inner_w), inner_w), 232, tc.attachment))
+        };
+        lines.insert(0, bar(&format!(" ATTACHED MAIL  {}", name)));
+        lines.insert(1, bar(" ESC: back to the attachments \u{00b7} ESC again: back to the message"));
+        lines.insert(2, String::new());
         let border_before = self.right.border_fg;
         self.right.border_fg = Some(tc.attachment as u16);
         self.right.set_text(&lines.join("\n"));
         self.right.ix = 0;
         self.right.full_refresh();
         if self.right.border { self.right.border_refresh(); }
-        self.bottom.say(&style::fb(&format!(" ATTACHED MAIL {}   j/k:Scroll  Space/b:Page  ESC:Back", name),
-            232, tc.attachment));
+        let bottom_w = self.bottom.w as usize;
+        let foot = format!(" ATTACHED MAIL  {}   j/k:Scroll  Space/b:Page  ESC:Back", name);
+        self.bottom.say(&style::fb(&pad_to_width(&truncate_str(&foot, bottom_w), bottom_w), 232, tc.attachment));
         loop {
             let Some(key) = Input::getchr(None) else { continue };
             match key.as_str() {
