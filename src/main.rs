@@ -11967,13 +11967,22 @@ impl App {
         let raw = std::fs::read(path)
             .map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
         let tc = &self.config.theme_colors;
-        let lines = eml_lines(&raw, tc.header_from, tc.header_date, tc.header_subj);
+        let mut lines = eml_lines(&raw, tc.header_from, tc.header_date, tc.header_subj);
+        // This is not the message view, and it must not look like one:
+        // a banner across the top and the border in the attachment
+        // colour say so until ESC takes the view down.
+        let inner_w = (self.right.w as usize).saturating_sub(if self.right.border { 2 } else { 0 });
+        let banner = format!(" ATTACHED MAIL  {}   ESC: back to the attachments, ESC again: back to the message", name);
+        lines.insert(0, style::bold(&style::fb(&format!("{:<w$}", banner, w = inner_w), 232, tc.attachment)));
+        lines.insert(1, String::new());
+        let border_before = self.right.border_fg;
+        self.right.border_fg = Some(tc.attachment as u16);
         self.right.set_text(&lines.join("\n"));
         self.right.ix = 0;
         self.right.full_refresh();
         if self.right.border { self.right.border_refresh(); }
-        self.bottom.say(&style::fg(&format!(" {}   j/k:Scroll  Space/b:Page  ESC:Back", name),
-            self.config.theme_colors.hint_fg));
+        self.bottom.say(&style::fb(&format!(" ATTACHED MAIL {}   j/k:Scroll  Space/b:Page  ESC:Back", name),
+            232, tc.attachment));
         loop {
             let Some(key) = Input::getchr(None) else { continue };
             match key.as_str() {
@@ -11987,6 +11996,8 @@ impl App {
                 _ => {}
             }
         }
+        self.right.border_fg = border_before;
+        if self.right.border { self.right.border_refresh(); }
     }
 
     /// If the default desktop handler for `path`'s MIME type is a terminal
