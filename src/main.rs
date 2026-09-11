@@ -750,6 +750,38 @@ fn take_kastrup_link_headers(data: &str) -> (String, Option<i64>, Vec<i64>) {
     (out, reply, fwd)
 }
 
+/// Put the quoted original into a draft that has none, above the
+/// `-- ` signature line (at the end when there is no signature). A
+/// draft that already quotes (`> ` lines or a "wrote:" line) is left
+/// alone. Headers end at the first blank line.
+fn quote_into_draft(data: &str, quote: &str) -> String {
+    let (head, body) = match data.find("\n\n") {
+        Some(i) => (&data[..i + 2], &data[i + 2..]),
+        None => (data, ""),
+    };
+    let quoted_already = body.lines().any(|l| l.starts_with('>') || l.trim_end().ends_with("wrote:"));
+    if quoted_already || quote.trim().is_empty() { return data.to_string(); }
+    let mut out = String::from(head);
+    match body.lines().position(|l| l == "-- ") {
+        Some(sig) => {
+            let lines: Vec<&str> = body.lines().collect();
+            let above = lines[..sig].join("\n");
+            out.push_str(above.trim_end());
+            out.push_str("\n\n");
+            out.push_str(quote);
+            out.push('\n');
+            out.push_str(&lines[sig..].join("\n"));
+            out.push('\n');
+        }
+        None => {
+            out.push_str(body.trim_end());
+            out.push_str("\n\n");
+            out.push_str(quote);
+        }
+    }
+    out
+}
+
 /// `/me <action>` → Some(action) with the prefix stripped; else None.
 /// Single-line body only (multi-line messages with a `/me` first line
 /// are treated as regular messages — Slack's chat.meMessage doesn't
@@ -8767,14 +8799,12 @@ impl App {
         }
         let msg = &self.filtered_messages[idx];
 
-        let sender = msg.display_name();
         let subject = msg.subject.as_deref().unwrap_or("");
         let re_subject = if subject.starts_with("Re:") {
             subject.to_string()
         } else {
             format!("Re: {}", subject)
         };
-        let date = format_timestamp(msg.timestamp, "%Y-%m-%d %H:%M");
         // Replying to a message the user sent is a follow-up: same
         // To/Cc as the original, sent from the same identity.
         let own = self.identity_for_sender(&msg.sender).cloned();
@@ -8795,13 +8825,7 @@ impl App {
         template.push_str(&format!("Subject: {}\n", re_subject));
         template.push('\n');
         template.push('\n');
-        template.push_str(&format!("On {}, {} wrote:\n", date, sender));
-
-        // Get content, falling back to HTML conversion
-        let content = self.get_display_content(msg);
-        for line in content.lines() {
-            template.push_str(&format!("> {}\n", line));
-        }
+        template.push_str(&self.quote_block(msg));
 
         if !sig.is_empty() {
             template.push('\n');
@@ -8810,6 +8834,17 @@ impl App {
         }
 
         self.run_editor_compose_at(&template, None);
+    }
+
+    /// "On date, name wrote:" and the message's rendered text, each line
+    /// behind `> `. Used by `r` and by a loaded draft that replies.
+    fn quote_block(&self, msg: &Message) -> String {
+        let mut out = format!("On {}, {} wrote:\n",
+            format_timestamp(msg.timestamp, "%Y-%m-%d %H:%M"), msg.display_name());
+        for line in self.get_display_content(msg).lines() {
+            out.push_str(&format!("> {}\n", line));
+        }
+        out
     }
 
     fn reply_all(&mut self) {
@@ -9605,6 +9640,12 @@ impl App {
                         data = stripped;
                         if reply_id.is_some() { self.pending_reply_id = reply_id; }
                         if !fwd_ids.is_empty() { self.pending_forward_ids = fwd_ids; }
+                        // A draft written outside kastrup carries no quote.
+                        // Put the original above the signature, as `r`
+                        // does; the editor is where it gets trimmed.
+                        if let Some(orig) = reply_id.and_then(|id| self.db.get_message(id)) {
+                            data = quote_into_draft(&data, &self.quote_block(&orig));
+                        }
                     }
                     self.run_editor_compose_recalled(&data, kind);
                     return;
@@ -15439,6 +15480,23 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod quote_tests {
+    use super::quote_into_draft;
+
+    #[test]
+    fn the_quote_goes_above_the_signature_or_at_the_end_and_never_twice() {
+        let q = "On 2026-09-10 06:20, Kumar wrote:\n> Hello\n> there\n";
+        let draft = "From: a\nTo: b\n\nReply text.\n\n/Geir\n\n-- \nSig line\n";
+        assert_eq!(quote_into_draft(draft, q),
+            "From: a\nTo: b\n\nReply text.\n\n/Geir\n\nOn 2026-09-10 06:20, Kumar wrote:\n> Hello\n> there\n\n-- \nSig line\n");
+        let no_sig = "From: a\n\nReply text.\n";
+        assert_eq!(quote_into_draft(no_sig, q), "From: a\n\nReply text.\n\nOn 2026-09-10 06:20, Kumar wrote:\n> Hello\n> there\n");
+        let quoted = "From: a\n\nReply.\n\n> old\n\n-- \nSig\n";
+        assert_eq!(quote_into_draft(quoted, q), quoted);
+    }
 }
 
 #[cfg(test)]
