@@ -1651,6 +1651,26 @@ fn parse_message_id(s: &str) -> Option<i64> {
     s.strip_prefix("kastrup:").unwrap_or(s).trim().parse().ok()
 }
 
+/// What `y` copies on a section header: `kastrup:workspace#general`.
+/// The type comes first and never holds a `#`, so a name that does
+/// (`libera.#ruby`) still splits at the first one.
+fn section_ref(source_type: &str, name: &str) -> String {
+    format!("kastrup:{}#{}", source_type, name)
+}
+
+#[cfg(test)]
+mod section_ref_tests {
+    use super::*;
+
+    #[test]
+    fn a_section_is_copied_as_type_and_name() {
+        assert_eq!(section_ref("workspace", "team-chat"), "kastrup:workspace#team-chat");
+        assert_eq!(section_ref("weechat-relay", "libera.#ruby"), "kastrup:weechat-relay#libera.#ruby");
+        // A section reference is never mistaken for a message id by `#`.
+        assert_eq!(parse_message_id(&section_ref("workspace", "Private: Alice")), None);
+    }
+}
+
 fn main() {
     // --help / --version answer before anything else, including the
     // no-terminal guard below: a CLI that cannot say what it is when
@@ -6552,16 +6572,20 @@ impl App {
         let id = self.current_filtered_index()
             .and_then(|i| self.filtered_messages.get(i))
             .map(|m| m.id);
-        match id {
-            Some(id) => {
-                let id_str = format!("kastrup:{}", id);
-                crust::clipboard_copy(&id_str, "clipboard");
-                self.set_feedback(&format!("Copied: {}", id_str), self.config.theme_colors.feedback_ok);
+        // On a section header (a channel, DM or folder), copy the section.
+        let section = self.display_messages.get(self.index)
+            .filter(|m| self.show_threaded && m.is_header)
+            .map(|m| section_ref(&m.source_type, m.subject.as_deref().unwrap_or("")));
+        let text = match (id, section) {
+            (_, Some(r)) => r,
+            (Some(id), None) => format!("kastrup:{}", id),
+            (None, None) => {
+                self.set_feedback("Nothing to copy here", self.config.theme_colors.feedback_warn);
+                return;
             }
-            None => self.set_feedback(
-                "Copy id needs a message — cursor is on a section header",
-                self.config.theme_colors.feedback_warn),
-        }
+        };
+        crust::clipboard_copy(&text, "clipboard");
+        self.set_feedback(&format!("Copied: {}", text), self.config.theme_colors.feedback_ok);
     }
 
     fn copy_right_pane(&self) {
@@ -6754,7 +6778,7 @@ impl App {
   B              Folder browser\n\
   Ctrl-B         Cycle border style\n\
   P              Preferences\n\
-  y/Y            Copy ID / copy content\n\
+  y/Y            Copy ID (or channel) / copy content\n\
   @              Address book\n\
   Ctrl-L         Redraw\n\
   q              Quit",

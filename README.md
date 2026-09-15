@@ -171,7 +171,7 @@ cursor.
 | B | Folder browser |
 | Ctrl-B | Cycle border style |
 | P | Preferences |
-| y / Y | Copy message ID / copy right pane content |
+| y / Y | Copy message ID (on a channel or folder header: `kastrup:<type>#<name>`) / copy right pane content |
 | Ctrl-L | Force redraw |
 | ? | Help (press again for extended help) |
 | q | Quit |
