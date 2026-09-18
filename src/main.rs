@@ -422,7 +422,7 @@ fn thread_link(msg: &Message) -> (Option<String>, Option<String>) {
 /// Mail roots come out newest-first, which is the order a mail section
 /// has always had. A chat channel keeps the order it was handed, so a
 /// channel with no replies in it looks exactly as it did.
-fn build_thread_order(messages: &[Message], section_indices: &[usize]) -> Vec<(usize, u8)> {
+fn build_thread_order(messages: &[Message], section_indices: &[usize], oldest_first: bool) -> Vec<(usize, u8)> {
     use std::collections::HashMap;
     let is_email = |i: usize| matches!(messages[i].source_type.as_str(),
         "email" | "maildir" | "imap" | "gmail");
@@ -462,7 +462,12 @@ fn build_thread_order(messages: &[Message], section_indices: &[usize]) -> Vec<(u
     for kids in children.values_mut() {
         kids.sort_by_key(|&i| (messages[i].timestamp, messages[i].id));
     }
-    if is_mail {
+    // Chat roots keep the order the section handed them, newest first.
+    // An inverted folders view asks for the other way round, so a channel
+    // reads top to bottom the way it happened.
+    if oldest_first {
+        roots.sort_by_key(|&i| (messages[i].timestamp, messages[i].id));
+    } else if is_mail {
         roots.sort_by(|&a, &b| (messages[b].timestamp, messages[b].id).cmp(&(messages[a].timestamp, messages[a].id)));
     }
 
@@ -1304,6 +1309,14 @@ impl HideMode {
     fn from_str(s: &str) -> HideMode {
         match s { "highlight" => HideMode::UntilHighlight, _ => HideMode::UntilNew }
     }
+}
+
+/// What the cursor rests on, kept across a rebuild of the list.
+enum CursorOn {
+    Message(i64),
+    /// A section header, by the section's name.
+    Header(String),
+    Nothing,
 }
 
 /// A muted channel in a view: its section name, the resurface mode, and
@@ -4368,8 +4381,51 @@ impl App {
         }
     }
 
+    /// What the cursor is on, in a form that survives a rebuild of the
+    /// list: a message by id, or a section header by name.
+    fn cursor_on(&self) -> CursorOn {
+        if self.show_threaded {
+            match self.display_messages.get(self.index) {
+                Some(m) if m.is_header => CursorOn::Header(m.thread_id.clone().unwrap_or_default()),
+                Some(m) => CursorOn::Message(m.id),
+                None => CursorOn::Nothing,
+            }
+        } else {
+            match self.filtered_messages.get(self.index) {
+                Some(m) => CursorOn::Message(m.id),
+                None => CursorOn::Nothing,
+            }
+        }
+    }
+
+    /// Put the cursor back on what it was on before the list was
+    /// rebuilt, or at the same slot when that row is gone.
+    fn put_cursor_back(&mut self, on: &CursorOn, saved_index: usize) {
+        let (found, len) = if self.show_threaded {
+            let found = match on {
+                CursorOn::Message(id) => self.display_messages.iter()
+                    .position(|m| !m.is_header && m.id == *id),
+                CursorOn::Header(name) => self.display_messages.iter()
+                    .position(|m| m.is_header && m.thread_id.as_deref() == Some(name.as_str())),
+                CursorOn::Nothing => None,
+            };
+            (found, self.display_messages.len())
+        } else {
+            let found = match on {
+                CursorOn::Message(id) => self.filtered_messages.iter().position(|m| m.id == *id),
+                _ => None,
+            };
+            (found, self.filtered_messages.len())
+        };
+        self.index = found.unwrap_or(saved_index).min(len.saturating_sub(1));
+    }
+
     fn refresh_current_view(&mut self) {
-        let saved_id = self.filtered_messages.get(self.index).map(|m| m.id);
+        // In threaded and folders views the cursor indexes
+        // display_messages, not filtered_messages. Saving the id at the
+        // same offset of the flat list, as this once did, moved the cursor
+        // one row down every time a new message landed above it.
+        let was_on = self.cursor_on();
         let saved_index = self.index;
         let old_ids: Vec<i64> = self.filtered_messages.iter().map(|m| m.id).collect();
         let old_read: Vec<bool> = self.filtered_messages.iter().map(|m| m.read).collect();
@@ -4396,19 +4452,11 @@ impl App {
                     self.unseen_ids.insert(msg.id);
                 }
             }
-            // Best-effort cursor preservation: keep cursor on same id
-            // if it survived; otherwise stay at the same index slot.
-            if let Some(id) = saved_id {
-                if let Some(pos) = self.filtered_messages.iter().position(|m| m.id == id) {
-                    self.index = pos;
-                } else {
-                    self.index = saved_index.min(self.filtered_messages.len().saturating_sub(1));
-                }
-            }
             // Mute warnings about unread caches we don't use here.
             let _ = old_read;
             self.sort_messages();
             self.rebuild_display();
+            self.put_cursor_back(&was_on, saved_index);
             self.left.full_refresh();
             self.suppress_automark_read = true;
             self.render_all();
@@ -4470,31 +4518,7 @@ impl App {
             self.sort_messages();
         }
         self.rebuild_display();
-
-        // Restore position by message ID, fall back to saved index
-        if let Some(id) = saved_id {
-            if let Some(pos) = self.filtered_messages.iter().position(|m| m.id == id) {
-                self.index = pos;
-            } else {
-                self.index = saved_index.min(self.filtered_messages.len().saturating_sub(1));
-            }
-        } else {
-            self.index = saved_index.min(self.filtered_messages.len().saturating_sub(1));
-        }
-
-        // The restores above clamp to filtered_messages, but in threaded
-        // mode self.index tracks display_messages (shorter when sections
-        // are collapsed). Clamp to the active list so the cursor can't be
-        // left past the end — that out-of-range index is what crashed
-        // Ctrl+Space (toggle_collapse_all) after a background refresh.
-        let active_len = if self.show_threaded {
-            self.display_messages.len()
-        } else {
-            self.filtered_messages.len()
-        };
-        if self.index >= active_len {
-            self.index = active_len.saturating_sub(1);
-        }
+        self.put_cursor_back(&was_on, saved_index);
 
         // Skip render if nothing changed (avoids flicker on periodic refresh)
         let new_ids: Vec<i64> = self.filtered_messages.iter().map(|m| m.id).collect();
@@ -5116,7 +5140,7 @@ impl App {
             // The conversation's top message IS the row, it carries the
             // fold arrow and the count, and the replies indent beneath it.
             if section.section_type == "thread" {
-                let ordered = build_thread_order(&self.filtered_messages, &section.messages);
+                let ordered = build_thread_order(&self.filtered_messages, &section.messages, false);
                 let total = section.messages.len();
                 for (n, (idx, depth)) in ordered.into_iter().enumerate() {
                     if n > 0 && is_collapsed { break; }
@@ -5170,8 +5194,11 @@ impl App {
                 // reply; Discord and Slack do from the day their syncs
                 // started writing `reply_to`. A channel with nothing to
                 // nest keeps its order untouched (see build_thread_order).
-                let ordered: Vec<(usize, u8)> =
-                    build_thread_order(&self.filtered_messages, &section.messages);
+                let ordered: Vec<(usize, u8)> = build_thread_order(
+                    &self.filtered_messages,
+                    &section.messages,
+                    self.sort_inverted && self.group_by_folder,
+                );
 
                 for (idx, depth) in ordered {
                     let row = self.display_row(idx, depth);
@@ -15664,7 +15691,7 @@ mod fold_tests {
             mail(3, "r2", Some("r1"), 300),
             mail(4, "r3", Some("root"), 250),
         ];
-        let order = build_thread_order(&msgs, &[0, 1, 2, 3]);
+        let order = build_thread_order(&msgs, &[0, 1, 2, 3], false);
         let ids: Vec<i64> = order.iter().map(|&(i, _)| msgs[i].id).collect();
         let depths: Vec<u8> = order.iter().map(|&(_, d)| d).collect();
         assert_eq!(ids, vec![1, 2, 3, 4], "root first, then replies in order");
@@ -15689,14 +15716,14 @@ mod fold_tests {
             chat(3, "a1", Some("a"), 200),
             chat(4, "a2", Some("a"), 250),
         ];
-        let order = build_thread_order(&msgs, &[0, 1, 2, 3]);
+        let order = build_thread_order(&msgs, &[0, 1, 2, 3], false);
         let ids: Vec<i64> = order.iter().map(|&(i, _)| msgs[i].id).collect();
         let depths: Vec<u8> = order.iter().map(|&(_, d)| d).collect();
         assert_eq!(ids, vec![1, 2, 3, 4]);
         assert_eq!(depths, vec![0, 0, 1, 1]);
 
         let flat = vec![chat(1, "x", None, 300), chat(2, "y", None, 100)];
-        let order = build_thread_order(&flat, &[0, 1]);
+        let order = build_thread_order(&flat, &[0, 1], false);
         assert_eq!(order, vec![(0, 0), (1, 0)], "no replies: order as handed");
     }
 
@@ -15707,7 +15734,7 @@ mod fold_tests {
     #[test]
     fn mail_without_reply_headers_hangs_under_the_oldest() {
         let msgs = vec![mail(1, "update", None, 300), mail(2, "invite", None, 100)];
-        let order = build_thread_order(&msgs, &[0, 1]);
+        let order = build_thread_order(&msgs, &[0, 1], false);
         assert_eq!(order, vec![(1, 0), (0, 1)]);
 
         let msgs = vec![
@@ -15715,7 +15742,7 @@ mod fold_tests {
             mail(2, "orphan", None, 300),
             mail(3, "r1", Some("root"), 200),
         ];
-        let order = build_thread_order(&msgs, &[0, 1, 2]);
+        let order = build_thread_order(&msgs, &[0, 1, 2], false);
         assert_eq!(order, vec![(0, 0), (2, 1), (1, 1)]);
     }
 
@@ -15732,7 +15759,7 @@ mod fold_tests {
             mail_s(5, "c2", None, 500, "C"),
             mail_s(6, "c1", None, 500, "C"),
         ];
-        let order = build_thread_order(&msgs, &[0, 1, 2, 3, 4, 5]);
+        let order = build_thread_order(&msgs, &[0, 1, 2, 3, 4, 5], false);
         let ids: Vec<i64> = order.iter().map(|&(i, _)| msgs[i].id).collect();
         let depths: Vec<u8> = order.iter().map(|&(_, d)| d).collect();
         assert_eq!(ids, vec![5, 6, 1, 4, 3, 2]);
@@ -16060,5 +16087,37 @@ mod alias_tests {
         assert_eq!(a["infra"], "Jakob Treland <jakob@example.com>, Jørn <jorn@example.com>, extra@example.com");
         assert!(a.get("JAKOB").is_none(), "keys are stored lowercase; lookups lowercase the query");
         assert!(a["loop1"].len() < 40, "a key loop ends, it does not hang: {}", a["loop1"]);
+    }
+}
+
+#[cfg(test)]
+mod oldest_first_tests {
+    use super::*;
+
+    fn chat(id: i64, ts: i64, reply_to: Option<i64>) -> Message {
+        let mut m = Message::default_header();
+        m.is_header = false;
+        m.id = id;
+        m.timestamp = ts;
+        m.source_type = "workspace".to_string();
+        m.external_id = id.to_string();
+        m.metadata = serde_json::json!({});
+        if let Some(p) = reply_to {
+            m.metadata["reply_to"] = serde_json::Value::String(p.to_string());
+        }
+        m
+    }
+
+    /// An inverted folders view lays a channel out the way it happened:
+    /// oldest root first, and each reply still under what it answers.
+    #[test]
+    fn inverted_puts_the_oldest_root_first_and_keeps_replies_under_their_parent() {
+        let msgs = vec![chat(3, 30, None), chat(2, 20, Some(1)), chat(1, 10, None)];
+        let newest_first: Vec<i64> = build_thread_order(&msgs, &[0, 1, 2], false)
+            .into_iter().map(|(i, _)| msgs[i].id).collect();
+        let oldest_first: Vec<(i64, u8)> = build_thread_order(&msgs, &[0, 1, 2], true)
+            .into_iter().map(|(i, d)| (msgs[i].id, d)).collect();
+        assert_eq!(newest_first, vec![3, 1, 2]);
+        assert_eq!(oldest_first, vec![(1, 0), (2, 1), (3, 0)]);
     }
 }

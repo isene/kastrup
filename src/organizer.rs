@@ -207,7 +207,11 @@ pub fn organize_by_folder(
             }
         }
     });
-    if sort_inverted { sections.reverse(); }
+    // Newest first inside every channel, whatever the sort direction: the
+    // header reads its time and preview off the first message. An
+    // inverted view turns the rows round when it lays them out, so a
+    // chat reads oldest to newest like the chat client does.
+    let _ = sort_inverted;
     for section in &mut sections {
         section.messages.sort_by(|&a, &b| messages[b].timestamp.cmp(&messages[a].timestamp));
     }
