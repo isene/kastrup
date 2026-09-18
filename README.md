@@ -165,7 +165,7 @@ cursor.
 | Key | Action |
 |-----|--------|
 | o | Cycle sort order |
-| i | Invert sort |
+| i | Invert sort (in a folders view: the messages inside each channel run oldest to newest, so `n` reads a chat in order) |
 | w / W | Cycle pane width forward / back |
 | H | Set top-bar (view) colour |
 | B | Folder browser |
