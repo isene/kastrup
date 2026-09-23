@@ -10424,6 +10424,14 @@ impl App {
         let body = parse_chat_body(draft);
         if body.trim().is_empty() { return; }
         let target = target.trim();
+        // A bare number is a channel id, the same rule send_discord uses.
+        let bare;
+        let target = if !target.is_empty() && target.chars().all(|c| c.is_ascii_digit()) {
+            bare = format!("channel:{target}");
+            bare.as_str()
+        } else {
+            target
+        };
 
         let (folder, channel_id, is_channel) =
             if let Some(cid) = target.strip_prefix("channel:") {
