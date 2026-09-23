@@ -6616,8 +6616,18 @@ impl App {
     }
 
     fn copy_right_pane(&self) {
-        let text = self.right.text();
-        crust::clipboard_copy(&crust::strip_ansi(text), "clipboard");
+        // Every row in the pane is padded out to the pane's width, so a
+        // message carries hundreds of trailing spaces nobody wants in a
+        // paste. They also cost room: a terminal takes a copy through an
+        // escape sequence with a size limit, and the padding was pushing
+        // long messages past it, so only the first part arrived.
+        let plain = crust::strip_ansi(self.right.text());
+        let mut out = String::with_capacity(plain.len());
+        for line in plain.lines() {
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        crust::clipboard_copy(out.trim_end_matches('\n'), "clipboard");
     }
 
 }
