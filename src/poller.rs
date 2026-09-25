@@ -16,6 +16,15 @@ pub enum PollerEvent {
 /// can't stall every source behind it in the sequential poll loop.
 const NETWORK_SYNC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// Set once inotify watches every maildir `new/` and `cur/`. From then on
+/// a maildir is scanned when a file lands there, not on the clock.
+static MAILDIR_WATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// With the watches in place, a maildir is still looked at this often, in
+/// case a folder was made after startup (it has no watch) or the kernel
+/// dropped events.
+const MAILDIR_SAFETY_NET: i64 = 300;
+
 /// Run `f` on a worker thread, waiting at most `deadline` for its result.
 /// Returns `None` on timeout; the orphaned worker keeps running and exits on
 /// its own once its blocking I/O finally errors (its result is discarded —
@@ -152,24 +161,20 @@ fn poller_loop(
         + std::time::Duration::from_secs(3600);
 
     // True when this iteration was woken by inotify (a maildir file
-    // actually appeared) rather than by the 10 s safety-net timeout.
-    // A forced iteration scans maildir NOW, bypassing both the
-    // poll-interval loop gate and sync_maildir's mtime gate, so a
-    // delivery that lands within the poll-interval window can't get
-    // orphaned (the bug: inotify wake skipped by the 5 s gate, then
-    // the next timeout poll advances last_sync past the file's dir
-    // mtime → sync_maildir mtime-skips it forever until the next
-    // delivery bumps the dir).
-    //
-    // The first iteration is ALSO forced (last_sync=0, no mtime gate):
-    // a mail that was skipped or dropped on an earlier run (mtime-gate
-    // race, or a parse failure now fixed) sits in new/ with a dir mtime
-    // ≤ the stored last_sync, so a gated startup scan would never re-read
-    // it. One full scan at boot re-examines every dir so such backlog
-    // gets ingested (known_ids dedups everything already in the DB).
-    // Runs on the background poller thread, off the UI paint path, so it
-    // adds no startup latency — the heavier walk is paid once per launch.
+    // actually appeared) rather than by the 10 s timeout. A forced
+    // iteration scans maildir NOW, bypassing the poll-interval gate, so
+    // a delivery never waits for the clock. (The old bug: an inotify
+    // wake skipped by the 5 s gate, then the next timeout poll advanced
+    // last_sync past the file's dir mtime, so the mtime gate skipped it
+    // forever. Bypassing the interval gate is what closes that.)
     let mut forced = true;
+    // The first iteration also reads every folder in full (last_sync=0,
+    // no mtime gate): a mail skipped or dropped on an earlier run (a
+    // parse failure now fixed, say) sits in a folder whose mtime is at
+    // or before the stored last_sync, so a gated scan would never re-read
+    // it. known_ids dedups everything already in the DB. It runs on the
+    // poller thread, off the UI paint path, once per launch.
+    let mut first = true;
 
     loop {
         if std::time::Instant::now() >= next_mem_log {
@@ -203,10 +208,14 @@ fn poller_loop(
             .filter(|s| s.plugin_type != "gateway")
             .map(|s| s.plugin_type.clone()).collect();
         for source in &sources_list {
-            let interval = source.poll_interval;
+            let is_maildir = source.plugin_type == "maildir";
+            let interval = if is_maildir && MAILDIR_WATCHED.load(std::sync::atomic::Ordering::Relaxed) {
+                source.poll_interval.max(MAILDIR_SAFETY_NET)
+            } else {
+                source.poll_interval
+            };
             let last_sync = *polled_at.get(&source.id)
                 .unwrap_or(&source.last_sync.unwrap_or(0));
-            let is_maildir = source.plugin_type == "maildir";
             // inotify-forced wakes bypass the poll-interval gate for
             // maildir — reacting immediately to a delivery is the
             // whole point. Other sources (and timeout polls) keep the
@@ -228,15 +237,16 @@ fn poller_loop(
                         .unwrap_or("~/Maildir");
                     let expanded = path.replace("~/",
                         &format!("{}/", std::env::var("HOME").unwrap_or_default()));
-                    // Forced (inotify) scan passes last_sync=0 to defeat
-                    // sync_maildir's per-dir mtime gate — we KNOW a file
-                    // just landed, so scan every dir and let known_ids
-                    // dedup down to the genuinely-new file(s). This full
-                    // walk only fires on a real delivery event, so the
-                    // tens-of-ms cost is paid only when there's something
-                    // to find; idle 10 s timeout polls still use the
-                    // cheap mtime gate.
-                    let eff_last_sync = if forced { 0 } else { last_sync };
+                    // The first cycle passes last_sync=0 to defeat
+                    // sync_maildir's per-dir mtime gate: every folder is
+                    // read once, so mail skipped on an earlier run gets in.
+                    // After that the gate is safe even on an inotify wake:
+                    // last_sync is when the previous scan STARTED, so a
+                    // file that landed during or after it has a newer
+                    // folder mtime and is read. The gate only stats the
+                    // folders (1,536 here, ~7 ms), where a full read walks
+                    // every file in them.
+                    let eff_last_sync = if first { 0 } else { last_sync };
                     sources::maildir::sync_maildir(&expanded, known, eff_last_sync)
                 }
                 // weechat-relay is driven by its own push supervisor (see
@@ -346,6 +356,7 @@ fn poller_loop(
             std::time::Duration::from_secs(10),
             |state| *state == WakeState::Idle,
         ).unwrap();
+        first = false;
         forced = match *guard {
             WakeState::Stop => return,
             WakeState::Wake => { *guard = WakeState::Idle; true }
@@ -425,14 +436,14 @@ fn inotify_watcher(db: Arc<Database>, wake: Arc<(Mutex<WakeState>, Condvar)>) {
             .and_then(|v| v.as_str())
             .unwrap_or("~/Maildir");
         let root = PathBuf::from(path.replace("~/", &format!("{}/", home)));
-        // Top-level INBOX new/ (where gmail-idle drops mail) — the
-        // common hot path; watch it even if the subfolder enumeration
-        // below somehow fails.
-        let top = root.join("new");
-        if top.is_dir() {
-            if inotify.watches()
-                .add(&top, WatchMask::CREATE | WatchMask::MOVED_TO)
-                .is_ok()
+        // Top-level INBOX new/ and cur/ — the common hot path; watch
+        // them even if the subfolder enumeration below somehow fails.
+        // cur/ as well as new/: a Maildir kept in step by a sync tool
+        // (Syncthing, say) gets mail straight into cur/, never new/.
+        for sub in ["new", "cur"] {
+            let top = root.join(sub);
+            if top.is_dir()
+                && inotify.watches().add(&top, WatchMask::CREATE | WatchMask::MOVED_TO).is_ok()
             {
                 watched += 1;
             }
@@ -455,11 +466,10 @@ fn inotify_watcher(db: Arc<Database>, wake: Arc<(Mutex<WakeState>, Condvar)>) {
                     continue;
                 }
                 if !p.is_dir() { continue; }
-                let sub = p.join("new");
-                if sub.is_dir() {
-                    if inotify.watches()
-                        .add(&sub, WatchMask::CREATE | WatchMask::MOVED_TO)
-                        .is_ok()
+                for sub in ["new", "cur"] {
+                    let dir = p.join(sub);
+                    if dir.is_dir()
+                        && inotify.watches().add(&dir, WatchMask::CREATE | WatchMask::MOVED_TO).is_ok()
                     {
                         watched += 1;
                     }
@@ -469,10 +479,11 @@ fn inotify_watcher(db: Arc<Database>, wake: Arc<(Mutex<WakeState>, Condvar)>) {
     }
 
     if watched == 0 {
-        crate::log::info("inotify: no maildir new/ dirs to watch (polling-only)");
+        crate::log::info("inotify: no maildir new/ or cur/ dirs to watch (polling-only)");
         return;
     }
-    crate::log::info(&format!("inotify: watching {} maildir new/ dir(s)", watched));
+    crate::log::info(&format!("inotify: watching {} maildir new/ and cur/ dir(s)", watched));
+    MAILDIR_WATCHED.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // Event loop. Drain whatever the kernel hands us per wake, then
     // promote WakeState::Idle → Wake exactly once per batch. Multiple
