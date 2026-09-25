@@ -277,6 +277,14 @@ fn drafts_drop_dir() -> std::path::PathBuf {
     home.join(".kastrup").join("drafts")
 }
 
+/// How a view key is shown: "M-1" as "Alt+1", the rest as they are.
+fn key_label(key: &str) -> String {
+    match key.strip_prefix("M-") {
+        Some(k) => format!("Alt+{}", k),
+        None => key.to_string(),
+    }
+}
+
 /// Map a candidate index to its picker key: 0-9, then a-z.
 fn pick_key_for(i: usize) -> char {
     if i < 10 {
@@ -1537,6 +1545,8 @@ struct App {
     /// Ctrl+U peek: when true, muted channels show too (dim muted tag).
     /// Session-only view state, never persisted.
     show_muted: bool,
+    /// The views overview is on screen: `m` there moves a view to another key.
+    views_screen: bool,
 
     // Background poller
     poller: Option<poller::Poller>,
@@ -1868,6 +1878,8 @@ fn main() {
     };
 
     Crust::init();
+    // Views sit on Alt+1 .. Alt+0 too, so Alt+digit must read as "M-1".
+    Input::report_alt(true);
     Crust::set_app_identity("Kastrup");
     let (cols, rows) = Crust::terminal_size();
     log_phase("crust init + identity + termsize", &mut phase);
@@ -2174,6 +2186,7 @@ fn main() {
         last_highlight_refresh: std::time::Instant::now() - std::time::Duration::from_secs(60),
         current_hidden_channels: Vec::new(),
         show_muted: false,
+        views_screen: false,
         poller: None,
         poller_rx: None,
         write_tx,
@@ -2541,6 +2554,10 @@ fn create_panes(cols: u16, rows: u16, width: u16, border: u8, config: &Config) -
 
 impl App {
     fn handle_key(&mut self, key: &str) {
+        if std::mem::take(&mut self.views_screen) && key == "m" {
+            self.move_view_key();
+            return;
+        }
         // While an inline image is visible, only D acts (download). Any
         // other key dismisses the image, like ESC would. Otherwise their
         // redraw paints email text underneath the still-visible image.
@@ -2606,6 +2623,9 @@ impl App {
             "C-S" => { self.show_sources(); }
             "C-W" => { self.show_views_screen(); }
             "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+                self.switch_to_view(key);
+            }
+            "M-0" | "M-1" | "M-2" | "M-3" | "M-4" | "M-5" | "M-6" | "M-7" | "M-8" | "M-9" => {
                 self.switch_to_view(key);
             }
             "F1" | "F2" | "F3" | "F4" | "F5" | "F6" | "F7" | "F8" | "F9"
@@ -2912,7 +2932,7 @@ impl App {
             v => {
                 // Look for named custom view with key number prefix
                 if let Some(view) = self.views.iter().find(|vw| vw.key_binding.as_deref() == Some(v)) {
-                    format!("{} {}", style::fg(&format!("[{}]", v), tc.hint_fg), style::fg(&view.name, tc.view_custom))
+                    format!("{} {}", style::fg(&format!("[{}]", key_label(v)), tc.hint_fg), style::fg(&view.name, tc.view_custom))
                 } else {
                     format!("{} {}", style::fg(&format!("[{}]", v), tc.hint_fg), style::fg(&format!("View {}", v), tc.view_custom))
                 }
@@ -2992,7 +3012,7 @@ impl App {
             if key == self.current_view { continue; }
             if matches!(key.as_str(), "A" | "N" | "*") { continue; }
             if self.view_unread_cache.get(&key).copied().unwrap_or(false) {
-                other_view_badges.push(style::fg(&key, tc.unread));
+                other_view_badges.push(style::fg(&key_label(&key), tc.unread));
             }
         }
 
@@ -6756,6 +6776,7 @@ impl App {
   Ctrl-S         Sources management\n\
   Ctrl-W         Views overview\n\
   0-9            Custom views\n\
+  Alt+0-9        More views\n\
   F1-F12         Extended views\n\
   F              Favorites browser\n\
   L              Load more messages\n\
@@ -6847,6 +6868,8 @@ impl App {
                 "*" => (0, 2, String::new()),
                 k if k.len() == 1 && k.as_bytes()[0].is_ascii_digit() =>
                     (1, (k.as_bytes()[0] - b'0') as i64, String::new()),
+                k if k.len() == 3 && k.starts_with("M-") && k.as_bytes()[2].is_ascii_digit() =>
+                    (1, 10 + (k.as_bytes()[2] - b'0') as i64, String::new()),
                 k if k.len() > 1 && k.starts_with('F')
                     && k[1..].chars().all(|c| c.is_ascii_digit()) =>
                     (2, k[1..].parse::<i64>().unwrap_or(0), String::new()),
@@ -6859,20 +6882,55 @@ impl App {
         let mut lines: Vec<String> = Vec::new();
         lines.push(style::bold("Kastrup - Views"));
         lines.push(String::new());
-        lines.push(style::fg("  Key  View                Matches", warn));
+        lines.push(style::fg("  Key    View                Matches", warn));
         for v in &views {
             let key = v.key_binding.clone().unwrap_or_else(|| "-".into());
             let summary = self.summarize_view_filter(&v.filters);
             lines.push(format!("  {} {:<19} {}",
-                style::fg(&format!("{:<3}", key), warn), v.name, summary));
+                style::fg(&format!("{:<5}", key_label(&key)), warn), v.name, summary));
         }
         lines.push(String::new());
         lines.push(style::fg(
-            "  (read-only — switch with a view key, or open a message to dismiss)",
+            "  m moves a view to another key (a digit or Alt+digit); a view key switches",
             warn));
         self.right.set_text(&lines.join("\n"));
         self.right.ix = 0;
         self.right.full_refresh();
+        self.views_screen = true;
+    }
+
+    /// `m` in the views overview: press a view's key, then the key it
+    /// should move to, a digit or Alt+digit. A key another view holds is
+    /// refused, not swapped, so nothing moves by surprise.
+    fn move_view_key(&mut self) {
+        let warn = self.config.theme_colors.feedback_warn;
+        self.set_feedback("Move which view? Press its key", warn);
+        let Some(from) = Input::getchr(Some(30)) else { self.show_views_screen(); return };
+        let Some(name) = self.views.iter().find(|v| v.key_binding.as_deref() == Some(from.as_str())).map(|v| v.name.clone()) else {
+            self.set_feedback(&format!("No view on {}", key_label(&from)), warn);
+            self.show_views_screen();
+            return;
+        };
+        self.set_feedback(&format!("New key for {}: a digit or Alt+digit", name), warn);
+        let Some(to) = Input::getchr(Some(30)) else { self.show_views_screen(); return };
+        let ok = (to.len() == 1 && to.as_bytes()[0].is_ascii_digit())
+            || (to.len() == 3 && to.starts_with("M-") && to.as_bytes()[2].is_ascii_digit());
+        if !ok {
+            self.set_feedback("Only 0-9 or Alt+0-9", warn);
+        } else if let Some(other) = self.views.iter().find(|v| v.key_binding.as_deref() == Some(to.as_str())) {
+            self.set_feedback(&format!("{} is taken by {}", key_label(&to), other.name), warn);
+        } else {
+            {
+                let conn = self.db.conn.lock().unwrap();
+                let _ = conn.execute("UPDATE views SET key_binding = ? WHERE key_binding = ?", rusqlite::params![to, from]);
+            }
+            self.views = self.db.get_views();
+            if self.current_view == from {
+                self.current_view = to.clone();
+            }
+            self.set_feedback(&format!("{} is now on {}", name, key_label(&to)), self.config.theme_colors.feedback_ok);
+        }
+        self.show_views_screen();
     }
 
     /// Compact human description of a view's `filters` JSON for the
