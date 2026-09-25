@@ -80,6 +80,9 @@ pub fn sync_maildir(maildir_path: &str, known_ids: &HashSet<String>, last_sync: 
                 let path = entry.path();
                 if path.is_dir() { continue; }
                 let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("").to_string();
+                // A name starting with a dot is no message: Syncthing's
+                // `.syncthing.*.tmp` while it writes, an editor's backup.
+                if filename.starts_with('.') { continue; }
 
                 // Check if already known: exact match, prefixed, or base (ignoring flags)
                 if known_ids.contains(&filename) { continue; }
