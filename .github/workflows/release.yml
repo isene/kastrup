@@ -29,24 +29,24 @@ jobs:
             artifact: kastrup-macos-aarch64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: kastrup
 
       - name: Checkout crust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: isene/crust
           path: crust
 
       - name: Checkout glow
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: isene/glow
           path: glow
 
       - name: Checkout highlight
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: isene/highlight
           path: highlight
@@ -86,7 +86,7 @@ jobs:
           chmod +x ../${{ matrix.artifact }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -96,15 +96,15 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           body: |
