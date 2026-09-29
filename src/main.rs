@@ -6780,7 +6780,7 @@ impl App {
   F1-F12         Extended views\n\
   F              Favorites browser\n\
   L              Load more messages\n\
-  Ctrl-R         Refresh current view\n\
+  Ctrl-R         Refresh the view, fetch every source now\n\
   Ctrl-F         Filter editor\n\
   K              Kill (close) view\n\n\
 {}\n\
@@ -7390,7 +7390,9 @@ impl App {
         } else {
             self.switch_to_view(&view);
         }
-        self.set_feedback("View refreshed", self.config.theme_colors.feedback_ok);
+        // And ask every source now, not when its interval comes round.
+        if let Some(p) = self.poller.as_ref() { p.fetch_all(); }
+        self.set_feedback("View refreshed; fetching every source now", self.config.theme_colors.feedback_ok);
     }
 
     fn tag_by_regex(&mut self) {
