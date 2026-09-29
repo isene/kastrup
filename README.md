@@ -104,7 +104,7 @@ cursor.
 | F1-F12 | Extended custom views |
 | F | Favorites browser |
 | L | Load more messages |
-| Ctrl-R | Refresh current view |
+| Ctrl-R | Refresh the view and fetch every source now |
 | Ctrl-F | Edit filter |
 | K | Kill (close) view |
 

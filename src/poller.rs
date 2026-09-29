@@ -48,9 +48,11 @@ where
 ///   * `Wake`  — somebody (inotify, an external trigger) wants
 ///               the poller to scan NOW. Consumed by the poller
 ///               on the next iteration.
+///   * `All`   — the user asked for every source now (Ctrl-R): one
+///               cycle that skips the poll-interval gate for all.
 ///   * `Stop`  — terminal: poller (and helpers) exit.
 #[derive(PartialEq, Eq, Clone, Copy)]
-enum WakeState { Idle, Wake, Stop }
+enum WakeState { Idle, Wake, All, Stop }
 
 pub struct Poller {
     wake: Arc<(Mutex<WakeState>, Condvar)>,
@@ -103,6 +105,18 @@ impl Poller {
         if let Ok(mut g) = lock.lock() {
             if *g == WakeState::Idle {
                 *g = WakeState::Wake;
+                cvar.notify_one();
+            }
+        }
+    }
+
+    /// Fetch every enabled source now, whatever its poll interval: for
+    /// the moment something is wanted at once.
+    pub fn fetch_all(&self) {
+        let (lock, cvar) = &*self.wake;
+        if let Ok(mut g) = lock.lock() {
+            if *g != WakeState::Stop {
+                *g = WakeState::All;
                 cvar.notify_one();
             }
         }
@@ -168,6 +182,8 @@ fn poller_loop(
     // last_sync past the file's dir mtime, so the mtime gate skipped it
     // forever. Bypassing the interval gate is what closes that.)
     let mut forced = true;
+    // True for one cycle after `fetch_all`: every source skips the gate.
+    let mut all = false;
     // The first iteration also reads every folder in full (last_sync=0,
     // no mtime gate): a mail skipped or dropped on an earlier run (a
     // parse failure now fixed, say) sits in a folder whose mtime is at
@@ -220,7 +236,7 @@ fn poller_loop(
             // maildir — reacting immediately to a delivery is the
             // whole point. Other sources (and timeout polls) keep the
             // normal gate.
-            if !(forced && is_maildir) && now - last_sync < interval { continue; }
+            if !(all || (forced && is_maildir)) && now - last_sync < interval { continue; }
 
             // Get or initialize cached known_ids (only load from DB on first access)
             let known = known_cache.entry(source.id).or_insert_with(|| {
@@ -357,10 +373,11 @@ fn poller_loop(
             |state| *state == WakeState::Idle,
         ).unwrap();
         first = false;
-        forced = match *guard {
+        (forced, all) = match *guard {
             WakeState::Stop => return,
-            WakeState::Wake => { *guard = WakeState::Idle; true }
-            WakeState::Idle => false, // 10 s timeout — normal gated poll
+            WakeState::Wake => { *guard = WakeState::Idle; (true, false) }
+            WakeState::All => { *guard = WakeState::Idle; (true, true) }
+            WakeState::Idle => (false, false), // 10 s timeout — normal gated poll
         };
     }
 }
