@@ -7200,7 +7200,7 @@ impl App {
         }
         if let Some(html) = html {
             let path = format!("/tmp/kastrup_msg_{}.html", mid);
-            if std::fs::write(&path, &html).is_ok() {
+            if std::fs::write(&path, html_for_browser(&html)).is_ok() {
                 spawn(&path);
                 self.set_feedback("Opened in browser", self.config.theme_colors.feedback_ok);
             }
@@ -7317,7 +7317,7 @@ impl App {
             Some(link)
         } else if let Some(h) = html {
             let path = format!("/tmp/kastrup_msg_{}.html", mid);
-            let _ = std::fs::write(&path, &h);
+            let _ = std::fs::write(&path, html_for_browser(&h));
             Some(format!("file://{}", path))
         } else {
             match urls.len() {
@@ -14361,6 +14361,22 @@ fn extract_mime_text(raw: &str) -> Option<String> {
 }
 
 
+/// A mail's HTML as written to a file for the browser. The desktop tells a
+/// file's type by its first 256 bytes, and an XHTML doctype there makes
+/// WebKit (gaze) read the mail as strict XML: one unclosed <meta> and the
+/// page is an error box. A comment of 256 spaces pushes the doctype past
+/// those bytes, so the mail opens as plain HTML, as it does in Firefox.
+fn html_for_browser(html: &str) -> String {
+    format!("<!--{:256}-->\n{}", "", html)
+}
+
+#[cfg(test)]
+#[test]
+fn an_xhtml_doctype_is_out_of_the_bytes_the_desktop_reads() {
+    let page = html_for_browser(r#"<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "x"><html xmlns="http://www.w3.org/1999/xhtml">"#);
+    assert!(page.starts_with("<!--"));
+    assert!(!page[..256].contains("XHTML") && !page[..256].contains("xmlns"));
+}
 
 /// Pick the most useful HTML representation of a message for the
 /// "open in scroll / browser" path. Tries, in order:
