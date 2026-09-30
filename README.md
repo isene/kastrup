@@ -101,7 +101,6 @@ cursor.
 | N | New (unread) |
 | Ctrl-S | Sources management |
 | 0-9 | Custom views |
-| F1-F12 | Extended custom views |
 | F | Favorites browser |
 | L | Load more messages |
 | Ctrl-R | Refresh the view and fetch every source now |
