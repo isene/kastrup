@@ -21,6 +21,10 @@ use std::path::PathBuf;
 /// and with the screen locked Android hands the relay only "Sensitive
 /// notification content hidden". That stand-in is dropped for every
 /// platform; there is nothing in it to read.
+///
+/// Private Discord messages are the exception. The Discord source is a
+/// bot: it reads server channels and its own DMs, never the DMs sent to
+/// Geir's own account, so the phone is the only way those arrive.
 pub fn sync_gateway(config: &serde_json::Value, known_ids: &HashSet<String>, covered: &HashSet<String>) -> Vec<MessageData> {
     let base = config
         .get("gateway_dir")
@@ -86,7 +90,7 @@ pub fn sync_gateway(config: &serde_json::Value, known_ids: &HashSet<String>, cov
         // source already brings in, and Android's hidden-content stand-in.
         if platform.is_empty() || thread_key.is_empty()
             || (body.is_empty() && media_refs.is_empty())
-            || covered.contains(platform)
+            || (covered.contains(platform) && !(platform == "discord" && !group))
             || body == "Sensitive notification content hidden"
         {
             for (p, _) in &media_refs { let _ = std::fs::remove_file(p); }
@@ -102,6 +106,7 @@ pub fn sync_gateway(config: &serde_json::Value, known_ids: &HashSet<String>, cov
             "sms" => "SMS",
             "linkedin" => "LinkedIn",
             "reddit" => "Reddit",
+            "discord" => "Discord",
             other => other,
         };
 
@@ -284,4 +289,29 @@ fn expand_tilde(p: &str) -> PathBuf {
         return home_dir().join(rest);
     }
     PathBuf::from(p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_private_discord_message_gets_through_though_the_bot_covers_discord() {
+        let dir = std::env::temp_dir().join(format!("kastrup-gw-test-{}", std::process::id()));
+        let inbound = dir.join("inbound");
+        std::fs::create_dir_all(&inbound).unwrap();
+        let drop = |name: &str, platform: &str, group: bool| {
+            let json = format!(r#"{{"platform":"{platform}","thread_key":"{name}","sender":"{name}","text":"hi","timestamp":1716900000,"group":{group}}}"#);
+            std::fs::write(inbound.join(format!("{name}.json")), json).unwrap();
+        };
+        drop("alice", "discord", false);
+        drop("server", "discord", true);
+        drop("bob", "whatsapp", false);
+        let config = serde_json::json!({ "gateway_dir": dir.to_str().unwrap() });
+        let covered: HashSet<String> = ["discord".to_string()].into_iter().collect();
+        let mut got: Vec<String> = sync_gateway(&config, &HashSet::new(), &covered).into_iter().map(|m| m.sender).collect();
+        got.sort();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, vec!["alice", "bob"], "the private Discord message and WhatsApp stay; the channel one is the bot's");
+    }
 }
