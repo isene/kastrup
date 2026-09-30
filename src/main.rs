@@ -6058,6 +6058,13 @@ impl App {
         let min_deleted_pos = ids.iter()
             .filter_map(|id| self.filtered_messages.iter().position(|m| m.id == *id))
             .min().unwrap_or(0);
+        // Where the cursor lands: the row just above the topmost deleted
+        // one, found again after the rebuild by what it is, so collapsed
+        // threads and hidden channels cannot shift it. The section logic
+        // above is the fallback when there is no such row.
+        let anchor = anchor_above(
+            if self.show_threaded { &self.display_messages } else { &self.filtered_messages },
+            &id_set);
 
         self.filtered_messages.retain(|m| !id_set.contains(&m.id));
 
@@ -6071,13 +6078,15 @@ impl App {
                     || (m.is_header && m.thread_id.as_deref() == Some(name)))
             };
             let len = self.display_messages.len();
-            self.index = own_section.as_deref().and_then(|n| pos_of(n, &self.display_messages))
+            self.index = anchor.as_ref().and_then(|a| find_anchor(&self.display_messages, a))
+                .or_else(|| own_section.as_deref().and_then(|n| pos_of(n, &self.display_messages)))
                 .or_else(|| prev_section.as_deref().and_then(|n| pos_of(n, &self.display_messages)))
                 .unwrap_or(0)
                 .min(len.saturating_sub(1));
         } else {
             let len = self.filtered_messages.len();
-            self.index = min_deleted_pos.min(len.saturating_sub(1));
+            self.index = anchor.as_ref().and_then(|a| find_anchor(&self.filtered_messages, a))
+                .unwrap_or(min_deleted_pos).min(len.saturating_sub(1));
         }
 
         let ms_list = t_start.elapsed().as_millis();
@@ -15700,6 +15709,60 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     result
+}
+
+/// A row the cursor can be put back on after the list is rebuilt: a
+/// message by its id, a section header by its name.
+enum RowAnchor { Msg(i64), Header(String) }
+
+/// The row just above the topmost of `ids` in `rows`, passing over rows
+/// that go too. None when the topmost is the first row.
+fn anchor_above(rows: &[Message], ids: &std::collections::HashSet<i64>) -> Option<RowAnchor> {
+    let top = rows.iter().position(|m| !m.is_header && ids.contains(&m.id))?;
+    rows[..top].iter().rev().find(|m| m.is_header || !ids.contains(&m.id)).map(|m| {
+        if m.is_header { RowAnchor::Header(m.thread_id.clone().unwrap_or_default()) } else { RowAnchor::Msg(m.id) }
+    })
+}
+
+fn find_anchor(rows: &[Message], a: &RowAnchor) -> Option<usize> {
+    rows.iter().position(|m| match a {
+        RowAnchor::Msg(id) => !m.is_header && m.id == *id,
+        RowAnchor::Header(n) => m.is_header && m.thread_id.as_deref() == Some(n.as_str()),
+    })
+}
+
+#[cfg(test)]
+mod purge_cursor_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn msg(id: i64) -> Message { Message { id, is_header: false, ..Message::default() } }
+
+    fn header(name: &str) -> Message {
+        let mut h = Message::default_header();
+        h.thread_id = Some(name.into());
+        h
+    }
+
+    #[test]
+    fn the_cursor_lands_on_the_row_just_above_the_deleted_one() {
+        let before = vec![header("a"), msg(1), msg(2), header("b"), msg(3), msg(4), msg(5)];
+        // Two rows deep in a section: the row above them, not the section's top.
+        let ids: HashSet<i64> = [4, 5].into_iter().collect();
+        let a = anchor_above(&before, &ids).unwrap();
+        let after = vec![header("a"), msg(1), msg(2), header("b"), msg(3)];
+        assert_eq!(find_anchor(&after, &a), Some(4));
+        // The first message of a section: its header is the row above.
+        let ids: HashSet<i64> = [3].into_iter().collect();
+        let a = anchor_above(&before, &ids).unwrap();
+        assert_eq!(find_anchor(&before, &a), Some(3));
+        // A whole section going, header aside: the last row of the one above.
+        let ids: HashSet<i64> = [3, 4, 5].into_iter().collect();
+        assert_eq!(find_anchor(&before, &anchor_above(&before, &ids).unwrap()), Some(3));
+        // Nothing above the first row.
+        let ids: HashSet<i64> = [9].into_iter().collect();
+        assert!(anchor_above(&[msg(9), msg(10)], &ids).is_none());
+    }
 }
 
 #[cfg(test)]
