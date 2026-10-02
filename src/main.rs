@@ -277,6 +277,120 @@ fn drafts_drop_dir() -> std::path::PathBuf {
     home.join(".kastrup").join("drafts")
 }
 
+/// One step over `text`: an escape sequence in one piece (colour, or a
+/// link's start or end), or one character. Gives the piece and where the
+/// next one starts.
+fn text_piece(text: &str, at: usize) -> (&str, usize) {
+    let rest = &text[at..];
+    let b = rest.as_bytes();
+    if b.len() >= 2 && b[0] == 0x1b && b[1] == b'[' {
+        // CSI: up to and with its final letter.
+        let end = b[2..].iter().position(|c| (0x40..=0x7e).contains(c)).map(|i| i + 3).unwrap_or(b.len());
+        return (&rest[..end], at + end);
+    }
+    if b.len() >= 2 && b[0] == 0x1b && b[1] == b']' {
+        // OSC: up to BEL, or ESC and a backslash.
+        let mut i = 2;
+        while i < b.len() {
+            if b[i] == 0x07 { i += 1; break; }
+            if b[i] == 0x1b && b.get(i + 1) == Some(&b'\\') { i += 2; break; }
+            i += 1;
+        }
+        return (&rest[..i], at + i);
+    }
+    let len = rest.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+    (&rest[..len], at + len)
+}
+
+/// Where `needle` stands in what `text` shows: byte ranges into `text`.
+/// Escape sequences are stepped over, case does not count, and any run
+/// of blanks and line breaks is one space, so a phrase is found across
+/// the end of a line.
+fn find_spans(text: &str, needle: &str) -> Vec<(usize, usize)> {
+    let needle: Vec<char> = needle.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase().chars().collect();
+    if needle.is_empty() { return Vec::new(); }
+    // The visible characters, lowercased, each with the bytes it came from.
+    let mut seen: Vec<(char, usize, usize)> = Vec::new();
+    let mut at = 0;
+    while at < text.len() {
+        let (piece, next) = text_piece(text, at);
+        if !piece.starts_with('\x1b') {
+            let c = piece.chars().next().unwrap_or(' ');
+            if c.is_whitespace() {
+                if seen.last().is_some_and(|l| l.0 != ' ') { seen.push((' ', at, next)); }
+            } else {
+                for l in c.to_lowercase() { seen.push((l, at, next)); }
+            }
+        }
+        at = next;
+    }
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i + needle.len() <= seen.len() {
+        if seen[i..i + needle.len()].iter().map(|s| s.0).eq(needle.iter().copied()) {
+            spans.push((seen[i].1, seen[i + needle.len() - 1].2));
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    spans
+}
+
+/// What starts a lit hit: reverse video, and yellow for the current one.
+fn find_mark(current: bool) -> String {
+    if current { format!("{}{}", style::set_fg(226), style::REVERSE) } else { style::REVERSE.to_string() }
+}
+
+/// `text` with the hits in `spans` lit and number `current` in yellow.
+/// The colours around a hit come back after it (`fg` is the pane's own),
+/// and a hit that runs over a line break is lit on each line, not across
+/// the gap between them.
+fn light_spans(text: &str, spans: &[(usize, usize)], current: usize, fg: u8) -> String {
+    if spans.is_empty() { return text.to_string(); }
+    let mut out = String::with_capacity(text.len() + spans.len() * 32);
+    // The colour sequences since the last reset, to put back after a hit.
+    let mut outer = String::new();
+    let mut span = 0;
+    // Some(true) while the current hit is lit, Some(false) for another.
+    let mut lit: Option<bool> = None;
+    let mut at = 0;
+    let mut last_blank = false;
+    while at < text.len() {
+        while span < spans.len() && at >= spans[span].1 { span += 1; }
+        let inside = span < spans.len() && at >= spans[span].0;
+        let (piece, next) = text_piece(text, at);
+        let escape = piece.starts_with('\x1b');
+        let blank = !escape && piece.chars().all(char::is_whitespace);
+        // Inside a hit, one space between two words is lit. A line break,
+        // or the blanks that pad a line out, are not.
+        let next_blank = text[next..].chars().next().is_none_or(char::is_whitespace);
+        let gap = piece == "\n" || (blank && (last_blank || next_blank));
+        let want = inside && !escape && !gap;
+        if let (Some(yellow), false) = (lit, want) {
+            out.push_str(style::REVERSE_OFF);
+            if yellow { out.push_str(&style::set_fg(fg)); }
+            out.push_str(&outer);
+            lit = None;
+        } else if want && lit.is_none() {
+            out.push_str(&find_mark(span == current));
+            lit = Some(span == current);
+        }
+        if escape && piece.ends_with('m') {
+            if piece == style::RESET { outer.clear(); } else { outer.push_str(piece); }
+        }
+        if piece == "\n" { outer.clear(); }
+        if !escape { last_blank = blank; }
+        out.push_str(piece);
+        at = next;
+    }
+    if let Some(yellow) = lit {
+        out.push_str(style::REVERSE_OFF);
+        if yellow { out.push_str(&style::set_fg(fg)); }
+    }
+    out
+}
+
 /// What a `mailto:` link asks for (RFC 6068): who, and maybe a subject
 /// and a text to start from.
 #[derive(Default, Debug, PartialEq)]
@@ -1492,6 +1606,19 @@ struct App {
     /// Last `\` find-in-view needle, so `\` then Enter (empty) jumps to the
     /// next match without retyping.
     last_find: String,
+    /// The find in the message pane (`|`): the word or phrase whose hits
+    /// are lit, empty when no find is on. `;` and `,` step through them.
+    find_needle: String,
+    /// The last one, so `;` after Esc, or `|` then Enter, brings it back.
+    find_last: String,
+    /// Which hit is the current one, and whether `;` has gone to a hit in
+    /// this message yet. A new message starts at its first hit.
+    find_at: usize,
+    find_jumped: bool,
+    /// The pane's text without the hits lit, and with them, to tell
+    /// whether the pane still shows what the find put there.
+    find_base: String,
+    find_shown: String,
     in_source_view: bool,
     index: usize,
 
@@ -2240,6 +2367,12 @@ fn main() {
         active_search_filter: None,
         active_search_label: String::new(),
         last_find: String::new(),
+        find_needle: String::new(),
+        find_last: String::new(),
+        find_at: 0,
+        find_jumped: false,
+        find_base: String::new(),
+        find_shown: String::new(),
         in_source_view: false,
         index: 0,
         filtered_messages: Vec::new(),
@@ -2790,6 +2923,9 @@ impl App {
             // Search / filter
             "/" => { self.search_prompt(); }
             "\\" => { self.find_in_view(); }
+            "|" => { self.find_in_message(); }
+            ";" => { self.find_step(1); }
+            "," => { self.find_step(-1); }
             // A plugin that asked for a key of its own (`top:` in its file).
             k if self.top_plugins.iter().any(|(pk, _, _)| pk == k) => {
                 if let Some((_, l, c)) = self.top_plugins.iter().find(|(pk, _, _)| pk == k).cloned() {
@@ -2876,7 +3012,9 @@ impl App {
 
             // Esc: drop sticky search, reload current view.
             "ESC" => {
-                if self.active_search_filter.is_some() {
+                if !self.find_needle.is_empty() {
+                    self.find_clear();
+                } else if self.active_search_filter.is_some() {
                     self.active_search_filter = None;
                     self.active_search_label.clear();
                     let key = self.current_view.clone();
@@ -3695,7 +3833,12 @@ impl App {
             if let Some((cid, cfp, ref text)) = self.body_cache {
                 if (cid, cfp) == cache_key {
                     // Cache hit — reuse rendered text; skip the heavy pipeline.
-                    self.right.set_text(text);
+                    if self.find_needle.is_empty() {
+                        self.right.set_text(text);
+                    } else {
+                        let base = text.clone();
+                        self.set_right_found(&base);
+                    }
                     self.right.full_refresh();
                     if self.right.border { self.right.border_refresh(); }
                     return;
@@ -4046,7 +4189,14 @@ impl App {
         if msg.id != 0 {
             self.body_cache = Some((cache_key.0, cache_key.1, rendered.clone()));
         }
-        self.right.set_text(&rendered);
+        if self.find_needle.is_empty() {
+            self.right.set_text(&rendered);
+        } else {
+            // Another message under a find that is still on: its hits are
+            // lit too, and `;` starts at the first of them.
+            if msg_changed { self.find_at = 0; self.find_jumped = false; }
+            self.set_right_found(&rendered);
+        }
         if msg_changed {
             self.right.ix = 0;
             self.right.full_refresh();
@@ -6926,6 +7076,8 @@ impl App {
   X              Open HTML in browser\n\n\
 {}\n\
   /              Search messages (DB content substring, sticky)\n\
+  |              Find a word or phrase in the message on the right\n\
+  ; / ,          Next / previous hit of that find (Esc ends it)\n\
   #              Go to message by id (kastrup:7957849 or 7957849)\n\
   @              Address book: the alias file in your editor (mutt style, groups too)\n\
   S              :search (claude → Filters → message list)\n\
@@ -7704,6 +7856,88 @@ impl App {
                 &format!("Not found in view: {}", needle),
                 self.config.theme_colors.feedback_warn),
         }
+    }
+
+    /// `|`: find a word or phrase in the message pane. Every hit is lit,
+    /// the pane moves to the first, and `;` and `,` step on from there.
+    fn find_in_message(&mut self) {
+        let input = self.prompt("|find: ", "");
+        self.render_bottom_bar();
+        let needle = if input.trim().is_empty() { self.find_last.clone() } else { input.trim().to_string() };
+        if needle.is_empty() { return; }
+        self.find_needle = needle.clone();
+        self.find_last = needle;
+        self.find_at = 0;
+        self.find_jumped = false;
+        self.find_step(1);
+    }
+
+    /// `;` and `,`: on to the next hit, or back to the one before. Past
+    /// the last it starts over at the first.
+    fn find_step(&mut self, dir: i64) {
+        if self.find_needle.is_empty() {
+            if self.find_last.is_empty() {
+                self.set_feedback("No find yet: | starts one", self.config.theme_colors.feedback_warn);
+                return;
+            }
+            self.find_needle = self.find_last.clone();
+            self.find_jumped = false;
+        }
+        // What the pane holds without the hits lit: the text the find last
+        // worked on, or whatever the pane has been given since.
+        let base = if !self.find_shown.is_empty() && self.right.text() == self.find_shown {
+            self.find_base.clone()
+        } else {
+            self.right.text().to_string()
+        };
+        let n = find_spans(&base, &self.find_needle).len();
+        if n == 0 {
+            self.set_right_found(&base);
+            self.right.refresh();
+            self.set_feedback(&format!("Not in this message: {}", self.find_needle), self.config.theme_colors.feedback_warn);
+            return;
+        }
+        self.find_at = if !self.find_jumped {
+            if dir < 0 { n - 1 } else { 0 }
+        } else {
+            (self.find_at as i64 + dir).rem_euclid(n as i64) as usize
+        };
+        self.find_jumped = true;
+        self.set_right_found(&base);
+        // Bring the hit into view, a third of the way down, unless it is
+        // on screen already.
+        let rows = self.right.visual_lines();
+        let mark = find_mark(true);
+        if let Some(row) = rows.iter().position(|l| l.contains(&mark)) {
+            let h = self.right.h as usize;
+            if row < self.right.ix || row >= self.right.ix + h {
+                self.right.ix = row.saturating_sub(h / 3).min(rows.len().saturating_sub(1));
+            }
+        }
+        self.right.refresh();
+        self.set_feedback(&format!("|{}  {} of {}", self.find_needle, self.find_at + 1, n), self.config.theme_colors.feedback_info);
+    }
+
+    /// Esc: the find is over and the message is plain again, where it was.
+    fn find_clear(&mut self) {
+        self.find_needle.clear();
+        if !self.find_shown.is_empty() && self.right.text() == self.find_shown {
+            let base = std::mem::take(&mut self.find_base);
+            self.right.set_text(&base);
+            self.right.refresh();
+        }
+        self.find_base.clear();
+        self.find_shown.clear();
+        self.set_feedback("find cleared", self.config.theme_colors.feedback_ok);
+    }
+
+    /// Put `base` in the message pane with the hits of the find lit.
+    fn set_right_found(&mut self, base: &str) {
+        let spans = find_spans(base, &self.find_needle);
+        if self.find_at >= spans.len() { self.find_at = 0; }
+        self.right.set_text(&light_spans(base, &spans, self.find_at, self.right.fg as u8));
+        self.find_base = base.to_string();
+        self.find_shown = self.right.text().to_string();
     }
 
     /// Move the cursor onto the message with `target_id`. In threaded/folders
@@ -16033,6 +16267,45 @@ mod fold_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_find_sees_through_colours_case_and_line_ends() {
+        let text = format!("The {} proof\nruns on.   \nFree Will again", style::fg("Freedom", 177));
+        let spans = find_spans(&text, "freedom proof");
+        assert_eq!(spans.len(), 1);
+        assert!(text[spans[0].0..spans[0].1].starts_with("Freedom") && text[spans[0].0..spans[0].1].ends_with("proof"));
+        // A phrase over the end of a padded line.
+        let over = find_spans(&text, "on. free   will");
+        assert_eq!(over.len(), 1);
+        assert_eq!(find_spans(&text, "FREE").len(), 2);
+        assert!(find_spans(&text, "absent").is_empty());
+        assert!(find_spans(&text, "  ").is_empty());
+        assert_eq!(find_spans("blåbær og BLÅBÆR", "Blåbær").len(), 2);
+    }
+
+    #[test]
+    fn lit_hits_leave_the_text_and_its_colours_as_they_were() {
+        let text = format!("one {} three\nfour two   \ntwo five", style::fg("two words", 177));
+        let spans = find_spans(&text, "two");
+        assert_eq!(spans.len(), 3);
+        let lit = light_spans(&text, &spans, 1, 252);
+        // Nothing the reader sees changed.
+        assert_eq!(crust::strip_ansi(&lit), crust::strip_ansi(&text));
+        // Hit 1 is the yellow one, the others plain reverse.
+        assert_eq!(lit.matches(&find_mark(true)).count(), 1);
+        assert_eq!(lit.matches(style::REVERSE).count(), 3);
+        assert_eq!(lit.matches(style::REVERSE_OFF).count(), 3);
+        // The colour around the first hit comes back after it.
+        let after = lit.split(style::REVERSE_OFF).nth(1).unwrap();
+        assert!(after.starts_with(&style::set_fg(177)), "{after:?}");
+        // A phrase over a line end is lit on both lines, not across the padding.
+        let both = find_spans(&text, "two two");
+        assert_eq!(both.len(), 1);
+        let lit = light_spans(&text, &both, 0, 252);
+        assert_eq!(lit.matches(style::REVERSE).count(), 2);
+        assert!(lit.contains(&format!("{}   \n", style::set_fg(252))), "{lit:?}");
+        assert_eq!(light_spans(&text, &[], 0, 252), text);
+    }
 
     #[test]
     fn a_mailto_link_gives_its_address_subject_and_text() {
