@@ -277,6 +277,106 @@ fn drafts_drop_dir() -> std::path::PathBuf {
     home.join(".kastrup").join("drafts")
 }
 
+/// What a `mailto:` link asks for (RFC 6068): who, and maybe a subject
+/// and a text to start from.
+#[derive(Default, Debug, PartialEq)]
+struct Mailto {
+    to: String,
+    cc: String,
+    bcc: String,
+    subject: String,
+    body: String,
+}
+
+/// `%41` to `A`, the rest as it is. A `+` stays a plus: in a mailto:
+/// link it is part of an address, not a space.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Read a `mailto:` link. None when it is not one. A link can name no
+/// address at all and still carry a subject or a text.
+fn parse_mailto(uri: &str) -> Option<Mailto> {
+    let uri = uri.trim();
+    if !uri.get(..7)?.eq_ignore_ascii_case("mailto:") { return None; }
+    let rest = &uri[7..];
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    // A header value is one line. A link that smuggles a line break in
+    // could add a header of its own, an `Attach:` among them.
+    let line = |v: &str| percent_decode(v).replace(['\r', '\n'], " ").trim().to_string();
+    let add = |list: &mut String, v: String| {
+        if v.is_empty() { return; }
+        if !list.is_empty() { list.push_str(", "); }
+        list.push_str(&v);
+    };
+    let mut m = Mailto::default();
+    for addr in path.split(',') { add(&mut m.to, line(addr)); }
+    for param in query.split('&') {
+        let Some((k, v)) = param.split_once('=') else { continue };
+        match percent_decode(k).to_ascii_lowercase().as_str() {
+            "to" => add(&mut m.to, line(v)),
+            "cc" => add(&mut m.cc, line(v)),
+            "bcc" => add(&mut m.bcc, line(v)),
+            "subject" => m.subject = line(v),
+            "body" => m.body = percent_decode(v).replace("\r\n", "\n").replace('\r', "\n"),
+            // Any other header is the link's wish, not the user's: left out.
+            _ => {}
+        }
+    }
+    Some(m)
+}
+
+/// The draft a `mailto:` link becomes: the same text `+` would open,
+/// from the default identity, with its signature.
+fn mailto_draft(config: &Config, m: &Mailto) -> String {
+    let ident = config.identity_for_folder(None);
+    let (from, reply_to) = match ident {
+        Some(i) => (i.from_line(), i.email.clone()),
+        None => (config.default_email.clone(), config.default_email.clone()),
+    };
+    let mut d = format!(
+        "From: {from}\nTo: {}\nCc: {}\nBcc: {}\nReply-To: {reply_to}\nSubject: {}\n\n{}\n",
+        m.to, m.cc, m.bcc, m.subject, m.body.trim_end()
+    );
+    let sig = ident.map(|i| i.signature()).unwrap_or_default();
+    if !sig.is_empty() {
+        d.push_str(&format!("\n-- \n{sig}\n"));
+    }
+    d
+}
+
+/// `kastrup --draft mailto:...`: put the link in the drop folder as a
+/// draft and say where. The same link twice gives one file, so a page
+/// that fires its link again and again fills nothing up.
+fn queue_mailto(uri: &str) -> Result<std::path::PathBuf, String> {
+    let m = parse_mailto(uri).ok_or("not a mailto: link")?;
+    let text = mailto_draft(&Config::load(), &m);
+    let dir = drafts_drop_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // FNV-1a of the link names the file.
+    let hash = uri.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    let path = dir.join(format!("mailto-{hash:016x}.eml"));
+    let tmp = dir.join(format!(".mailto-{hash:016x}.tmp"));
+    std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
 /// How a view key is shown: "M-1" as "Alt+1", the rest as they are.
 fn key_label(key: &str) -> String {
     match key.strip_prefix("M-") {
@@ -1707,6 +1807,8 @@ fn main() {
         println!("  kastrup:ID | ID       open that message (paste an id straight in)");
         println!("  --compose-to ADDR     open a compose window to ADDR");
         println!("  --subject TEXT        subject for --compose-to");
+        println!("  mailto:LINK           open a compose window for that link");
+        println!("  --draft mailto:LINK   queue the link as a draft for + and leave");
         println!("  --backfill-text       fill the decoded body for older messages");
         println!("  --weechat-probe       one-shot relay wire test");
         println!("  -v, --version         print version");
@@ -1720,6 +1822,20 @@ fn main() {
     if std::env::args().skip(1).any(|a| a == "-v" || a == "--version") {
         println!("kastrup {}", env!("CARGO_PKG_VERSION"));
         return;
+    }
+
+    // --draft mailto:...: a browser hands over a mail link. It becomes a
+    // draft in the drop folder, where + in a running kastrup finds it. No
+    // terminal and no database, so it is done in a few milliseconds.
+    {
+        let mut args = std::env::args().skip(1);
+        if args.any(|a| a == "--draft") {
+            match queue_mailto(&args.next().unwrap_or_default()) {
+                Ok(path) => println!("Draft queued for + in kastrup: {}", path.display()),
+                Err(e) => { eprintln!("kastrup --draft: {e}"); std::process::exit(1); }
+            }
+            return;
+        }
     }
 
     // --backfill-text: fill `content_text` for rows that predate the
@@ -1842,20 +1958,10 @@ fn main() {
             }
             "--compose-to" if i + 1 < args.len() => { compose_to = Some(args[i + 1].clone()); i += 2; }
             "--subject" if i + 1 < args.len() => { compose_subject = Some(args[i + 1].clone()); i += 2; }
-            a if a.starts_with("mailto:") => {
-                // Parse mailto:user@host?subject=X&cc=Y&body=Z
-                let rest = &a[7..];
-                let (addr, query) = rest.split_once('?').unwrap_or((rest, ""));
-                compose_to = Some(addr.to_string());
-                for param in query.split('&') {
-                    if let Some((k, v)) = param.split_once('=') {
-                        let decoded = v.replace("%20", " ").replace("+", " ");
-                        match k.to_lowercase().as_str() {
-                            "subject" => compose_subject = Some(decoded),
-                            _ => {}
-                        }
-                    }
-                }
+            a if parse_mailto(a).is_some() => {
+                let m = parse_mailto(a).unwrap_or_default();
+                compose_to = Some(m.to);
+                if !m.subject.is_empty() { compose_subject = Some(m.subject); }
                 i += 1;
             }
             _ => { i += 1; }
@@ -15927,6 +16033,35 @@ mod fold_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mailto_link_gives_its_address_subject_and_text() {
+        let m = parse_mailto("mailto:a@example.com?subject=Objection%20to%20step%201%3A%20why&body=First%20line%0D%0ASecond%0Aline&cc=b@example.com").unwrap();
+        assert_eq!(m.to, "a@example.com");
+        assert_eq!(m.cc, "b@example.com");
+        assert_eq!(m.subject, "Objection to step 1: why");
+        assert_eq!(m.body, "First line\nSecond\nline");
+        let two = parse_mailto("MAILTO:a@example.com,b%2Bx@example.com?to=c@example.com").unwrap();
+        assert_eq!(two.to, "a@example.com, b+x@example.com, c@example.com");
+        assert_eq!(parse_mailto("mailto:?subject=Bl%C3%A5b%C3%A6r").unwrap(), Mailto { subject: "Blåbær".into(), ..Default::default() });
+        assert_eq!(parse_mailto("https://example.com/"), None);
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("a%2"), "a%2");
+    }
+
+    #[test]
+    fn a_mailto_link_cannot_add_headers_of_its_own() {
+        // A line break in a header value would start a new header, and
+        // kastrup attaches the file an `Attach:` header names.
+        let m = parse_mailto("mailto:a@example.com?subject=Hi%0AAttach%3A%20~/.ssh/id_rsa&from=evil@example.com&attach=/etc/passwd").unwrap();
+        assert_eq!(m.subject, "Hi Attach: ~/.ssh/id_rsa");
+        let draft = mailto_draft(&Config::default(), &m);
+        let headers = draft.split("\n\n").next().unwrap();
+        assert_eq!(headers.lines().count(), 6, "the six headers and no more:\n{headers}");
+        assert!(!headers.lines().any(|l| l.to_ascii_lowercase().starts_with("attach:")));
+        assert!(!draft.contains("evil@example.com"));
+        assert!(parse_chat_attachments(&draft).is_empty());
+    }
 
     #[test]
     fn a_sender_with_no_name_is_just_the_address() {
