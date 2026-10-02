@@ -1607,11 +1607,11 @@ struct App {
     /// next match without retyping.
     last_find: String,
     /// The find in the message pane (`|`): the word or phrase whose hits
-    /// are lit, empty when no find is on. `;` and `,` step through them.
+    /// are lit, empty when no find is on. `,` and `;` step through them.
     find_needle: String,
-    /// The last one, so `;` after Esc, or `|` then Enter, brings it back.
+    /// The last one, so `,` after Esc, or `|` then Enter, brings it back.
     find_last: String,
-    /// Which hit is the current one, and whether `;` has gone to a hit in
+    /// Which hit is the current one, and whether `,` has gone to a hit in
     /// this message yet. A new message starts at its first hit.
     find_at: usize,
     find_jumped: bool,
@@ -2924,8 +2924,8 @@ impl App {
             "/" => { self.search_prompt(); }
             "\\" => { self.find_in_view(); }
             "|" => { self.find_in_message(); }
-            ";" => { self.find_step(1); }
-            "," => { self.find_step(-1); }
+            "," => { self.find_step(1); }
+            ";" => { self.find_step(-1); }
             // A plugin that asked for a key of its own (`top:` in its file).
             k if self.top_plugins.iter().any(|(pk, _, _)| pk == k) => {
                 if let Some((_, l, c)) = self.top_plugins.iter().find(|(pk, _, _)| pk == k).cloned() {
@@ -4193,7 +4193,7 @@ impl App {
             self.right.set_text(&rendered);
         } else {
             // Another message under a find that is still on: its hits are
-            // lit too, and `;` starts at the first of them.
+            // lit too, and `,` starts at the first of them.
             if msg_changed { self.find_at = 0; self.find_jumped = false; }
             self.set_right_found(&rendered);
         }
@@ -7077,7 +7077,7 @@ impl App {
 {}\n\
   /              Search messages (DB content substring, sticky)\n\
   |              Find a word or phrase in the message on the right\n\
-  ; / ,          Next / previous hit of that find (Esc ends it)\n\
+  , / ;          Next / previous hit of that find (Esc ends it)\n\
   #              Go to message by id (kastrup:7957849 or 7957849)\n\
   @              Address book: the alias file in your editor (mutt style, groups too)\n\
   S              :search (claude → Filters → message list)\n\
@@ -7859,7 +7859,7 @@ impl App {
     }
 
     /// `|`: find a word or phrase in the message pane. Every hit is lit,
-    /// the pane moves to the first, and `;` and `,` step on from there.
+    /// the pane moves to the first, and `,` and `;` step on from there.
     fn find_in_message(&mut self) {
         let input = self.prompt("|find: ", "");
         self.render_bottom_bar();
@@ -7872,7 +7872,7 @@ impl App {
         self.find_step(1);
     }
 
-    /// `;` and `,`: on to the next hit, or back to the one before. Past
+    /// `,` and `;`: on to the next hit, or back to the one before. Past
     /// the last it starts over at the first.
     fn find_step(&mut self, dir: i64) {
         if self.find_needle.is_empty() {

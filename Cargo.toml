@@ -1,6 +1,6 @@
 [package]
 name = "kastrup"
-version = "0.3.70"
+version = "0.3.71"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
 description = "Unified messaging hub TUI, built on crust."
