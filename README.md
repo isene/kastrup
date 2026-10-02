@@ -79,6 +79,20 @@ Inside kastrup, `#` does the same thing and takes the same two forms —
 the other end of `y`, which copies the id of the message under the
 cursor.
 
+## Mail links from a browser
+
+```bash
+kastrup 'mailto:alice@example.com?subject=Hello'           # compose now, in this terminal
+kastrup --draft 'mailto:alice@example.com?subject=Hello'   # queue a draft and leave
+```
+
+The first opens kastrup with the message ready to write. The second
+needs no terminal: it writes a draft that `+` finds in the kastrup you
+already have open, from your default identity and with its signature.
+A window browser hands its mail links over this way; [gaze](https://github.com/isene/gaze)
+does it out of the box. The address, Cc, Bcc, subject and text of the
+link are used. Any other header the link asks for is left out.
+
 ## Key Bindings
 
 ### Navigation
