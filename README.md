@@ -159,7 +159,7 @@ link are used. Any other header the link asks for is left out.
 |-----|--------|
 | / | Search messages (notmuch + DB substring fallback) |
 | `\|` | Find a word or phrase in the message on the right: every hit is lit, the pane moves to the first |
-| `;` / `,` | Next / previous hit of that find; past the last it starts over. Esc ends the find |
+| `,` / `;` | Next / previous hit of that find; past the last it starts over. Esc ends the find |
 | `#` | Go to a message by id — `kastrup:7957849` or `7957849` |
 | **S** | **`:search`** — natural-language query → claude translates to a `Filters` JSON spec → applied to the message list |
 | @ | Address book |

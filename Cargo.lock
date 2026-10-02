@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "kastrup"
-version = "0.3.70"
+version = "0.3.71"
 dependencies = [
  "base64",
  "fe2o3-crust",
