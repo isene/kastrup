@@ -257,7 +257,7 @@ pub struct Config {
     ///   push:
     ///     url: http://localhost:8100
     ///     connector: <uuid>
-    ///     key_file: /home/.safe/corpintel-push.key
+    ///     key_file: /home/you/.indexer/push.key
     ///     folder: /home/you/.indexer/push    # optional
     /// With `folder`, a batch goes there as a file while nothing answers
     /// at `url`, for an indexer that reads the folder when it next runs.

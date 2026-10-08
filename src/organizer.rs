@@ -277,22 +277,22 @@ mod tests {
         // the current maildir importer writes it. That used to split it off
         // into a thread of one.
         let msgs = vec![
-            mail(1, "Dualog Insight", None, 100),
-            mail(2, "RE: Dualog Insight", None, 200),
-            mail(3, "Sv: RE: Dualog Insight", Some("its-own-message-id"), 300),
-            mail(4, "Fwd: Dualog Insight", None, 400),
+            mail(1, "Site survey", None, 100),
+            mail(2, "RE: Site survey", None, 200),
+            mail(3, "Sv: RE: Site survey", Some("its-own-message-id"), 300),
+            mail(4, "Fwd: Site survey", None, 400),
             mail(5, "Something else", None, 500),
         ];
         let sections = organize_messages(&msgs, "timestamp", false);
         let thread: Vec<_> = sections.iter()
-            .filter(|s| s.display_name == "Dualog Insight").collect();
+            .filter(|s| s.display_name == "Site survey").collect();
         assert_eq!(thread.len(), 1, "one section for the conversation");
         assert_eq!(thread[0].messages.len(), 4, "all four mails in it");
         assert_eq!(sections.len(), 2, "the unrelated mail stays on its own");
 
         // The section name is what the collapse map keys on, so it has to
         // be the stripped subject, not whichever mail happened to be first.
-        assert_eq!(thread[0].name, "Dualog Insight");
+        assert_eq!(thread[0].name, "Site survey");
         println!("sections: {:?}", sections.iter()
             .map(|s| (s.display_name.clone(), s.messages.len())).collect::<Vec<_>>());
     }
