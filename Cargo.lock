@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-crust"
-version = "0.1.60"
+version = "0.1.61"
 dependencies = [
  "crossterm",
  "libc",
@@ -238,7 +238,7 @@ version = "0.1.1"
 
 [[package]]
 name = "fe2o3-glow"
-version = "0.1.48"
+version = "0.1.49"
 dependencies = [
  "base64",
  "image",
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "kastrup"
-version = "0.3.71"
+version = "0.3.72"
 dependencies = [
  "base64",
  "fe2o3-crust",
