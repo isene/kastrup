@@ -8364,7 +8364,7 @@ impl App {
 
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".into());
         Crust::cleanup();
-        let _ = std::process::Command::new("sh").arg("-c").arg(&format!("{} {}", editor, crust::shell_escape(&tmpfile))).status();
+        let _ = std::process::Command::new("sh").arg("-c").arg(editor_line(&editor, &tmpfile)).status();
         Crust::init();
         Crust::clear_screen();
 
@@ -9012,7 +9012,7 @@ impl App {
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".into());
         Crust::cleanup();
         let _ = std::process::Command::new("sh").arg("-c")
-            .arg(format!("{} {}", editor, crust::shell_escape(&tmpfile)))
+            .arg(editor_line(&editor, &tmpfile))
             .status();
         Crust::init();
         // handle_resize() does clear_screen + create_panes (if size changed) +
@@ -11544,7 +11544,7 @@ impl App {
                                     let editor_short_re = std::path::Path::new(&editor).file_name()
                                         .and_then(|s| s.to_str()).unwrap_or(editor.as_str());
                                     let is_vim_re = matches!(editor_short_re, "vim" | "vi" | "nvim");
-                                    let scribe_re = if editor_short_re == "scribe" { " --no-spell" } else { "" };
+                                    let scribe_re = if editor_short_re == "scribe" { " --no-spell --insert" } else { "" };
                                     let args_re = if is_vim_re { editor_args.as_str() } else { "" };
                                     let cmd_re = format!("{}{} {} {}", editor, scribe_re, args_re, escaped_re);
                                     let _ = std::process::Command::new("sh")
@@ -14100,7 +14100,7 @@ impl App {
         Crust::clear_screen();
         let _ = std::io::Write::flush(&mut std::io::stdout());
         let _ = std::process::Command::new("sh").arg("-c")
-            .arg(&format!("{} {}", editor, crust::shell_escape(&path.to_string_lossy())))
+            .arg(editor_line(&editor, &path.to_string_lossy()))
             .status();
         Crust::init();
         Crust::clear_screen();
@@ -16034,6 +16034,26 @@ fn extract_image_urls(html: &str) -> Vec<String> {
 }
 
 /// Simple string hash for cache filenames
+/// The command line that opens `file` in `editor`. scribe gets `--insert`:
+/// whatever kastrup opens it for, the first key types.
+fn editor_line(editor: &str, file: &str) -> String {
+    let name = std::path::Path::new(editor).file_name().and_then(|s| s.to_str()).unwrap_or(editor);
+    let insert = if name == "scribe" { " --insert" } else { "" };
+    format!("{}{} {}", editor, insert, crust::shell_escape(file))
+}
+
+#[cfg(test)]
+mod editor_line_tests {
+    use super::editor_line;
+
+    #[test]
+    fn scribe_always_starts_in_insert_mode() {
+        assert_eq!(editor_line("scribe", "/tmp/a.txt"), "scribe --insert '/tmp/a.txt'");
+        assert_eq!(editor_line("/home/you/bin/scribe", "/tmp/a.txt"), "/home/you/bin/scribe --insert '/tmp/a.txt'");
+        assert_eq!(editor_line("vim", "/tmp/a.txt"), "vim '/tmp/a.txt'");
+    }
+}
+
 fn simple_hash(s: &str) -> String {
     let mut h: u64 = 5381;
     for b in s.bytes() {
