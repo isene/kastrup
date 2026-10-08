@@ -58,10 +58,10 @@ pub fn sync_discord(config: &serde_json::Value, known_ids: &HashSet<String>) -> 
         }
     }
 
-    // Folder the DMs land in — defaults to PassionFruits so bot replies show in
-    // View 3 alongside the relayed Discord DMs. Override via the source config.
+    // Folder the DMs land in: "Discord", unless the source config names
+    // another under `folder`, such as the folder a view already shows.
     let folder = config.get("folder").and_then(|f| f.as_str())
-        .filter(|s| !s.is_empty()).unwrap_or("PassionFruits").to_string();
+        .filter(|s| !s.is_empty()).unwrap_or("Discord").to_string();
 
     let mut out: Vec<MessageData> = Vec::new();
 
