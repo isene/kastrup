@@ -258,6 +258,9 @@ pub struct Config {
     ///     url: http://localhost:8100
     ///     connector: <uuid>
     ///     key_file: /home/.safe/corpintel-push.key
+    ///     folder: /home/you/.indexer/push    # optional
+    /// With `folder`, a batch goes there as a file while nothing answers
+    /// at `url`, for an indexer that reads the folder when it next runs.
     pub push: Option<crate::feeder::PushConfig>,
     /// Deliver a phone-gateway reply for `<platform>:<thread_key>` through a
     /// native chat target instead of the (phone-drained) gateway outbox.
@@ -491,7 +494,7 @@ impl Config {
             let get = |k: &str| p.get(serde_yaml::Value::String(k.into()))
                 .and_then(|v| v.as_str()).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
             if let (Some(url), Some(connector), Some(key_file)) = (get("url"), get("connector"), get("key_file")) {
-                self.push = Some(crate::feeder::PushConfig { url, connector, key_file });
+                self.push = Some(crate::feeder::PushConfig { url, connector, key_file, folder: get("folder") });
             }
         }
 

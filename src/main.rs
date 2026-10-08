@@ -1980,7 +1980,7 @@ fn main() {
         };
         let db = match Database::new() { Ok(d) => std::sync::Arc::new(d), Err(e) => { eprintln!("{}", e); std::process::exit(1); } };
         match feeder::push_new(&db, &cfg) {
-            Some((n, ms)) => println!("push: {} rows in {} ms", n, ms),
+            Some((n, in_folder, ms)) => println!("push: {} rows in {} ms, {} of them to the folder", n, ms, in_folder),
             None => println!("push: nothing to send (watermark {})",
                 db.get_setting("push_sent_up_to").unwrap_or_else(|| "unset".into())),
         }
