@@ -196,8 +196,8 @@ fn build_branch_where(filters: &Filters) -> (String, Vec<Box<dyn rusqlite::types
         if !subs.is_empty() {
             let ors: Vec<&str> = subs.iter().map(|_| "subject LIKE ?").collect();
             parts.push(format!("({})", ors.join(" OR ")));
-            // Anchored at the end, so "Dualog Insight" catches "RE: Dualog
-            // Insight" and "Sv: Re: Dualog Insight" without catching a
+            // Anchored at the end, so "Site survey" catches "RE: Site
+            // survey" and "Sv: Re: Site survey" without catching a
             // subject that merely mentions it in the middle.
             for sub in subs { params.push(Box::new(format!("%{}", sub))); }
         }
@@ -664,8 +664,8 @@ impl Database {
             }
             // A branched view still has to answer a search. The view's own
             // rules live in `branches`, but `/` sets content_pattern on the
-            // top-level struct, and dropping it turned a search in Dualog or
-            // PassionFruits into a plain re-list of the view — 500 rows and a
+            // top-level struct, and dropping it turned a search in such a
+            // view into a plain re-list of the view — 500 rows and a
             // match count that meant nothing. AND it onto the branch group.
             let (frag, params) = build_branch_where(filters);
             if !frag.is_empty() {
@@ -743,8 +743,8 @@ impl Database {
             }
             // A branched view still has to answer a search. The view's own
             // rules live in `branches`, but `/` sets content_pattern on the
-            // top-level struct, and dropping it turned a search in Dualog or
-            // PassionFruits into a plain re-list of the view — 500 rows and a
+            // top-level struct, and dropping it turned a search in such a
+            // view into a plain re-list of the view — 500 rows and a
             // match count that meant nothing. AND it onto the branch group.
             let (frag, params) = build_branch_where(filters);
             if !frag.is_empty() {
@@ -1881,9 +1881,9 @@ mod tests {
 
     #[test]
     fn sent_replies_find_their_original() {
-        assert_eq!(normalise_subject("RE: Sv: Dualog Insight"), "Dualog Insight");
+        assert_eq!(normalise_subject("RE: Sv: Site survey"), "Site survey");
         assert_eq!(normalise_subject("Fwd:  Re: hi"), "hi");
-        assert_eq!(normalise_subject("Dualog Insight"), "Dualog Insight");
+        assert_eq!(normalise_subject("Site survey"), "Site survey");
         assert_eq!(normalise_subject("Regarding the report"), "Regarding the report");
 
         let tmp = std::env::temp_dir().join("kastrup-link-test");
@@ -1902,10 +1902,10 @@ mod tests {
         }
 
         // 1. Header match: In-Reply-To names the original outright.
-        db.insert_message(1, &msg("in1", "bernd@ess.biz", "geir@dualog.com",
-            "Dualog Insight", "AA.Customers.Dualog", t, "MID-1", None));
-        db.insert_message(1, &msg("out1", "geir@dualog.com", "bernd@ess.biz",
-            "RE: Dualog Insight", "Sent.2026-08", t + 600, "MID-2", Some("MID-1")));
+        db.insert_message(1, &msg("in1", "bob@customer.example", "me@acmeco.example",
+            "Site survey", "Customers.AcmeCo", t, "MID-1", None));
+        db.insert_message(1, &msg("out1", "me@acmeco.example", "bob@customer.example",
+            "RE: Site survey", "Sent.2026-08", t + 600, "MID-2", Some("MID-1")));
         assert_eq!(link_of(&db, "in1").0, 1, "original marked replied");
         assert_eq!(link_of(&db, "out1").1, Some(id_of(&db, "in1")), "sent copy linked");
 
@@ -1939,24 +1939,6 @@ mod tests {
 
         std::fs::remove_dir_all(&tmp).ok();
         println!("linking ok");
-    }
-
-    #[test]
-    fn the_real_pair_resolves() {
-        // The message DI could not link: 7966396 (Sent) answers 7966391.
-        let home = "/home/geir";
-        let conn = Connection::open_with_flags(
-            format!("{}/.kastrup/kastrup.db", home),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        ).unwrap();
-        let (subject, to, cc, ts): (String, String, Option<String>, i64) = conn.query_row(
-            "SELECT subject, recipients, cc, timestamp FROM messages WHERE id = 7966396",
-            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        ).unwrap();
-        let recipients = format!("{} {}", to, cc.unwrap_or_default());
-        let hit = find_reply_target(&conn, None, None, &subject, &recipients, ts, 7966396);
-        println!("subject {:?} resolved to {:?}", subject, hit);
-        assert_eq!(hit, Some(7966391));
     }
 }
 

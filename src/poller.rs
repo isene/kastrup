@@ -401,7 +401,7 @@ fn clear_error(db: &Arc<Database>, id: i64, failing: &mut HashMap<i64, String>) 
     }
 }
 
-/// Dualog Workspace never reaches the poller: an external
+/// The Workspace chat never reaches the poller: an external
 /// `ws-bridge-listen` writes its rows straight into the database. So
 /// the one thing kastrup can check is the breadcrumb ws-bridge leaves
 /// when its refresh token expires. One `stat()` per cycle, and it is

@@ -471,9 +471,9 @@ mod tests {
         // would error and drop the whole message; from_utf8_lossy keeps
         // it. ASCII headers must still parse correctly.
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"From: \"BMW UK\" <bmwuk@service.bmw.com>\r\n");
-        bytes.extend_from_slice(b"Subject: Your BMW is in need of attention\r\n");
-        bytes.extend_from_slice(b"Message-ID: <abc123@service.bmw.com>\r\n");
+        bytes.extend_from_slice(b"From: \"Acme Cars\" <news@service.example.com>\r\n");
+        bytes.extend_from_slice(b"Subject: Your car is in need of attention\r\n");
+        bytes.extend_from_slice(b"Message-ID: <abc123@service.example.com>\r\n");
         bytes.extend_from_slice(b"Date: Sat, 27 Jun 2026 15:41:42 +0100\r\n");
         bytes.extend_from_slice(b"\r\n");
         bytes.extend_from_slice(b"Hello\x92 world \x97 done\xa0now");
@@ -487,8 +487,8 @@ mod tests {
         let _ = std::fs::remove_file(&fp);
 
         let msg = msg.expect("non-UTF-8 mail must still parse (not be dropped)");
-        assert_eq!(msg.subject.as_deref(), Some("Your BMW is in need of attention"));
-        assert!(msg.sender.contains("bmwuk@service.bmw.com"));
+        assert_eq!(msg.subject.as_deref(), Some("Your car is in need of attention"));
+        assert!(msg.sender.contains("news@service.example.com"));
     }
 }
 

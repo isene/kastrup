@@ -7,7 +7,7 @@ Firefox/Marionette scrape of Instagram + Messenger.
 ## TL;DR
 
 A new Android app, **`relay`** (`com.isene.relay`, in
-`/home/geir/Main/G/GIT-isene/nomad/apps/relay/`), captures incoming messages
+`apps/relay/` of the nomad repo), captures incoming messages
 on the phone and sends replies, ferrying them to/from kastrup over a Syncthing
 folder. It **replaces the laptop Marionette** for Instagram + Messenger and
 **adds WhatsApp + SMS**.

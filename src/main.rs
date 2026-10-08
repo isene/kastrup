@@ -5341,7 +5341,7 @@ impl App {
             // latest activity within each platform.
             let by_source = self.sort_order == "source";
             // For a branches view, group sections by which branch they belong
-            // to, in branch order, so a multi-source view (e.g. Dualog: mail,
+            // to, in branch order, so a multi-source view (e.g. work: mail,
             // then Workspace, then Slack) stays cleanly grouped instead of
             // interleaving channels by recency. A section's branch is the
             // first one whose source + folder dimensions admit it (matched on
@@ -6419,7 +6419,7 @@ impl App {
             .map(|k| {
                 let v = &shortcuts[*k];
                 // Show the last two path elements so e.g.
-                // AA.Customers.Dualog.Archive reads as Dualog.Archive and the
+                // Customers.AcmeCo.Archive reads as AcmeCo.Archive and the
                 // several *.Archive targets stay distinguishable.
                 let parts: Vec<&str> = v.split('.').collect();
                 let short = if parts.len() > 2 {
@@ -7739,7 +7739,7 @@ impl App {
         if query.is_empty() { return; }
 
         // `/` searches the whole database, not the view you happen to be in.
-        // Scoping it to the view meant a search in Dualog missed the Dualog
+        // Scoping it to the view meant a search in a work view missed its
         // archive, which is where the old mail actually is. To narrow, search
         // first and then use `\` to walk the results.
         let mut filters = Filters::default();
@@ -8798,7 +8798,7 @@ impl App {
         // section header or out-of-range display index doesn't yield the
         // wrong message / None (the v0.1.181-class index bug). Then fall
         // back to the current view's own folder filter, so composing a
-        // fresh mail in e.g. View 4 (Dualog) still picks the folder_hook
+        // fresh mail in e.g. View 4 (work) still picks the folder_hook
         // identity even with no row selected or the cursor on a header.
         if let Some(idx) = self.current_filtered_index() {
             if let Some(folder) = self.filtered_messages.get(idx).and_then(|m| m.folder.clone()) {
@@ -8810,7 +8810,7 @@ impl App {
 
     /// The folder the current view filters on, used as the compose
     /// identity context when no message is selected (cursor on a section
-    /// header), so View 4 → `AA.Customers.Dualog` → the `dualog`
+    /// header), so View 4 → `Customers.AcmeCo` → the `acmeco`
     /// folder_hook. Filters are stored either flat (`{"rules":[…]}`) or
     /// as a union (`{"branches":[{"rules":[…]},…]}`); return the first
     /// `folder`-field rule's value.
@@ -11963,7 +11963,7 @@ impl App {
             return;
         }
         // Per-identity SMTP: match the From header to an identity to
-        // pick its transport spec (e.g. dualog → smtp://relay). Owned
+        // pick its transport spec (e.g. work → smtp://relay). Owned
         // String so the borrow of self.config ends before the later
         // &mut self spawn call.
         let smtp_spec: String = self.config.identities.iter()
@@ -15763,7 +15763,7 @@ fn local_utc_offset() -> i64 {
 /// Truncate a plain string to at most `max` characters
 /// Cut `s` to `max` TERMINAL COLUMNS, not characters.
 ///
-/// A Japanese subject is the case that matters: "Fw: Dualogの脆弱性…" is 31
+/// A Japanese subject is the case that matters: "Fw: AcmeCoの脆弱性…" is 31
 /// characters but 52 columns, so counting characters let it past a 48-column
 /// budget and the row spilled onto two extra lines. Every CJK character, and
 /// most emoji, take two cells.
@@ -16552,7 +16552,7 @@ mod tests {
 mod wide_char_tests {
     #[test]
     fn a_japanese_subject_survives_the_header_path() {
-        let subj = "Fw: Dualogの脆弱性対応に関するアンケート回答のお願い";
+        let subj = "Fw: AcmeCoの脆弱性対応に関するアンケート回答のお願い";
         let decoded = crate::sources::maildir::decode_rfc2047(subj);
         println!("decode_rfc2047 -> {:?}", decoded);
         assert_eq!(decoded, subj, "already-decoded UTF-8 must pass through");
@@ -16583,7 +16583,7 @@ mod wide_char_tests {
 
     #[test]
     fn truncation_counts_columns_not_characters() {
-        let subj = "Fw: Dualogの脆弱性対応に関するアンケート回答のお願い";
+        let subj = "Fw: AcmeCoの脆弱性対応に関するアンケート回答のお願い";
         assert_eq!(subj.chars().count(), 31);
         assert_eq!(crust::display_width(subj), 52, "every CJK char is two cells");
         // The case from the list pane: 48 columns of room, and counting
