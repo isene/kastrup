@@ -44,6 +44,9 @@ pub struct Filters {
     /// `Re:` and `Sv:` replies come along with the message that matched.
     /// Search sets it after widening its hits.
     pub subjects: Option<Vec<String>>,
+    /// The list of hidden (snoozed) mail: only messages that wait for
+    /// their time. Every other list leaves those out.
+    pub snoozed: bool,
     /// Optional OR-of-Filters. When present, takes precedence over
     /// the other fields of this struct — each branch is rendered as
     /// its own AND-group and combined with `OR`.
@@ -95,6 +98,10 @@ pub struct Database {
     /// the read-state export. One atomic load per idle tick is what keeps
     /// that export off a timer: nothing changed, nothing runs.
     read_dirty: std::sync::atomic::AtomicBool,
+    /// Hidden (snoozed) mail: message id and the time it comes back. A
+    /// copy of the `snoozed` table, filled at open, so a list query needs
+    /// no join and the idle loop no query.
+    snoozed: Mutex<HashMap<i64, i64>>,
 }
 
 /// A read connection checked out of `Database::read_pool`. Derefs to the
@@ -260,10 +267,12 @@ impl Database {
             // additive belongs here too.
             Self::ensure_added_tables(&conn);
         }
+        let snoozed = Self::load_snoozed(&conn);
         Ok(Self {
             conn: Mutex::new(conn),
             read_pool: Mutex::new(Vec::new()),
             read_dirty: std::sync::atomic::AtomicBool::new(true),
+            snoozed: Mutex::new(snoozed),
         })
     }
 
@@ -316,7 +325,11 @@ impl Database {
                 created_at INTEGER NOT NULL,
                 last_error TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_scheduled_due ON scheduled(send_at);"
+            CREATE INDEX IF NOT EXISTS idx_scheduled_due ON scheduled(send_at);
+            CREATE TABLE IF NOT EXISTS snoozed (
+                message_id INTEGER PRIMARY KEY,
+                until INTEGER NOT NULL
+            );"
         );
         // The decoded body, so nothing outside kastrup has to reassemble
         // MIME to read a message. `content` keeps the raw parts, which is
@@ -456,6 +469,11 @@ impl Database {
                 last_error TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_scheduled_due ON scheduled(send_at);
+            -- Mail hidden until a time the user picked.
+            CREATE TABLE IF NOT EXISTS snoozed (
+                message_id INTEGER PRIMARY KEY,
+                until INTEGER NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source_id);
             CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
@@ -637,6 +655,22 @@ impl Database {
         // one message by id; see Filters::message_id.
         if filters.message_id.is_none() {
             sql.push_str(" AND (archived = 0 OR archived IS NULL)");
+        }
+
+        // Hidden mail stays out of every list until its time comes. The
+        // list of hidden mail shows nothing else. A search, or a message
+        // asked for by id, still reaches a hidden one.
+        let hidden = self.snoozed_ids();
+        if filters.snoozed {
+            if hidden.is_empty() {
+                return Vec::new();
+            }
+            sql.push_str(&format!(" AND id IN ({})", hidden));
+        } else if !hidden.is_empty()
+            && filters.message_id.is_none()
+            && filters.content_pattern.is_none()
+        {
+            sql.push_str(&format!(" AND id NOT IN ({})", hidden));
         }
 
         // OR-of-AND-groups: when `branches` is set, render each branch's
@@ -875,6 +909,75 @@ impl Database {
             Ok(it) => it.filter_map(|r| r.ok()).filter(|m| !m.is_empty()).collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    fn load_snoozed(conn: &Connection) -> HashMap<i64, i64> {
+        let mut map = HashMap::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT message_id, until FROM snoozed") {
+            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))) {
+                for (id, until) in rows.flatten() {
+                    map.insert(id, until);
+                }
+            }
+        }
+        map
+    }
+
+    /// The hidden ids as `1,2,3`, ready for an SQL `IN (...)`.
+    fn snoozed_ids(&self) -> String {
+        let map = self.snoozed.lock().unwrap();
+        map.keys().map(|id| id.to_string()).collect::<Vec<_>>().join(",")
+    }
+
+    /// Hide a message until `until`. False when the row could not be
+    /// written; the message then stays where it is.
+    pub fn snooze(&self, id: i64, until: i64) -> bool {
+        let stored = {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO snoozed (message_id, until) VALUES (?, ?)",
+                params![id, until],
+            ).is_ok()
+        };
+        if stored {
+            self.snoozed.lock().unwrap().insert(id, until);
+        }
+        stored
+    }
+
+    /// Bring a hidden message back now.
+    pub fn unsnooze(&self, id: i64) {
+        {
+            let conn = self.conn.lock().unwrap();
+            let _ = conn.execute("DELETE FROM snoozed WHERE message_id = ?", params![id]);
+        }
+        self.snoozed.lock().unwrap().remove(&id);
+    }
+
+    /// When a hidden message comes back, if it is hidden.
+    pub fn snoozed_until(&self, id: i64) -> Option<i64> {
+        self.snoozed.lock().unwrap().get(&id).copied()
+    }
+
+    /// The earliest time any hidden message comes back.
+    pub fn next_snooze_wake(&self) -> Option<i64> {
+        self.snoozed.lock().unwrap().values().min().copied()
+    }
+
+    pub fn snoozed_count(&self) -> usize {
+        self.snoozed.lock().unwrap().len()
+    }
+
+    /// Bring back every message whose time has come, and name them.
+    pub fn take_due_snoozed(&self, now: i64) -> Vec<i64> {
+        let due: Vec<i64> = self.snoozed.lock().unwrap().iter()
+            .filter(|(_, until)| **until <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &due {
+            self.unsnooze(*id);
+        }
+        due
     }
 
     pub fn mark_as_read(&self, id: i64) {
@@ -1867,6 +1970,11 @@ mod tests {
         }
     }
 
+    /// Tests that point HOME at their own folder take this first. A read
+    /// opens the database by the HOME of that moment, so two such tests
+    /// at once would read each other's file.
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
+
     fn id_of(db: &Database, ext: &str) -> i64 {
         let conn = db.conn.lock().unwrap();
         conn.query_row("SELECT id FROM messages WHERE external_id = ?",
@@ -1880,7 +1988,59 @@ mod tests {
     }
 
     #[test]
+    fn a_snoozed_message_is_hidden_until_its_time() {
+        let _home = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join("kastrup-snooze-test");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(tmp.join(".kastrup")).unwrap();
+        std::env::set_var("HOME", &tmp);
+        let db = Database::new().unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO sources (id, name, plugin_type, config, capabilities, \
+                 created_at, updated_at) VALUES (77, 'snz', 'maildir', '{}', '[]', 0, 0)", [],
+            ).unwrap();
+        }
+        let t = 1_787_000_000i64;
+        db.insert_message(77, &msg("snz-a", "a@example.com", "me@example.com", "Snooze A", "INBOX", t, "<snz-a>", None));
+        db.insert_message(77, &msg("snz-b", "b@example.com", "me@example.com", "Snooze B", "INBOX", t + 1, "<snz-b>", None));
+        let (a, b) = (id_of(&db, "snz-a"), id_of(&db, "snz-b"));
+        let mine = |f: &Filters| -> Vec<i64> {
+            let mut f = f.clone();
+            f.source_id = Some(77);
+            db.get_messages(&f, 50, 0).iter().map(|m| m.id).collect()
+        };
+        let all = Filters::default();
+        let hidden = Filters { snoozed: true, ..Default::default() };
+        assert_eq!(mine(&all), vec![b, a]);
+        assert!(mine(&hidden).is_empty());
+
+        assert!(db.snooze(a, 5_000));
+        assert_eq!(mine(&all), vec![b], "a hidden message is out of the list");
+        assert_eq!(mine(&hidden), vec![a], "and in the list of hidden mail");
+        assert_eq!(db.snoozed_until(a), Some(5_000));
+        assert_eq!(db.next_snooze_wake(), Some(5_000));
+        let search = Filters { content_pattern: Some("body".into()), ..Default::default() };
+        assert!(mine(&search).contains(&a), "a search still finds it");
+
+        // It survives a restart: a second handle reads the table.
+        assert_eq!(Database::new().unwrap().snoozed_until(a), Some(5_000));
+
+        assert!(db.take_due_snoozed(4_999).is_empty(), "not yet");
+        assert_eq!(db.take_due_snoozed(5_000), vec![a], "its time has come");
+        assert_eq!(mine(&all), vec![b, a]);
+        assert_eq!(db.next_snooze_wake(), None);
+        assert_eq!(db.snoozed_count(), 0);
+
+        db.snooze(b, 9_000);
+        db.unsnooze(b);
+        assert_eq!(mine(&all), vec![b, a], "brought back by hand");
+    }
+
+    #[test]
     fn sent_replies_find_their_original() {
+        let _home = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(normalise_subject("RE: Sv: Site survey"), "Site survey");
         assert_eq!(normalise_subject("Fwd:  Re: hi"), "hi");
         assert_eq!(normalise_subject("Site survey"), "Site survey");
