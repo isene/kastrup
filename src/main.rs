@@ -1714,6 +1714,9 @@ struct App {
     /// cache is refreshed once a minute — an indexed MIN() over a handful
     /// of rows, against a loop that already wakes every ten seconds.
     last_sched_check: i64,
+    /// When the first hidden (snoozed) mail comes back, cached for the
+    /// same reason: one integer compare per idle wake. `None` = none.
+    next_wake_at: Option<i64>,
     compose_source_type: Option<String>,
     /// Set by the recall path so an unmodified editor return still
     /// lands on the review screen (Send / Postpone / Cancel) instead
@@ -2408,6 +2411,7 @@ fn main() {
         draft_row: None,
         next_send_at: None,
         last_sched_check: 0,
+        next_wake_at: None,
         compose_source_type: None,
         compose_force_review: false,
         compose_kind: DraftKind::Email,
@@ -2533,6 +2537,7 @@ fn main() {
     // Anything scheduled in an earlier session: prime the cache so the
     // first idle wake can deliver what is already due.
     app.refresh_next_send_at();
+    app.next_wake_at = app.db.next_snooze_wake();
 
     // Resume watchdog state: wall-clock at the previous loop turn.
     let mut last_wall = std::time::SystemTime::now();
@@ -2637,6 +2642,8 @@ fn main() {
                 // timestamp, so this is one integer compare when nothing
                 // is waiting — no new timer, no query per wake.
                 app.send_due_scheduled();
+                // Hidden mail whose time has come: the same kind of gate.
+                app.wake_due_snoozed();
                 // Periodic DB refresh (skip when showing inline images: a
                 // rebuild would wipe the picture the user is looking at).
                 // Gated on messages_dirty so an idle kastrup doesn't rerun
@@ -2887,6 +2894,9 @@ impl App {
             "d" => { self.toggle_delete_mark(); }
             "<" => { self.purge_deleted(); }
             "u" | "U" => { self.unsee_message(); }
+            "h" => { self.snooze_message(); }
+            "b" => { self.show_snoozed(); }
+            "O" => { self.unsubscribe(); }
             "S-SPACE" => { self.mark_browsed_as_read(); }
 
             // Compose / reply
@@ -3505,11 +3515,17 @@ impl App {
             " ".to_string()
         };
 
-        // Indicator: D > tag > star > attachment > space
+        // Hidden (snoozed) mail, seen in the list of hidden mail or in a
+        // search: a clock mark, and the day it comes back as its date.
+        let wake = self.db.snoozed_until(msg.id);
+
+        // Indicator: D > tag > hidden > star > attachment > space
         let ind = if self.delete_marked.contains(&msg.id) {
             style::fg("D", self.config.theme_colors.delete_mark)
         } else if self.tagged.contains(&msg.id) {
             style::fg("\u{2022}", self.config.theme_colors.tag)
+        } else if wake.is_some() {
+            style::fg("\u{25F7}", self.config.theme_colors.attach_ind)
         } else if msg.starred {
             style::fg("\u{2605}", self.config.theme_colors.star)
         } else if !msg.attachments.is_empty() {
@@ -3519,7 +3535,7 @@ impl App {
         };
 
         // Date
-        let date_str = format_timestamp(msg.timestamp, &self.date_format);
+        let date_str = format_timestamp(wake.unwrap_or(msg.timestamp), &self.date_format);
         let date_padded = format!("{:>6}", &date_str[..date_str.len().min(6)]);
 
         // Source icon and color
@@ -7058,6 +7074,9 @@ impl App {
   d              Mark for deletion\n\
   <              Purge deleted\n\
   u/U            Mark unseen\n\
+  h              Hide until a time you type (snooze); on hidden mail: bring it back\n\
+  b              List the hidden mail (the date shows when each comes back)\n\
+  O              Opt out: unsubscribe from the mailing list (asks first)\n\
   Shift-Space    Mark browsed\n\n\
 {}\n\
   r              Reply\n\
@@ -7731,6 +7750,172 @@ impl App {
         self.set_feedback(&format!("kastrup:{}  (Esc clears)", id),
             self.config.theme_colors.feedback_ok);
         self.open_message();
+    }
+
+    /// `h`: hide the message under the cursor, or the tagged ones, until a
+    /// time typed at the prompt. It comes back unread when the time is up.
+    /// On mail that is already hidden, `h` brings it back now.
+    fn snooze_message(&mut self) {
+        let tc = self.config.theme_colors.clone();
+        let ids: Vec<i64> = if !self.tagged.is_empty() {
+            self.tagged.iter().copied().collect()
+        } else {
+            match self.cursor_on() {
+                CursorOn::Message(id) if id > 0 => vec![id],
+                _ => return,
+            }
+        };
+        if ids.iter().all(|id| self.db.snoozed_until(*id).is_some()) {
+            for id in &ids {
+                self.db.unsnooze(*id);
+                self.db.mark_as_unread(*id);
+            }
+            self.tagged.clear();
+            self.after_snooze_change();
+            self.set_feedback(&format!("Back in the inbox: {}", count_mail(ids.len())), tc.feedback_ok);
+            return;
+        }
+        let when = self.prompt("Hide until (08:00, tomorrow 09:00, +2h, 2026-07-28 08:00): ", "");
+        if when.trim().is_empty() { return; }
+        let at = match parse_send_at(&when) {
+            Some(at) if at > database::now_secs() => at,
+            Some(_) => {
+                self.set_feedback("That time has passed", tc.feedback_warn);
+                return;
+            }
+            None => {
+                self.set_feedback(&format!("Not a time: {}", when.trim()), tc.feedback_warn);
+                return;
+            }
+        };
+        let mut hidden = 0usize;
+        for id in &ids {
+            if !self.db.snooze(*id, at) { continue; }
+            hidden += 1;
+            // Read while it is away, so no unread count points at mail
+            // that is not on screen. It comes back unread.
+            self.db.mark_as_read(*id);
+            if let Some(m) = self.filtered_messages.iter().find(|m| m.id == *id) {
+                let _ = self.write_tx.send(DbWriteOp::SyncMaildirFlag(m.metadata.clone(), *id));
+            }
+        }
+        if hidden == 0 {
+            self.set_feedback("Could not hide the message", tc.feedback_warn);
+            return;
+        }
+        self.tagged.clear();
+        self.after_snooze_change();
+        self.set_feedback(
+            &format!("Hidden until {}: {}. b lists hidden mail", fmt_send_at(at), count_mail(hidden)),
+            tc.feedback_ok);
+    }
+
+    /// After mail was hidden or came back: the next wake time, the unread
+    /// counts and the list on screen. Leaves the list of hidden mail when
+    /// its last message is gone.
+    fn after_snooze_change(&mut self) {
+        self.next_wake_at = self.db.next_snooze_wake();
+        self.sync_mail_count();
+        let in_hidden_list = self.active_search_filter.as_ref().map_or(false, |f| f.snoozed);
+        if in_hidden_list && self.db.snoozed_count() == 0 {
+            self.active_search_filter = None;
+            self.active_search_label.clear();
+            let key = self.current_view.clone();
+            self.switch_to_view(&key);
+        } else {
+            self.refresh_view_unread_cache();
+            self.refresh_current_view();
+        }
+    }
+
+    /// `b`: the hidden mail as a list. The date column shows when each
+    /// message comes back; `h` brings one back now, Esc leaves the list.
+    fn show_snoozed(&mut self) {
+        let tc = self.config.theme_colors.clone();
+        let n = self.db.snoozed_count();
+        if n == 0 {
+            self.set_feedback("No hidden mail", tc.feedback_warn);
+            return;
+        }
+        self.active_search_label = "hidden mail".to_string();
+        self.active_search_filter = Some(Filters { snoozed: true, ..Default::default() });
+        self.index = 0;
+        self.show_threaded = false;
+        self.refresh_current_view();
+        self.set_feedback(
+            &format!("Hidden: {}. The date is the day it comes back. h brings one back, Esc leaves",
+                count_mail(n)),
+            tc.feedback_ok);
+    }
+
+    /// Bring back hidden mail whose time has come, unread. Called from
+    /// the idle arm of the main loop: one compare while nothing is due.
+    fn wake_due_snoozed(&mut self) {
+        let Some(at) = self.next_wake_at else { return };
+        let now = database::now_secs();
+        if at > now { return; }
+        let due = self.db.take_due_snoozed(now);
+        for id in &due {
+            self.db.mark_as_unread(*id);
+        }
+        self.after_snooze_change();
+        if !due.is_empty() {
+            let okcol = self.config.theme_colors.feedback_ok;
+            self.set_feedback_sticky(&format!("Back in the inbox: {}", count_mail(due.len())), okcol);
+        }
+    }
+
+    /// Ask a yes/no question in the status line. Anything but `y` is no.
+    fn confirm(&mut self, question: &str) -> bool {
+        let warn = self.config.theme_colors.feedback_warn;
+        self.set_feedback(question, warn);
+        matches!(Input::getchr(Some(15)).as_deref(), Some("y") | Some("Y"))
+    }
+
+    /// `O`: opt out of the mailing list a mail came from, the way the mail
+    /// itself names in its List-Unsubscribe header. Always asks first.
+    fn unsubscribe(&mut self) {
+        let tc = self.config.theme_colors.clone();
+        let CursorOn::Message(id) = self.cursor_on() else { return };
+        let Some(msg) = self.filtered_messages.iter().find(|m| m.id == id) else { return };
+        let sender = msg.display_name().to_string();
+        let file = msg.metadata.get("maildir_file").and_then(|v| v.as_str()).map(String::from);
+        let Some(file) = file else {
+            self.set_feedback("Only mail has a list to unsubscribe from", tc.feedback_warn);
+            return;
+        };
+        let way = mail_head(&file).and_then(|head| unsubscribe_way(&mail_headers(&head)));
+        match way {
+            None => self.set_feedback("This mail names no way to unsubscribe", tc.feedback_warn),
+            Some(Unsubscribe::OneClick(url)) => {
+                if !self.confirm(&format!("Unsubscribe from {} at {}? (y/n)", sender, url_host(&url))) {
+                    self.set_feedback("Left as it was", tc.feedback_ok);
+                    return;
+                }
+                self.set_feedback("Unsubscribing...", tc.feedback_ok);
+                match unsubscribe_post(&url) {
+                    Ok(()) => self.set_feedback(&format!("Unsubscribed from {}", sender), tc.feedback_ok),
+                    Err(why) => self.set_feedback_sticky(
+                        &format!("Could not unsubscribe from {}: {}", sender, why), tc.feedback_warn),
+                }
+            }
+            Some(Unsubscribe::Web(url)) => {
+                if !self.confirm(&format!("Open the unsubscribe page of {} at {}? (y/n)", sender, url_host(&url))) {
+                    self.set_feedback("Left as it was", tc.feedback_ok);
+                    return;
+                }
+                let _ = std::process::Command::new("xdg-open").arg(&url)
+                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+                self.set_feedback(&format!("Opened {}: finish there", url_host(&url)), tc.feedback_ok);
+            }
+            Some(Unsubscribe::Mail(to, subject)) => {
+                if !self.confirm(&format!("Write an unsubscribe mail to {}? (y/n)", to)) {
+                    self.set_feedback("Left as it was", tc.feedback_ok);
+                    return;
+                }
+                self.compose_to(&to, &subject);
+            }
+        }
     }
 
     fn search_prompt(&mut self) {
@@ -14640,6 +14825,69 @@ fn html_for_browser(html: &str) -> String {
 
 #[cfg(test)]
 #[test]
+fn a_mail_says_how_to_unsubscribe() {
+    let h = |raw: &str| unsubscribe_way(&mail_headers(raw));
+    // One click, with the header folded over two lines.
+    assert_eq!(
+        h("From: News <n@example.com>\nList-Unsubscribe: <mailto:off@example.com?subject=stop%20it>,\n <https://example.com/u?a=1,2>\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\n\nbody"),
+        Some(Unsubscribe::OneClick("https://example.com/u?a=1,2".into())));
+    // A web link without the one-click promise is a page to open.
+    assert_eq!(
+        h("list-unsubscribe: <https://example.com/u>\n\n"),
+        Some(Unsubscribe::Web("https://example.com/u".into())));
+    // One click is never sent over plain http.
+    assert_eq!(
+        h("List-Unsubscribe: <http://example.com/u>\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\n\n"),
+        Some(Unsubscribe::Web("http://example.com/u".into())));
+    assert_eq!(
+        h("List-Unsubscribe: <mailto:off@example.com?subject=stop%20it>\n\n"),
+        Some(Unsubscribe::Mail("off@example.com".into(), "stop it".into())));
+    assert_eq!(
+        h("List-Unsubscribe: <mailto:off@example.com>\n\n"),
+        Some(Unsubscribe::Mail("off@example.com".into(), "unsubscribe".into())));
+    // A header in the body is not a header.
+    assert_eq!(h("Subject: hi\n\nList-Unsubscribe: <https://example.com/u>\n"), None);
+    assert_eq!(url_host("https://news.example.com/u?x=1"), "news.example.com");
+    assert_eq!(count_mail(1), "1 message");
+    assert_eq!(count_mail(3), "3 messages");
+}
+
+#[cfg(test)]
+#[test]
+fn one_click_unsubscribe_is_one_post() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for answer in ["HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                       "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"] {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            // Read until the body named by the request has arrived.
+            while !String::from_utf8_lossy(&req).contains("List-Unsubscribe=One-Click") {
+                let n = sock.read(&mut buf).unwrap();
+                if n == 0 { break; }
+                req.extend_from_slice(&buf[..n]);
+            }
+            sock.write_all(answer.as_bytes()).unwrap();
+            seen.push(String::from_utf8_lossy(&req).to_string());
+        }
+        seen
+    });
+    let url = format!("http://127.0.0.1:{}/u?id=7", port);
+    assert_eq!(unsubscribe_post(&url), Ok(()));
+    assert_eq!(unsubscribe_post(&url), Err("the list answered 404".to_string()));
+    let seen = server.join().unwrap();
+    assert!(seen[0].starts_with("POST /u?id=7 HTTP/1.1"), "{}", seen[0]);
+    assert!(seen[0].to_lowercase().contains("content-type: application/x-www-form-urlencoded"));
+    assert!(seen[0].ends_with("List-Unsubscribe=One-Click"));
+    assert!(!seen[0].to_lowercase().contains("cookie"));
+}
+
+#[cfg(test)]
+#[test]
 fn an_ai_answer_or_the_reason_there_is_none() {
     assert_eq!(ask_cli("echo", "hi").unwrap().trim(), "-p hi");
     assert_eq!(ask_cli("true", "hi"), Err("claude returned empty response"));
@@ -15670,6 +15918,109 @@ fn parse_send_at(input: &str) -> Option<i64> {
 }
 
 /// "Mon 08:00" for this week, "2026-08-14 08:00" beyond it.
+/// "1 message" or "3 messages".
+fn count_mail(n: usize) -> String {
+    if n == 1 { "1 message".to_string() } else { format!("{} messages", n) }
+}
+
+/// How a mail asks to be unsubscribed from.
+#[derive(Debug, PartialEq)]
+enum Unsubscribe {
+    /// One POST to this address does it (RFC 8058).
+    OneClick(String),
+    /// A web page where the reader finishes the job.
+    Web(String),
+    /// A mail to this address, with this subject.
+    Mail(String, String),
+}
+
+/// The start of a mail file, enough to hold its headers.
+fn mail_head(path: &str) -> Option<String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(path).ok()?.take(128 * 1024).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// The headers of a mail: every line before the first empty one, with a
+/// header that runs over several lines joined into one.
+fn mail_headers(raw: &str) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for line in raw.lines() {
+        if line.is_empty() { break; }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(last) = headers.last_mut() {
+                last.1.push(' ');
+                last.1.push_str(line.trim());
+            }
+        } else if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
+    headers
+}
+
+/// Pick the way to unsubscribe: one click where the mail offers it, else
+/// its web page, else a mail. One click needs https.
+fn unsubscribe_way(headers: &[(String, String)]) -> Option<Unsubscribe> {
+    let get = |name: &str| headers.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str());
+    let list = get("List-Unsubscribe")?;
+    let mut web: Option<String> = None;
+    let mut mail: Option<String> = None;
+    // The targets stand in <...>. A comma can be part of an address, so
+    // the brackets are what separates them.
+    let mut rest = list;
+    while let Some(open) = rest.find('<') {
+        let Some(len) = rest[open..].find('>') else { break };
+        let target: String = rest[open + 1..open + len].split_whitespace().collect();
+        rest = &rest[open + len + 1..];
+        let lower = target.to_ascii_lowercase();
+        if (lower.starts_with("https://") || lower.starts_with("http://")) && web.is_none() {
+            web = Some(target);
+        } else if lower.starts_with("mailto:") && mail.is_none() {
+            mail = Some(target[7..].to_string());
+        }
+    }
+    let one_click = get("List-Unsubscribe-Post")
+        .map_or(false, |v| v.to_ascii_lowercase().contains("list-unsubscribe=one-click"));
+    match (web, mail) {
+        (Some(url), _) if one_click && url.to_ascii_lowercase().starts_with("https://") =>
+            Some(Unsubscribe::OneClick(url)),
+        (Some(url), _) => Some(Unsubscribe::Web(url)),
+        (None, Some(m)) => {
+            let (to, query) = m.split_once('?').unwrap_or((m.as_str(), ""));
+            let subject = query.split('&')
+                .find_map(|kv| kv.split_once('=').filter(|(k, _)| k.eq_ignore_ascii_case("subject")))
+                .map(|(_, v)| percent_decode(v))
+                .unwrap_or_else(|| "unsubscribe".to_string());
+            if to.is_empty() { None } else { Some(Unsubscribe::Mail(to.to_string(), subject)) }
+        }
+        (None, None) => None,
+    }
+}
+
+/// The machine name in a web address.
+fn url_host(url: &str) -> String {
+    url.split('/').nth(2).unwrap_or(url).to_string()
+}
+
+/// One-click unsubscribe as RFC 8058 has it: one POST with this body.
+/// It carries no cookie and nothing about the reader but the address
+/// the list wrote into its own link.
+fn unsubscribe_post(url: &str) -> Result<(), String> {
+    let sent = ureq::post(url)
+        .timeout(std::time::Duration::from_secs(15))
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .send_string("List-Unsubscribe=One-Click");
+    match sent {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(code, _)) => Err(format!("the list answered {}", code)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn fmt_send_at(ts: i64) -> String {
     const WDAY: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     unsafe {

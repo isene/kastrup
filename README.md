@@ -22,6 +22,8 @@ Unified terminal messaging client. All your email, chat, and feeds in one TUI. B
 - **Background sync**: automatic polling with configurable intervals per source
 - **Compose/Reply/Forward**: full email composition with editor integration
 - **Send later**: `S` in the send review parks the message until its time (`08:00`, `tomorrow 09:00`, `+2h`, `2026-07-28 08:00`). Works for every channel, not just email; scheduled messages sit in the `+` picker where they can be cancelled or edited
+- **Snooze**: `h` hides a message until a time you type, in the same forms as send later. It comes back unread when the time is up. `b` lists what is hidden, and `h` there brings a message back at once. Nothing runs while it waits: the idle loop compares one number.
+- **Unsubscribe**: `O` opts out of a mailing list the way the mail asks for in its `List-Unsubscribe` header. That is one request where the list offers one click. Else it opens the list's web page, or starts a mail you send yourself. It always asks first.
 - **Inline images**: Kitty protocol image display (V key)
 - **Folder browser**: hierarchical Maildir folder navigation (B key)
 - **Search**: substring and notmuch full-text search
@@ -132,6 +134,9 @@ link are used. Any other header the link asks for is left out.
 | d | Mark for deletion |
 | `<` | Purge deleted |
 | u / U | Mark unseen |
+| h | Hide until a time you type (snooze); on hidden mail: bring it back |
+| b | List the hidden mail; the date shows the day each comes back |
+| O | Opt out: unsubscribe from the mailing list (asks first) |
 | Shift-Space | Mark browsed as read |
 
 ### Compose & Reply
