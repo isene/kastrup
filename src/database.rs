@@ -1634,6 +1634,37 @@ impl Database {
         );
     }
 
+    /// Add a news feed to the first RSS source, or to a new source when
+    /// there is none. `Ok(false)` when that address is there already.
+    pub fn add_feed(&self, url: &str, title: &str) -> Result<bool, String> {
+        let mut feed = serde_json::json!({ "url": url });
+        if !title.is_empty() {
+            feed["title"] = serde_json::json!(title);
+        }
+        let found: Option<(i64, String)> = self.conn.lock().unwrap().query_row(
+            "SELECT id, config FROM sources WHERE plugin_type = 'rss' ORDER BY id LIMIT 1",
+            [], |r| Ok((r.get(0)?, r.get(1)?))).ok();
+        let Some((id, config)) = found else {
+            let config = serde_json::json!({ "feeds": [feed] });
+            self.add_source("RSS Feeds", "rss", &config.to_string(), "[\"read\"]", 3600);
+            return Ok(true);
+        };
+        let mut config: serde_json::Value = serde_json::from_str(&config)
+            .map_err(|e| format!("the feed list in the database cannot be read: {e}"))?;
+        let mut feeds = config.get("feeds").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        if feeds.iter().any(|f| f.get("url").and_then(|u| u.as_str()) == Some(url)) {
+            return Ok(false);
+        }
+        feeds.push(feed);
+        config.as_object_mut()
+            .ok_or("the feed list in the database cannot be read")?
+            .insert("feeds".into(), serde_json::Value::Array(feeds));
+        self.conn.lock().unwrap()
+            .execute("UPDATE sources SET config = ? WHERE id = ?", params![config.to_string(), id])
+            .map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
     /// Update the last_sync timestamp for a source
     /// Record why a source's sync failed, or clear it after a success.
     ///
@@ -1985,6 +2016,37 @@ mod tests {
         let conn = db.conn.lock().unwrap();
         conn.query_row("SELECT replied, parent_id FROM messages WHERE external_id = ?",
                        params![ext], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+    }
+
+    #[test]
+    fn a_feed_is_added_once_and_the_others_stay() {
+        let _home = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join("kastrup-feed-test");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(tmp.join(".kastrup")).unwrap();
+        std::env::set_var("HOME", &tmp);
+        let db = Database::new().unwrap();
+        let feeds = |db: &Database| -> Vec<serde_json::Value> {
+            let rss: Vec<Source> = db.get_sources(false).into_iter()
+                .filter(|s| s.plugin_type == "rss").collect();
+            assert_eq!(rss.len(), 1, "one RSS source, never a second");
+            rss[0].config["feeds"].as_array().cloned().unwrap()
+        };
+
+        // No RSS source yet: the first feed makes one.
+        assert_eq!(db.add_feed("https://example.org/feed.xml", "Example"), Ok(true));
+        assert_eq!(feeds(&db), vec![serde_json::json!({"url": "https://example.org/feed.xml", "title": "Example"})]);
+
+        // A second feed joins the first. No title: the address stands in.
+        assert_eq!(db.add_feed("https://example.com/atom", ""), Ok(true));
+        let got = feeds(&db);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0]["title"], "Example");
+        assert_eq!(got[1], serde_json::json!({"url": "https://example.com/atom"}));
+
+        // The same address again changes nothing, whatever it is called.
+        assert_eq!(db.add_feed("https://example.org/feed.xml", "Other name"), Ok(false));
+        assert_eq!(feeds(&db), got);
     }
 
     #[test]

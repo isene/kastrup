@@ -81,6 +81,17 @@ Inside kastrup, `#` does the same thing and takes the same two forms —
 the other end of `y`, which copies the id of the message under the
 cursor.
 
+## News feeds from a browser
+
+```bash
+kastrup --add-feed https://example.org/feed.xml "Example blog"
+```
+
+The feed joins the RSS feeds kastrup reads, under that name, and its
+items come in the next time kastrup looks at the feeds. It needs no
+terminal and works while kastrup runs. In [scroll](https://github.com/isene/scroll),
+`F` does this for the page on screen.
+
 ## Mail links from a browser
 
 ```bash
