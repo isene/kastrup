@@ -97,11 +97,11 @@ pub fn send_email(
     }
 }
 
-/// Default OAuth secret directory — matches the legacy
-/// `~/bin/gmail_smtp` Ruby script's `$safedir`. Override-able when
-/// kastrup grows a config field for it.
+/// Default OAuth secret directory: `~/.kastrup/oauth`. To keep the
+/// files somewhere else, make that a link to the folder that has them.
 pub fn default_safedir() -> PathBuf {
-    PathBuf::from("/home/.safe/mail")
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join(".kastrup").join("oauth")
 }
 
 /// Default "From" email used when the requested account's OAuth

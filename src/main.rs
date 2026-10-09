@@ -14053,10 +14053,12 @@ impl App {
 
     fn ai_fallback_openai(&mut self, ai_prompt: &str) -> String {
         let tc = self.config.theme_colors.clone();
-        let api_key = std::fs::read_to_string("/home/.safe/openai.txt")
+        // The key: OPENAI_API_KEY, or the one line in ~/.kastrup/openai.txt.
+        let api_key = std::env::var("OPENAI_API_KEY").ok()
+            .or_else(|| std::fs::read_to_string(home_dir().join(".kastrup").join("openai.txt")).ok())
             .unwrap_or_default().trim().to_string();
         if api_key.is_empty() {
-            self.set_feedback("No AI available (install claude CLI or set OpenAI key)", tc.feedback_warn);
+            self.set_feedback("No AI available (install the claude CLI, or put an OpenAI key in ~/.kastrup/openai.txt)", tc.feedback_warn);
             return String::new();
         }
         let body = serde_json::json!({
