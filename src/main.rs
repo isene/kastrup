@@ -1939,6 +1939,7 @@ fn main() {
         println!("  --subject TEXT        subject for --compose-to");
         println!("  mailto:LINK           open a compose window for that link");
         println!("  --draft mailto:LINK   queue the link as a draft for + and leave");
+        println!("  --add-feed URL [NAME] add a news feed (RSS or Atom) and leave");
         println!("  --backfill-text       fill the decoded body for older messages");
         println!("  --weechat-probe       one-shot relay wire test");
         println!("  -v, --version         print version");
@@ -1963,6 +1964,28 @@ fn main() {
             match queue_mailto(&args.next().unwrap_or_default()) {
                 Ok(path) => println!("Draft queued for + in kastrup: {}", path.display()),
                 Err(e) => { eprintln!("kastrup --draft: {e}"); std::process::exit(1); }
+            }
+            return;
+        }
+    }
+
+    // --add-feed URL [TITLE]: a browser hands over a page's news feed. It
+    // joins the feed list in the database, and a running kastrup fetches
+    // it at its next look at the feeds. No terminal.
+    {
+        let cli: Vec<String> = std::env::args().skip(1).collect();
+        if let Some(i) = cli.iter().position(|a| a == "--add-feed") {
+            let url = cli.get(i + 1).map(|s| s.trim()).unwrap_or("");
+            let title = cli.get(i + 2).map(|s| s.trim()).unwrap_or("");
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                eprintln!("kastrup --add-feed: give the web address of a feed");
+                std::process::exit(1);
+            }
+            let name = if title.is_empty() { url } else { title };
+            match Database::new().and_then(|db| db.add_feed(url, title)) {
+                Ok(true) => println!("Feed added to kastrup: {}", name),
+                Ok(false) => println!("kastrup has this feed already: {}", name),
+                Err(e) => { eprintln!("kastrup --add-feed: {e}"); std::process::exit(1); }
             }
             return;
         }
