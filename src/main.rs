@@ -13510,27 +13510,7 @@ impl App {
 
         self.set_feedback("Asking AI...", tc.unread);
 
-        // Try claude CLI first, then curl to OpenAI.
-        // stdin must be /dev/null: kastrup runs in raw-mode TTY, so
-        // claude inherits that fd and prints "Warning: no stdin data
-        // received in 3s, proceeding without it." onto stdout, which
-        // contaminates the response we then try to parse.
-        let result = std::process::Command::new("claude")
-            .arg("-p")
-            .arg(&ai_prompt)
-            .stdin(std::process::Stdio::null())
-            .output();
-
-        let response = if let Ok(output) = result {
-            if output.status.success() {
-                String::from_utf8_lossy(&output.stdout).to_string()
-            } else {
-                self.ai_fallback_openai(&ai_prompt)
-            }
-        } else {
-            self.ai_fallback_openai(&ai_prompt)
-        };
-
+        let response = self.ask_claude(&ai_prompt);
         if response.is_empty() { return; }
 
         self.show_ai_response(
@@ -13621,24 +13601,8 @@ impl App {
             user_prompt, ref_line, sender, subject, content
         );
 
-        let result = std::process::Command::new("claude")
-            .arg("-p")
-            .arg(&full_prompt)
-            .stdin(std::process::Stdio::null())
-            .output();
-        let response = if let Ok(output) = result {
-            if output.status.success() {
-                String::from_utf8_lossy(&output.stdout).to_string()
-            } else {
-                self.ai_fallback_openai(&full_prompt)
-            }
-        } else {
-            self.ai_fallback_openai(&full_prompt)
-        };
-        if response.is_empty() {
-            self.set_feedback("claude returned empty response", tc.feedback_warn);
-            return;
-        }
+        let response = self.ask_claude(&full_prompt);
+        if response.is_empty() { return; }
 
         let header = format!("{}\n{}",
             style::bold(&style::fg("claude", tc.view_custom)),
@@ -13724,24 +13688,8 @@ impl App {
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
 
-        let result = std::process::Command::new("claude")
-            .arg("-p")
-            .arg(&system_prompt)
-            .stdin(std::process::Stdio::null())
-            .output();
-        let raw = if let Ok(output) = result {
-            if output.status.success() {
-                String::from_utf8_lossy(&output.stdout).to_string()
-            } else {
-                self.ai_fallback_openai(&system_prompt)
-            }
-        } else {
-            self.ai_fallback_openai(&system_prompt)
-        };
-        if raw.trim().is_empty() {
-            self.set_feedback("claude returned empty response", tc.feedback_warn);
-            return;
-        }
+        let raw = self.ask_claude(&system_prompt);
+        if raw.is_empty() { return; }
 
         // Robust JSON extraction: locate the outermost `{ … }` and
         // parse just that. This survives markdown fences, leading
@@ -14051,38 +13999,16 @@ impl App {
         }
     }
 
-    fn ai_fallback_openai(&mut self, ai_prompt: &str) -> String {
-        let tc = self.config.theme_colors.clone();
-        // The key: OPENAI_API_KEY, or the one line in ~/.kastrup/openai.txt.
-        let api_key = std::env::var("OPENAI_API_KEY").ok()
-            .or_else(|| std::fs::read_to_string(home_dir().join(".kastrup").join("openai.txt")).ok())
-            .unwrap_or_default().trim().to_string();
-        if api_key.is_empty() {
-            self.set_feedback("No AI available (install the claude CLI, or put an OpenAI key in ~/.kastrup/openai.txt)", tc.feedback_warn);
-            return String::new();
-        }
-        let body = serde_json::json!({
-            "model": "gpt-4o-mini",
-            "messages": [{"role": "user", "content": ai_prompt}],
-            "max_tokens": 800
-        });
-        let resp = std::process::Command::new("curl")
-            .args(["-s", "-X", "POST", "https://api.openai.com/v1/chat/completions",
-                   "-H", "Content-Type: application/json",
-                   "-H", &format!("Authorization: Bearer {}", api_key),
-                   "-d", &body.to_string()])
-            .output();
-        if let Ok(o) = resp {
-            let json_str = String::from_utf8_lossy(&o.stdout);
-            serde_json::from_str::<serde_json::Value>(&json_str).ok()
-                .and_then(|j| j["choices"][0]["message"]["content"].as_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| {
-                    self.set_feedback("AI request failed", tc.feedback_warn);
-                    String::new()
-                })
-        } else {
-            self.set_feedback("AI not available", tc.feedback_warn);
-            String::new()
+    /// Ask `claude -p` one question. Gives back the answer, or an empty
+    /// string and a line in the status bar that says why there is none.
+    fn ask_claude(&mut self, prompt: &str) -> String {
+        match ask_cli("claude", prompt) {
+            Ok(answer) => answer,
+            Err(why) => {
+                let tc = self.config.theme_colors.clone();
+                self.set_feedback(why, tc.feedback_warn);
+                String::new()
+            }
         }
     }
 
@@ -14710,6 +14636,15 @@ fn extract_mime_text(raw: &str) -> Option<String> {
 /// those bytes, so the mail opens as plain HTML, as it does in Firefox.
 fn html_for_browser(html: &str) -> String {
     format!("<!--{:256}-->\n{}", "", html)
+}
+
+#[cfg(test)]
+#[test]
+fn an_ai_answer_or_the_reason_there_is_none() {
+    assert_eq!(ask_cli("echo", "hi").unwrap().trim(), "-p hi");
+    assert_eq!(ask_cli("true", "hi"), Err("claude returned empty response"));
+    assert_eq!(ask_cli("false", "hi"), Err("claude ended with an error"));
+    assert_eq!(ask_cli("no-such-program-on-this-machine", "hi"), Err("No AI available (install the claude CLI)"));
 }
 
 #[cfg(test)]
@@ -15851,6 +15786,27 @@ fn format_file_size(bytes: u64) -> String {
 }
 
 // --- Image helpers ---
+
+/// One question to `program -p`: the answer, or why there is none.
+fn ask_cli(program: &str, prompt: &str) -> Result<String, &'static str> {
+    // stdin must be /dev/null: kastrup runs in raw-mode TTY, so
+    // claude inherits that fd and prints "Warning: no stdin data
+    // received in 3s, proceeding without it." onto stdout, which
+    // contaminates the response we then try to parse.
+    let result = std::process::Command::new(program)
+        .arg("-p")
+        .arg(prompt)
+        .stdin(std::process::Stdio::null())
+        .output();
+    match result {
+        Ok(o) if o.status.success() => {
+            let answer = String::from_utf8_lossy(&o.stdout).to_string();
+            if answer.trim().is_empty() { Err("claude returned empty response") } else { Ok(answer) }
+        }
+        Ok(_) => Err("claude ended with an error"),
+        Err(_) => Err("No AI available (install the claude CLI)"),
+    }
+}
 
 fn home_dir() -> std::path::PathBuf {
     std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from("."))
