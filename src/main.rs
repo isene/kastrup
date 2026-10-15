@@ -945,6 +945,14 @@ fn take_email_attach_headers(data: &str) -> (String, Vec<String>) {
     (out, atts)
 }
 
+/// The other way round: put attachments back into an email draft as
+/// `Attach:` lines, so a draft that is saved (postponed, or kept after
+/// a failed send) still has them when it is recalled.
+fn put_email_attach_headers(data: &str, attachments: &[String]) -> String {
+    let lines: String = attachments.iter().map(|a| format!("Attach: {}\n", a)).collect();
+    format!("{}{}", lines, data)
+}
+
 /// Extract the kastrup link pseudo-headers from a drop-file email
 /// draft: `X-Kastrup-Reply-To: <id>` and `X-Kastrup-Forward-Of:
 /// <id>[, <id>…]` (kastrup message ids). Returns the draft without
@@ -11557,9 +11565,14 @@ impl App {
                         // when it changes, not on every keypress.
                         let mut saved = String::new();
                         loop {
-                            if self.compose_kind == DraftKind::Email && final_content != saved {
-                                self.save_draft_row(&final_content);
-                                saved = final_content.clone();
+                            // The copy keeps the attachments, or a recalled
+                            // draft goes out without them.
+                            if self.compose_kind == DraftKind::Email {
+                                let row = put_email_attach_headers(&final_content, &attachments);
+                                if row != saved {
+                                    self.save_draft_row(&row);
+                                    saved = row;
+                                }
                             }
                             // Show message summary in right pane
                             self.show_compose_review(&final_content, &attachments);
@@ -11787,10 +11800,8 @@ impl App {
                                             // Email: carry the attachments into the
                                             // scheduled row as Attach: headers;
                                             // send_due_scheduled re-extracts them.
-                                            if self.compose_kind == DraftKind::Email && !attachments.is_empty() {
-                                                let lines: String = attachments.iter()
-                                                    .map(|a| format!("Attach: {}\n", a)).collect();
-                                                final_content = format!("{}{}", lines, final_content);
+                                            if self.compose_kind == DraftKind::Email {
+                                                final_content = put_email_attach_headers(&final_content, &attachments);
                                             }
                                             let kind = self.compose_kind;
                                             self.schedule_draft(kind, &final_content, at);
@@ -11839,7 +11850,7 @@ impl App {
                                         DraftKind::Email => {
                                             // The compose already keeps a row; postponing
                                             // is just letting go of it with the final text.
-                                            self.save_draft_row(&content);
+                                            self.save_draft_row(&put_email_attach_headers(&content, &attachments));
                                             self.draft_row = None;
                                             self.set_feedback("Message postponed", tc.feedback_ok);
                                         }
@@ -12246,7 +12257,7 @@ impl App {
         let att_n = attachments.len();
         self.spawn_smtp_send(
             from_email, recipients, to, smtp_tmpfile, rfc_msg, smtp_spec,
-            forward_ids, reply_id, Some(att_n), content.to_string(),
+            forward_ids, reply_id, Some(att_n), put_email_attach_headers(content, attachments),
         );
     }
 
@@ -16727,6 +16738,19 @@ mod tests {
         let (same, none) = take_email_attach_headers(plain);
         assert_eq!(same, plain);
         assert!(none.is_empty());
+    }
+
+    // A forward whose send failed went out again as an empty mail: the
+    // saved draft had lost its attachment (2026-10-15).
+    #[test]
+    fn a_saved_draft_keeps_its_attachments() {
+        let draft = "From: geir@isene.com\nTo: alice@example.com\nSubject: Fwd: News\n\n[Forwarded message attached]\n";
+        let atts = vec!["/tmp/kastrup_fwd_7.eml".to_string(), "/tmp/two.pdf".to_string()];
+        let saved = put_email_attach_headers(draft, &atts);
+        let (back, got) = take_email_attach_headers(&saved);
+        assert_eq!(back, draft);
+        assert_eq!(got, atts);
+        assert_eq!(put_email_attach_headers(draft, &[]), draft);
     }
 
     #[test]
