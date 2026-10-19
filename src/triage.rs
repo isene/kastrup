@@ -79,30 +79,33 @@ pub fn ensure_files_installed() -> Result<(PathBuf, PathBuf), String> {
     Ok((prompt, wrap))
 }
 
-/// Read tock's CLOUD calendar names from ~/.tock/tock.db. Local
-/// calendars are filtered out — triage events must always land on a
-/// cloud-synced calendar so they show up on the user's phone too.
-/// Returns an empty Vec if tock isn't installed or the DB is
-/// unreadable; in that case Claude just won't be given a calendar
-/// choice and the caller's default kicks in.
+/// tock's calendars that are on, as (id, kind, name), from the list
+/// tock writes in `~/.tock/calendars`: one a line, split by tabs. Only
+/// one program may open tock's own store, so this list is the way in.
+/// Empty when tock has not written it.
+pub fn tock_calendars(tock_home: &Path) -> Vec<(i64, String, String)> {
+    let text = std::fs::read_to_string(tock_home.join("calendars")).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.splitn(3, '\t');
+            let id = f.next()?.parse().ok()?;
+            Some((id, f.next()?.to_string(), f.next()?.to_string()))
+        })
+        .collect()
+}
+
+/// Read tock's CLOUD calendar names. Local calendars are filtered out:
+/// triage events must always land on a cloud-synced calendar so they
+/// show up on the user's phone too. Empty when tock is not set up; then
+/// Claude just won't be given a calendar choice and the caller's
+/// default kicks in.
 pub fn read_calendars() -> Vec<String> {
     let home = std::env::var("HOME").unwrap_or_default();
-    let db = PathBuf::from(home).join(".tock/tock.db");
-    if !db.exists() { return Vec::new(); }
-    let Ok(conn) = rusqlite::Connection::open_with_flags(
-        &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) else { return Vec::new(); };
-    let mut stmt = match conn.prepare(
-        "SELECT name FROM calendars \
-         WHERE source_type != 'local' AND enabled = 1 \
-         ORDER BY id"
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0));
-    let Ok(rows) = rows else { return Vec::new(); };
-    rows.filter_map(|r| r.ok()).collect()
+    tock_calendars(&PathBuf::from(home).join(".tock"))
+        .into_iter()
+        .filter(|(_, kind, _)| kind != "local")
+        .map(|(_, _, name)| name)
+        .collect()
 }
 
 /// Read the existing top-level categories from a hyperlist file.
@@ -311,6 +314,19 @@ fn chrono_local_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tock_calendar_list_is_read_line_by_line() {
+        let dir = std::env::temp_dir().join(format!("kastrup-tock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(tock_calendars(&dir).is_empty(), "no list yet");
+        std::fs::write(dir.join("calendars"), "1\tlocal\tPersonal\n9\toutlook\tWork, the big one\nbroken line\n").unwrap();
+        assert_eq!(tock_calendars(&dir), vec![
+            (1, "local".to_string(), "Personal".to_string()),
+            (9, "outlook".to_string(), "Work, the big one".to_string()),
+        ]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn append_into_existing_category() {

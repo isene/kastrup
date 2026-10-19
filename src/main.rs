@@ -14257,21 +14257,10 @@ impl App {
     }
 
     fn pick_tock_calendar(&mut self, tock_home: &std::path::Path) -> Option<i64> {
-        // Calendars from tock.db
-        let db_path = tock_home.join("tock.db");
-        let calendars: Vec<(i64, String)> = rusqlite::Connection::open(&db_path)
-            .ok()
-            .and_then(|c| {
-                let mut stmt = c.prepare(
-                    "SELECT id, name FROM calendars WHERE enabled = 1 ORDER BY id"
-                ).ok()?;
-                let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
-                    .ok()?
-                    .filter_map(|r| r.ok())
-                    .collect::<Vec<_>>();
-                Some(rows)
-            })
-            .unwrap_or_default();
+        let calendars: Vec<(i64, String)> = triage::tock_calendars(tock_home)
+            .into_iter()
+            .map(|(id, _, name)| (id, name))
+            .collect();
         if calendars.is_empty() { return Some(1); }
 
         // Default from ~/.tock/config.yml: line "default_calendar: <n>"
