@@ -184,7 +184,7 @@ link are used. Any other header the link asks for is left out.
 | `+` | Add to favorites |
 | **I** | **`:claude PROMPT`** — one-shot: pipe message + custom prompt to `claude -p`, response shown in the right pane |
 | **Ctrl+A** | **`:chat`** — full session: suspend kastrup, open interactive `claude` with the current message snapshot as context |
-| c | AI assistant menu (draft / summarize / translate / ask + plugins) |
+| c | AI assistant menu (draft / summarize / translate / ask + plugins). On a section header: give it a name of its own; an empty name gives its own back |
 | C | Full Claude session (alias of Ctrl+A) |
 | **`:`** | **Colon prompt** — type any verb explicitly: `:claude PROMPT`, `:search QUERY`, `:chat`, `:triage`, `:q`/`:quit` |
 | Esc | Clear sticky search, return to current view |
