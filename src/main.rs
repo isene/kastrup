@@ -1741,6 +1741,10 @@ struct App {
     group_by_folder: bool,
     display_messages: Vec<Message>,
     section_collapsed: HashMap<String, bool>,
+    /// Names given with `c` on a section header, by section name: a group
+    /// chat named after everyone in it gets a short name. Persisted as
+    /// `section_names` (JSON object).
+    section_names: HashMap<String, String>,
     /// User-pinned section order for the current view. Sections in
     /// this list rank above unpinned ones (which then sort by
     /// latest-message). Persisted per-view as `section_order_<key>`
@@ -2378,6 +2382,8 @@ fn main() {
 
     // Read state exchange, resolved before `config` moves into App.
     let read_sync = read_sync::ReadSync::new(&config.read_sync_dir, config.read_sync_days);
+    let section_names = db.get_setting("section_names")
+        .and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
     let mut app = App {
         top, left, right, bottom,
         cols, rows,
@@ -2451,6 +2457,7 @@ fn main() {
         group_by_folder: false,
         display_messages: Vec::new(),
         section_collapsed: HashMap::new(),
+        section_names,
         current_section_order: Vec::new(),
         nick_lists: nick_lists.clone(),
         subscribed_buffers: subscribed_buffers.clone(),
@@ -2999,7 +3006,10 @@ impl App {
             // richer AI menu (Draft/Summarize/Translate/Ask + plugins); C
             // stays an alias for the session for muscle memory.
             "C-A" => { self.chat_command(); }
-            "c" => { self.ai_assistant(); }
+            "c" => match self.cursor_on() {
+                CursorOn::Header(name) => self.name_section(&name),
+                _ => self.ai_assistant(),
+            },
             "C" => { self.chat_command(); }
 
             // Vim-style `:` command prompt — types out the colon command
@@ -3480,7 +3490,9 @@ impl App {
             + crust::display_width(&suffix)
             + crust::display_width(&muted_tag)
             + crust::display_width(&unread_mark);
-        let name = truncate_str(subject, pane_w.saturating_sub(deco_w));
+        let shown = msg.thread_id.as_ref()
+            .and_then(|n| self.section_names.get(n)).map(String::as_str).unwrap_or(subject);
+        let name = truncate_str(shown, pane_w.saturating_sub(deco_w));
 
         // Split the display name at the LAST `.` — everything up to and
         // including that dot is dimmed (the workspace / network prefix);
@@ -3792,8 +3804,11 @@ impl App {
                 if m.is_header {
                     let tc = &self.config.theme_colors;
                     let subj = m.subject.as_deref().unwrap_or("Section");
+                    let given = m.thread_id.as_ref().and_then(|n| self.section_names.get(n));
                     let mut lines = Vec::new();
-                    lines.push(style::bold(&style::fg(subj, tc.thread)));
+                    lines.push(style::bold(&style::fg(given.map(String::as_str).unwrap_or(subj), tc.thread)));
+                    // The full name stays readable under the short one.
+                    if given.is_some() { lines.push(style::fg(subj, tc.hint_fg)); }
                     lines.push(String::new());
                     lines.push(format!("{} {}", style::fg("Messages:", tc.header_date), m.content));
                     let (_, m_scolor) = source_info(&m.source_type, tc);
@@ -3808,6 +3823,7 @@ impl App {
                     lines.push(String::new());
                     lines.push(style::fg("ENTER/Space: Toggle collapse", tc.hint_fg));
                     lines.push(style::fg("h: Collapse", tc.hint_fg));
+                    lines.push(style::fg("c: Give it a name of its own", tc.hint_fg));
                     self.right.set_text(&lines.join("\n"));
                     self.right.ix = 0;
                     self.right.full_refresh();
@@ -7137,7 +7153,8 @@ impl App {
   Ctrl-U         Toggle: all channels / unmuted only\n\
   I              claude -p ask (one-shot, response in right pane)\n\
   Ctrl-A         Full Claude session (suspend, message context)\n\
-  c              AI assistant menu (draft/summarize/translate + plugins)\n\
+  c              AI assistant menu (draft/summarize/translate + plugins);\n\
+                 on a section header: give it a name of its own (empty: its own again)\n\
   C              Full Claude session (alias of Ctrl-A)\n\
   :              Colon command (claude/chat/search/triage/q)\n\
   Esc            Clear sticky search, return to current view\n\
@@ -7904,6 +7921,22 @@ impl App {
         // The question is in the log already; the answer makes it readable later.
         log::info(if yes { "answer: yes" } else { "answer: no" });
         yes
+    }
+
+    /// `c` on a section header: show it under a name of your own. An empty
+    /// name gives it back its own. Only the shown name changes; mutes,
+    /// order and `y` still go by the section's real name.
+    fn name_section(&mut self, section: &str) {
+        let now = self.section_names.get(section).cloned().unwrap_or_default();
+        let name = self.prompt("Name: ", &now);
+        if self.bottom.last_escaped { self.render_all(); return; }
+        let name = name.trim();
+        if name == now { self.render_all(); return; }
+        if name.is_empty() { self.section_names.remove(section); }
+        else { self.section_names.insert(section.to_string(), name.to_string()); }
+        self.db.set_setting("section_names",
+            &serde_json::to_string(&self.section_names).unwrap_or_default());
+        self.render_all();
     }
 
     /// `O`: opt out of the mailing list a mail came from, the way the mail
