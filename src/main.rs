@@ -7900,7 +7900,10 @@ impl App {
     fn confirm(&mut self, question: &str) -> bool {
         let warn = self.config.theme_colors.feedback_warn;
         self.set_feedback(question, warn);
-        matches!(Input::getchr(Some(15)).as_deref(), Some("y") | Some("Y"))
+        let yes = matches!(Input::getchr(Some(15)).as_deref(), Some("y") | Some("Y"));
+        // The question is in the log already; the answer makes it readable later.
+        log::info(if yes { "answer: yes" } else { "answer: no" });
+        yes
     }
 
     /// `O`: opt out of the mailing list a mail came from, the way the mail
@@ -7925,7 +7928,10 @@ impl App {
                 }
                 self.set_feedback("Unsubscribing...", tc.feedback_ok);
                 match unsubscribe_post(&url) {
-                    Ok(()) => self.set_feedback(&format!("Unsubscribed from {}", sender), tc.feedback_ok),
+                    Ok(code) => {
+                        log::info(&format!("unsubscribe: {} answered {}", url_host(&url), code));
+                        self.set_feedback(&format!("Unsubscribed from {}", sender), tc.feedback_ok);
+                    }
                     Err(why) => self.set_feedback_sticky(
                         &format!("Could not unsubscribe from {}: {}", sender, why), tc.feedback_warn),
                 }
@@ -14900,7 +14906,7 @@ fn one_click_unsubscribe_is_one_post() {
         seen
     });
     let url = format!("http://127.0.0.1:{}/u?id=7", port);
-    assert_eq!(unsubscribe_post(&url), Ok(()));
+    assert_eq!(unsubscribe_post(&url), Ok(200));
     assert_eq!(unsubscribe_post(&url), Err("the list answered 404".to_string()));
     let seen = server.join().unwrap();
     assert!(seen[0].starts_with("POST /u?id=7 HTTP/1.1"), "{}", seen[0]);
@@ -16032,13 +16038,13 @@ fn url_host(url: &str) -> String {
 /// One-click unsubscribe as RFC 8058 has it: one POST with this body.
 /// It carries no cookie and nothing about the reader but the address
 /// the list wrote into its own link.
-fn unsubscribe_post(url: &str) -> Result<(), String> {
+fn unsubscribe_post(url: &str) -> Result<u16, String> {
     let sent = ureq::post(url)
         .timeout(std::time::Duration::from_secs(15))
         .set("Content-Type", "application/x-www-form-urlencoded")
         .send_string("List-Unsubscribe=One-Click");
     match sent {
-        Ok(_) => Ok(()),
+        Ok(r) => Ok(r.status()),
         Err(ureq::Error::Status(code, _)) => Err(format!("the list answered {}", code)),
         Err(e) => Err(e.to_string()),
     }
