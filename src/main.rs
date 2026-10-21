@@ -1578,6 +1578,18 @@ struct HiddenChannel {
     hidden_at: i64,
 }
 
+/// Whether a muted channel shows. It does when it has an unread message
+/// newer than the mute that fits the mode, and also while the cursor is
+/// still in it after its last one was read (`pending`). A redraw then, such
+/// as after `v` on an attachment, must not take the message being read away.
+fn muted_section_shows<'a>(h: &HiddenChannel, mut msgs: impl Iterator<Item = &'a Message>, pending: Option<&str>) -> bool {
+    pending == Some(h.name.as_str())
+        || msgs.any(|m| !m.read && m.timestamp > h.hidden_at && match h.mode {
+            HideMode::UntilNew => true,
+            HideMode::UntilHighlight => m.metadata.get("highlight").and_then(|v| v.as_bool()) == Some(true),
+        })
+}
+
 struct App {
     top: Pane,
     left: Pane,
@@ -5479,17 +5491,10 @@ impl App {
             // applies this once the cursor leaves the channel.)
             if !self.show_muted && !self.current_hidden_channels.is_empty() {
                 let muted = &self.current_hidden_channels;
-                sections.retain(|s| {
-                    match muted.iter().find(|h| h.name == s.name) {
-                        None => true,
-                        Some(h) => s.messages.iter()
-                            .filter_map(|&i| filtered.get(i))
-                            .any(|m| !m.read && m.timestamp > h.hidden_at && match h.mode {
-                                HideMode::UntilNew => true,
-                                HideMode::UntilHighlight => m.metadata
-                                    .get("highlight").and_then(|v| v.as_bool()) == Some(true),
-                            }),
-                    }
+                let pending = self.mute_recheck_pending.as_deref();
+                sections.retain(|s| match muted.iter().find(|h| h.name == s.name) {
+                    None => true,
+                    Some(h) => muted_section_shows(h, s.messages.iter().filter_map(|&i| filtered.get(i)), pending),
                 });
             }
         }
@@ -16693,6 +16698,19 @@ mod fold_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_muted_channel_stays_while_its_last_message_is_being_read() {
+        let h = HiddenChannel { name: "libera.#ruby".into(), mode: HideMode::UntilNew, hidden_at: 100 };
+        let mut msg = Message::default_header();
+        msg.timestamp = 200;
+        msg.read = true;
+        assert!(!muted_section_shows(&h, [&msg].into_iter(), None), "all read: hidden");
+        assert!(muted_section_shows(&h, [&msg].into_iter(), Some("libera.#ruby")), "cursor still in it: shown");
+        assert!(!muted_section_shows(&h, [&msg].into_iter(), Some("libera.#vim")));
+        msg.read = false;
+        assert!(muted_section_shows(&h, [&msg].into_iter(), None), "a new unread brings it back");
+    }
 
     #[test]
     fn a_sent_chat_picture_is_kept_and_shown_as_an_image() {
