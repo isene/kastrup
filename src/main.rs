@@ -4709,6 +4709,16 @@ impl App {
         self.left.full_refresh();
         self.right.full_refresh();
         self.render_all();
+        // A view of a source that is switched off goes stale without a word.
+        // One Space on the sources screen does it, so say so here.
+        let sids: Vec<i64> = filters.source_id.into_iter()
+            .chain(filters.branches.iter().flatten().filter_map(|b| b.source_id)).collect();
+        if !sids.is_empty() {
+            if let Some(off) = self.db.get_sources(false).into_iter().find(|s| !s.enabled && sids.contains(&s.id)) {
+                let msg = format!("{} is switched off: Ctrl+S, then Space on it", off.name);
+                self.set_feedback(&msg, self.config.theme_colors.feedback_warn);
+            }
+        }
     }
 
     /// Reload messages for current view without resetting cursor position.
@@ -8270,10 +8280,12 @@ impl App {
     fn toggle_source(&mut self) {
         if let Some(src) = self.sources_list.get(self.index) {
             let sid = src.id;
+            let name = src.name.clone();
             let new_state = self.db.toggle_source_enabled(sid);
             // Refresh sources list
             self.sources_list = self.db.get_sources(false);
             let label = if new_state { "enabled" } else { "disabled" };
+            log::info(&format!("source {} {}", name, label));
             self.set_feedback(&format!("Source {}", label), self.config.theme_colors.feedback_ok);
             self.render_source_list();
             self.render_source_info();
