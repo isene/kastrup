@@ -733,6 +733,10 @@ fn buffer_admitted_by_filter(
         (None, None) => true,
     };
     if !source_ok { return false; }
+    // A platform rule admits only buffers of that platform. A sender rule
+    // admits none: an empty buffer has no sender to match.
+    if f.platform.as_deref().is_some_and(|p| p != sources::weechat_relay::classify_buffer(buf).0) { return false; }
+    if f.sender_pattern.is_some() { return false; }
     if let Some(ref fold) = f.folder { return buf == fold; }
     if let Some(ref pat) = f.folder_pattern {
         return pat.split('|').map(|s| s.trim()).filter(|s| !s.is_empty()).any(|s| buf.contains(s));
@@ -16658,6 +16662,22 @@ mod fold_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_channel_joins_only_a_view_of_its_own_platform() {
+        let map = std::collections::HashMap::new();
+        let messenger = Filters { platform: Some("messenger".into()), ..Default::default() };
+        assert!(!buffer_admitted_by_filter("irc.libera.#vim", &messenger, &map));
+        assert!(!buffer_admitted_by_filter("python.slack.dualog.#general", &messenger, &map));
+        let irc = Filters { platform: Some("irc".into()), ..Default::default() };
+        assert!(buffer_admitted_by_filter("irc.libera.#vim", &irc, &map));
+        assert!(!buffer_admitted_by_filter("python.slack.dualog.#general", &irc, &map));
+        let family = Filters { sender_pattern: Some("Alice".into()), ..Default::default() };
+        assert!(!buffer_admitted_by_filter("irc.libera.#vim", &family, &map));
+        // The IRC view, by folder, keeps its empty channels.
+        let by_folder = Filters { folder_pattern: Some("irc.libera.|irc.oftc.".into()), ..Default::default() };
+        assert!(buffer_admitted_by_filter("irc.oftc.#nuug", &by_folder, &map));
+    }
 
     #[test]
     fn a_find_sees_through_colours_case_and_line_ends() {
