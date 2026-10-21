@@ -1094,7 +1094,7 @@ fn is_uninteresting_buffer(full_name: &str) -> bool {
 /// Classify a buffer's `full_name` into a (platform, label) pair.
 /// `platform` lands in metadata for filtering; `label` is the
 /// per-message tag (mirrors what the legacy log-tail source emits).
-fn classify_buffer(full_name: &str) -> (&'static str, &'static str) {
+pub fn classify_buffer(full_name: &str) -> (&'static str, &'static str) {
     if full_name.starts_with("python.slack.")  { ("slack",   "Slack")   }
     else if full_name.starts_with("matrix.")    { ("matrix",  "Matrix")  }
     else if full_name.starts_with("irc.discord-bridge.") { ("discord", "DiscordBridge") }
