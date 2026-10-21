@@ -905,6 +905,21 @@ fn extract_message_urls(body: &str) -> Vec<String> {
 /// separator) from a chat draft. Values are file paths with `~/`
 /// and `$HOME/` expansion. Used by `.slack` and `.weechat` drafts
 /// to attach files alongside the message body.
+/// Copy each file a sent chat draft attached into `dir`, so the sent row can
+/// show it after the original (often in /tmp) is gone. Returns the row's
+/// attachment entries; a file that cannot be copied is left out.
+fn keep_sent_attachments(draft: &str, dir: &std::path::Path, stamp: i64) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for (i, src) in parse_chat_attachments(draft).into_iter().enumerate() {
+        let Some(name) = src.file_name().and_then(|n| n.to_str()) else { continue };
+        let kept = dir.join(format!("sent_{stamp}_{i}_{name}"));
+        if std::fs::create_dir_all(dir).is_err() || std::fs::copy(&src, &kept).is_err() { continue; }
+        let size = std::fs::metadata(&kept).map(|m| m.len()).unwrap_or(0);
+        out.push(serde_json::json!({ "filename": name, "path": kept.to_string_lossy(), "size": size }));
+    }
+    out
+}
+
 fn parse_chat_attachments(data: &str) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let home = std::env::var("HOME").unwrap_or_default();
@@ -11102,7 +11117,7 @@ impl App {
     fn record_outbound_discord(&mut self, draft: &str) {
         let Some(target) = parse_chat_channel(draft) else { return };
         let body = parse_chat_body(draft);
-        if body.trim().is_empty() { return; }
+        if body.trim().is_empty() && parse_chat_attachments(draft).is_empty() { return; }
         let target = target.trim();
         // A bare number is a channel id, the same rule send_discord uses.
         let bare;
@@ -11133,9 +11148,13 @@ impl App {
         if src_id == 0 { return; }
 
         let now = crate::database::now_secs();
+        let kept = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".kastrup").join("attachments");
+        let attachments = keep_sent_attachments(draft, &kept, now);
         let subject = body.lines().map(|l| l.trim()).find(|l| !l.is_empty())
             .map(|l| { let mut s: String = l.chars().take(80).collect();
                        if l.chars().count() > 80 { s.push('…'); } s })
+            .or_else(|| attachments.first().and_then(|a| a["filename"].as_str()).map(String::from))
             .unwrap_or_default();
 
         let md = crate::sources::MessageData {
@@ -11149,7 +11168,7 @@ impl App {
             html_content: None,
             timestamp: now,
             labels: vec!["discord".to_string()],
-            attachments: vec![],
+            attachments,
             metadata: serde_json::json!({
                 "discord_channel_id": channel_id,
                 "source_type": "discord",
@@ -16674,6 +16693,23 @@ mod fold_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sent_chat_picture_is_kept_and_shown_as_an_image() {
+        let base = std::env::temp_dir().join(format!("kastrup-sent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let pic = base.join("board.png");
+        std::fs::write(&pic, b"png").unwrap();
+        let draft = format!("Channel: channel:123\nAttach: {}\nAttach: {}/gone.png\n\nSee this:", pic.display(), base.display());
+        let kept = keep_sent_attachments(&draft, &base.join("kept"), 42);
+        assert_eq!(kept.len(), 1, "a missing file is left out");
+        std::fs::remove_file(&pic).unwrap();
+        let path = kept[0]["path"].as_str().unwrap();
+        assert!(std::path::Path::new(path).exists(), "the copy outlives the original");
+        assert!(is_image_attachment(&kept[0]));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn an_empty_channel_joins_only_a_view_of_its_own_platform() {
