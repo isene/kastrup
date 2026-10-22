@@ -1606,6 +1606,8 @@ struct App {
     last_title: String,
     /// Last seen database write signature; gates the unread recount.
     last_db_sig: (u64, u128, u128),
+    /// The newest message id at the last write by any program.
+    last_max_id: i64,
     /// Enabled sources whose sync is failing: name, why, failing since.
     source_errors: Vec<(i64, String, String, i64)>,
     /// The status lines already shown, so a missed one can still be read.
@@ -2423,6 +2425,7 @@ fn main() {
         source_type_map,
         last_title: String::new(),
         last_db_sig: (0, 0, 0),
+        last_max_id: 0,
         source_errors: Vec::new(),
         msg_log: crust::MessageLog::new(msg_log_cap),
         top_plugins: Vec::new(),
@@ -2743,6 +2746,14 @@ fn main() {
                     let sig = app.db.write_signature();
                     if sig != app.last_db_sig {
                     app.last_db_sig = sig;
+                    // A reply sent from here comes back from ws-bridge-listen
+                    // stored as read, so no unread count below moves. A new
+                    // newest id says a row landed: one seek on the key.
+                    let top = app.db.max_message_id();
+                    if top != app.last_max_id {
+                        app.last_max_id = top;
+                        app.messages_dirty.store(true, Ordering::Relaxed);
+                    }
                     let new_unread = app.db.unread_count_by_folder();
                     let new_src_unread = app.db.unread_count_by_source();
                     // External writers (the systemd ws-bridge-listen writing

@@ -2162,5 +2162,37 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
         println!("linking ok");
     }
-}
 
+    // 0.3.87 refreshed the open list for another program's rows only
+    // when an unread count moved. A Workspace reply sent from kastrup
+    // comes back from ws-bridge-listen stored as read, and never showed.
+    #[test]
+    fn a_row_another_program_stores_as_read_moves_the_newest_id() {
+        let _home = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join("kastrup-outside-test");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(tmp.join(".kastrup")).unwrap();
+        std::env::set_var("HOME", &tmp);
+        let db = Database::new().unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO sources (id, name, plugin_type, config, capabilities, \
+                 created_at, updated_at) VALUES (7, 'ws', 'workspace', '{}', '[]', 0, 0)", [],
+            ).unwrap();
+        }
+        db.insert_message(7, &msg("ws-a", "alice", "me", "", "Private: Alice", 1_000, "ws-a", None));
+        let (top, unread) = (db.max_message_id(), db.unread_count_by_folder());
+
+        let other = Connection::open(db_path()).unwrap();
+        other.execute(
+            "INSERT INTO messages (source_id, external_id, sender, recipients, content, \
+             timestamp, received_at, read, folder) \
+             VALUES (7, 'ws-b', 'me', 'alice', 'My reply.', 1001, 1001, 1, 'Private: Alice')", [],
+        ).unwrap();
+
+        assert_eq!(db.unread_count_by_folder(), unread, "no unread count moves");
+        assert!(db.max_message_id() > top, "the newest id does");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+}
