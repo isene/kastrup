@@ -1949,6 +1949,21 @@ fn parse_message_id(s: &str) -> Option<i64> {
     s.strip_prefix("kastrup:").unwrap_or(s).trim().parse().ok()
 }
 
+
+/// True once a new build has replaced the program file this copy runs
+/// from: Linux then marks the running copy " (deleted)". One readlink
+/// per bar draw until it fires, none after.
+fn rebuilt() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static OLD: AtomicBool = AtomicBool::new(false);
+    if OLD.load(Ordering::Relaxed) { return true; }
+    let old = std::fs::read_link("/proc/self/exe")
+        .map(|p| p.to_string_lossy().ends_with(" (deleted)"))
+        .unwrap_or(false);
+    if old { OLD.store(true, Ordering::Relaxed); }
+    old
+}
+
 /// What `y` copies on a section header: `kastrup:workspace#general`.
 /// The type comes first and never holds a `#`, so a name that does
 /// (`libera.#ruby`) still splits at the first one.
@@ -4321,7 +4336,12 @@ impl App {
     }
 
     fn render_bottom_bar(&mut self) {
-        let version = format!("kastrup v{}", env!("CARGO_PKG_VERSION"));
+        let old = rebuilt();
+        let version = if old {
+            format!("kastrup v{} is old: restart", env!("CARGO_PKG_VERSION"))
+        } else {
+            format!("kastrup v{}", env!("CARGO_PKG_VERSION"))
+        };
         let tc = &self.config.theme_colors;
         let left = if let Some((ref msg, color)) = self.feedback_message {
             format!(" {}", style::fg(msg, color))
@@ -4334,7 +4354,8 @@ impl App {
         let left_w = crust::display_width(&left);
         let ver_w = version.len();
         let pad = (self.cols as usize).saturating_sub(left_w + ver_w + 1);
-        self.bottom.say(&format!("{}{}{}", left, " ".repeat(pad), style::fg(&version, tc.hint_fg)));
+        let version = if old { style::bold(&style::fg(&version, 208)) } else { style::fg(&version, tc.hint_fg) };
+        self.bottom.say(&format!("{}{}{}", left, " ".repeat(pad), version));
     }
 
     // --- Source view rendering ---
