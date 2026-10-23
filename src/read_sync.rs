@@ -48,6 +48,11 @@ fn mtime(p: &Path) -> i64 {
 }
 
 impl ReadSync {
+    /// The shared folder itself.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// `None` when no folder is configured or it does not exist — the
     /// whole feature then costs nothing at all.
     pub fn new(dir: &str, days: i64) -> Option<Self> {

@@ -243,14 +243,31 @@ Deleting travels because deleting is the strongest "done with this" there
 is, and the phone reads the IMAP inbox directly — it never sees the
 delete, so without this the message sits there as new for ever.
 
-The arrow points one way. A phone writes nothing into the folder: it
-reads what this laptop publishes and keeps its own marks in its own
+The arrow points one way. A phone writes no read state into the folder:
+it reads what this laptop publishes and keeps its own marks in its own
 prefs, so clearing a phone's list can never cost you mail here. kastrup
 still merges every `mail-read-*.json` it finds, so a second authoritative
 machine would work; it is the phones that stay quiet.
 
 Idle cost is one atomic load plus a couple of `stat()`s every 5 s. The
 database is queried only when a mark has actually moved on one side.
+
+### Drafts sent from the phone
+
+Make the drafts drop folder a link into the shared folder, and the phone
+app lists every draft, shows it in full and can send it:
+
+```bash
+mkdir ~/.kastrup/sync/drafts
+rmdir ~/.kastrup/drafts && ln -s sync/drafts ~/.kastrup/drafts
+```
+
+Send on the phone moves the draft into `send/` in the shared folder.
+Once a minute, with its check of scheduled messages, kastrup moves each
+file there into the `scheduled` table, due now. The scheduled sender then
+sends it, retries a failure every five minutes, and shows it in `+`
+meanwhile. kastrup must be running on the laptop for this. The cost is
+one `readdir` a minute, and none without `read_sync_dir`.
 
 ### External fetch scripts (messenger / instagram)
 
