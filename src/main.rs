@@ -270,6 +270,29 @@ struct DraftCandidate {
     created_at: i64,
 }
 
+/// Move each draft in `send` into `scheduled`, due at `now`, and give
+/// the names moved. A draft is removed only once its row is in.
+fn queue_phone_sends(send: &std::path::Path, conn: &rusqlite::Connection, now: i64) -> Vec<String> {
+    let mut moved = Vec::new();
+    let Ok(entries) = std::fs::read_dir(send) else { return moved };
+    for ent in entries.flatten() {
+        let path = ent.path();
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        // Syncthing writes a file as a dotfile first and renames it.
+        if name.starts_with('.') || !path.is_file() { continue; }
+        let Ok(data) = std::fs::read_to_string(&path) else { continue };
+        let kind = DraftKind::from_path(&path);
+        let stored = conn.execute(
+            "INSERT INTO scheduled (kind, data, send_at, created_at) VALUES (?, ?, ?, ?)",
+            rusqlite::params![kind.tag(), data, now, now],
+        ).is_ok();
+        if stored && std::fs::remove_file(&path).is_ok() {
+            moved.push(name);
+        }
+    }
+    moved
+}
+
 fn drafts_drop_dir() -> std::path::PathBuf {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
@@ -10163,6 +10186,7 @@ impl App {
         let now = database::now_secs();
         if now - self.last_sched_check >= 60 {
             self.last_sched_check = now;
+            self.take_phone_sends(now);
             self.refresh_next_send_at();
         }
         match self.next_send_at {
@@ -10192,6 +10216,11 @@ impl App {
                 let (data, atts) = take_email_attach_headers(&data);
                 let atts: Vec<String> = atts.into_iter()
                     .filter(|a| std::path::Path::new(a).exists()).collect();
+                // A drop-file draft's link to the mail it answers, so the
+                // reply threads and the original gets its arrow.
+                let (data, reply_id, fwd_ids) = take_kastrup_link_headers(&data);
+                if reply_id.is_some() { self.pending_reply_id = reply_id; }
+                if !fwd_ids.is_empty() { self.pending_forward_ids = fwd_ids; }
                 if atts.is_empty() {
                     self.handle_composed_message(&data);
                 } else {
@@ -10233,6 +10262,23 @@ impl App {
             }
         }
         self.refresh_next_send_at();
+    }
+
+    /// Drafts sent from the phone. The nomad kastrup app moves a draft
+    /// from the drop folder into `send/` in the read-sync folder, which
+    /// Syncthing shares with the phone. Each one goes into `scheduled`,
+    /// due now, so the scheduled sender sends it at once, retries a
+    /// failure every five minutes and shows it in `+` meanwhile.
+    ///
+    /// Runs with the minute check of `scheduled`: one readdir a minute,
+    /// and none without a read-sync folder.
+    fn take_phone_sends(&mut self, now: i64) {
+        let Some(rs) = &self.read_sync else { return };
+        let send = rs.dir().join("send");
+        let conn = self.db.conn.lock().unwrap();
+        for name in queue_phone_sends(&send, &conn, now) {
+            log::info(&format!("phone send: {} queued", name));
+        }
     }
 
     /// Drop a draft from its backing store after the user loads it.
@@ -17207,4 +17253,33 @@ mod oldest_first_tests {
         assert_eq!(newest_first, vec![3, 1, 2]);
         assert_eq!(oldest_first, vec![(1, 0), (2, 1), (3, 0)]);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn a_draft_the_phone_sends_is_scheduled_now() {
+    let send = std::env::temp_dir().join(format!("kastrup-phone-send-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&send);
+    std::fs::create_dir_all(&send).unwrap();
+    std::fs::write(send.join("reply.eml"), "To: a@example.com\nSubject: Hi\n\nBody\n").unwrap();
+    std::fs::write(send.join("note.workspace"), "Conv: x\n\nOn my way.\n").unwrap();
+    // Still on its way from the phone: Syncthing's own temp file.
+    std::fs::write(send.join(".syncthing.late.eml.tmp"), "half").unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE scheduled (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+        data TEXT NOT NULL, send_at INTEGER NOT NULL, created_at INTEGER NOT NULL, last_error TEXT);").unwrap();
+    let mut moved = queue_phone_sends(&send, &conn, 1000);
+    moved.sort();
+    assert_eq!(moved, ["note.workspace", "reply.eml"]);
+    let rows: Vec<(String, i64, String)> = conn
+        .prepare("SELECT kind, send_at, data FROM scheduled ORDER BY kind").unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap()
+        .map(Result::unwrap).collect();
+    assert_eq!((rows[0].0.as_str(), rows[0].1), ("email", 1000));
+    assert_eq!((rows[1].0.as_str(), rows[1].2.as_str()), ("workspace", "Conv: x\n\nOn my way.\n"));
+    let left: Vec<_> = std::fs::read_dir(&send).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert_eq!(left, [std::ffi::OsString::from(".syncthing.late.eml.tmp")]);
+    // No send folder: nothing happens.
+    assert!(queue_phone_sends(&send.join("none"), &conn, 1000).is_empty());
+    let _ = std::fs::remove_dir_all(&send);
 }
