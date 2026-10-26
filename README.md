@@ -159,7 +159,7 @@ link are used. Any other header the link asks for is left out.
 | e | Reply in editor |
 | g | Reply-all |
 | f | Forward (then `i` inline / `a` attach) |
-| + | Compose new (lists postponed + scheduled drafts; `q` backs out) |
+| + | Compose new (lists postponed + scheduled drafts; `q` backs out). `[3]` at the end of the top line says three wait |
 | E | Edit draft |
 | S | In the send review: schedule instead of sending now |
 

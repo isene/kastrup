@@ -293,6 +293,26 @@ fn queue_phone_sends(send: &std::path::Path, conn: &rusqlite::Connection, now: i
     moved
 }
 
+/// How many drafts `+` lists: postponed rows not on their way out,
+/// scheduled rows, and the files in the drop folder that the picker
+/// reads (dotfiles are left out there too).
+fn count_drafts(conn: &rusqlite::Connection, dir: &std::path::Path, in_flight: &[i64]) -> usize {
+    let mut n = 0;
+    if let Ok(mut stmt) = conn.prepare("SELECT id FROM postponed") {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, i64>(0)) {
+            n += rows.flatten().filter(|id| !in_flight.contains(id)).count();
+        }
+    }
+    n += conn.query_row("SELECT COUNT(*) FROM scheduled", [], |r| r.get::<_, i64>(0))
+        .unwrap_or(0) as usize;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        n += entries.flatten()
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.') && e.path().is_file())
+            .count();
+    }
+    n
+}
+
 fn drafts_drop_dir() -> std::path::PathBuf {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
@@ -1778,6 +1798,10 @@ struct App {
     /// cache is refreshed once a minute — an indexed MIN() over a handful
     /// of rows, against a loop that already wakes every ten seconds.
     last_sched_check: i64,
+    /// What `count_drafts` gave last, shown as `[N]` at the end of the
+    /// top line. Recounted at start, after a database write, in the
+    /// minute check and after `+`; the top line only reads it.
+    draft_count: usize,
     /// When the first hidden (snoozed) mail comes back, cached for the
     /// same reason: one integer compare per idle wake. `None` = none.
     next_wake_at: Option<i64>,
@@ -2524,6 +2548,7 @@ fn main() {
         draft_row: None,
         next_send_at: None,
         last_sched_check: 0,
+        draft_count: 0,
         next_wake_at: None,
         compose_source_type: None,
         compose_force_review: false,
@@ -2636,6 +2661,7 @@ fn main() {
     // Load initial view (heavy DB query) — then repaint with real data.
     let default_view = app.config.default_view.clone();
     app.switch_to_view(&default_view);
+    app.refresh_draft_count();
     app.render_all();
 
     // A message id on the command line: show that one and open it.
@@ -2825,6 +2851,7 @@ fn main() {
                     app.source_unread_cache = new_src_unread;
                     app.source_errors = app.db.failing_sources();
                     app.refresh_view_unread_cache();
+                    app.refresh_draft_count();
                     app.render_top_bar();
                     }
                 }
@@ -3074,7 +3101,11 @@ impl App {
             // Labels / save / misc
             "l" => { self.label_message(); }
             "s" => { self.file_message(); }
-            "+" => { self.compose_new(); }
+            "+" => {
+                self.compose_new();
+                self.refresh_draft_count();
+                self.render_top_bar();
+            }
             "k" => { self.external_react(false); }
             "I" => { self.claude_command(); }
             "Z" => { self.open_in_tock(); }
@@ -3410,6 +3441,12 @@ impl App {
                 counts_str)
         } else {
             format!("{}{}", badges_str, counts_str)
+        };
+        // Drafts waiting in `+`: `[3]` at the very end of the line.
+        let right_info = if self.draft_count > 0 {
+            format!("{}  {}", right_info, style::fg(&format!("[{}]", self.draft_count), tc.accent))
+        } else {
+            right_info
         };
 
         // Build top bar: " Kastrup - [key] ViewName [Sort] [Mode] [pos] ... N unread / T msgs"
@@ -7224,7 +7261,8 @@ impl App {
   e              Reply in editor\n\
   g              Reply-all\n\
   f              Forward\n\
-  +              Compose new (also lists postponed + scheduled drafts)\n\
+  +              Compose new (also lists postponed + scheduled drafts;\n\
+                 [3] at the end of the top line says three wait)\n\
   E              Edit draft\n\
   S              (in the send review) schedule instead of sending now\n\
   k              Add emoji reaction (chat)\n\n\
@@ -10171,6 +10209,14 @@ impl App {
         }
     }
 
+    fn refresh_draft_count(&mut self) {
+        let in_flight: Vec<i64> = self.pending_send.iter().filter_map(|p| p.postponed_id)
+            .chain(self.send_queue.iter().filter_map(|q| q.postponed_id))
+            .collect();
+        let conn = self.db.conn.lock().unwrap();
+        self.draft_count = count_drafts(&conn, &drafts_drop_dir(), &in_flight);
+    }
+
     /// Re-read the earliest due time. One query, only when the table
     /// changed — the idle loop then compares an i64 and moves on.
     fn refresh_next_send_at(&mut self) {
@@ -10193,6 +10239,9 @@ impl App {
             self.last_sched_check = now;
             self.take_phone_sends(now);
             self.refresh_next_send_at();
+            let before = self.draft_count;
+            self.refresh_draft_count();
+            if self.draft_count != before { self.render_top_bar(); }
         }
         match self.next_send_at {
             Some(at) if at <= now => {}
@@ -17261,6 +17310,31 @@ mod oldest_first_tests {
         assert_eq!(newest_first, vec![3, 1, 2]);
         assert_eq!(oldest_first, vec![(1, 0), (2, 1), (3, 0)]);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn the_top_line_counts_the_drafts_that_plus_lists() {
+    let dir = std::env::temp_dir().join(format!("kastrup-draft-count-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("reply.eml"), "To: a@example.com\n\nBody\n").unwrap();
+    std::fs::write(dir.join(".half.eml.tmp"), "half").unwrap();
+    std::fs::create_dir_all(dir.join("send")).unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE postponed (id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER,
+        data TEXT NOT NULL, created_at INTEGER NOT NULL);
+        CREATE TABLE scheduled (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+        data TEXT NOT NULL, send_at INTEGER NOT NULL, created_at INTEGER NOT NULL, last_error TEXT);
+        INSERT INTO postponed (data, created_at) VALUES ('a', 1), ('b', 2);
+        INSERT INTO scheduled (kind, data, send_at, created_at) VALUES ('email', 'c', 9, 1);").unwrap();
+    // Two postponed, one scheduled, one file; the dotfile and the folder are not drafts.
+    assert_eq!(count_drafts(&conn, &dir, &[]), 4);
+    // A postponed row on its way out is hidden in `+`, so it is not counted.
+    assert_eq!(count_drafts(&conn, &dir, &[1]), 3);
+    // No drop folder: the rows alone.
+    assert_eq!(count_drafts(&conn, &dir.join("none"), &[]), 3);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(test)]
