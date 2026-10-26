@@ -10493,7 +10493,6 @@ impl App {
     }
 
     fn compose_new(&mut self) {
-        if self.maybe_external_compose() { return; }
         self.pending_reply_id = None;
 
         // Drafts may come from the `postponed` table (kastrup-side
@@ -10546,6 +10545,10 @@ impl App {
                 DraftPick::New => {}
             }
         }
+
+        // Drafts come first, whatever the cursor is on: a Workspace or
+        // gateway target under it used to skip the draft list.
+        if self.maybe_external_compose() { return; }
 
         // Set compose source type from current message context.
         // current_filtered_index() handles threaded-view's display_messages
