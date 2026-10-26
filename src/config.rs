@@ -259,8 +259,10 @@ pub struct Config {
     ///     connector: <uuid>
     ///     key_file: /home/you/.indexer/push.key
     ///     folder: /home/you/.indexer/push    # optional
+    ///     token_file: /home/you/.indexer/token    # optional
     /// With `folder`, a batch goes there as a file while nothing answers
     /// at `url`, for an indexer that reads the folder when it next runs.
+    /// With `token_file`, what is read here is marked read there.
     pub push: Option<crate::feeder::PushConfig>,
     /// Deliver a phone-gateway reply for `<platform>:<thread_key>` through a
     /// native chat target instead of the (phone-drained) gateway outbox.
@@ -494,7 +496,7 @@ impl Config {
             let get = |k: &str| p.get(serde_yaml::Value::String(k.into()))
                 .and_then(|v| v.as_str()).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
             if let (Some(url), Some(connector), Some(key_file)) = (get("url"), get("connector"), get("key_file")) {
-                self.push = Some(crate::feeder::PushConfig { url, connector, key_file, folder: get("folder") });
+                self.push = Some(crate::feeder::PushConfig { url, connector, key_file, folder: get("folder"), token_file: get("token_file") });
             }
         }
 

@@ -1695,6 +1695,44 @@ impl Database {
         match rows { Ok(rs) => rs.filter_map(|r| r.ok()).collect(), Err(_) => Vec::new() }
     }
 
+    /// Note every message that becomes read, or arrives read, until the
+    /// feeder has told the indexer (`feeder::push_reads`). Off drops the
+    /// note table and its triggers, so a read costs nothing extra.
+    pub fn follow_reads(&self, on: bool) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute_batch(if on {
+            "CREATE TABLE IF NOT EXISTS reads_out (message_id INTEGER PRIMARY KEY);\n\
+             CREATE TRIGGER IF NOT EXISTS reads_out_read AFTER UPDATE OF read ON messages \
+               WHEN NEW.read = 1 AND OLD.read = 0 BEGIN INSERT OR IGNORE INTO reads_out VALUES (NEW.id); END;\n\
+             CREATE TRIGGER IF NOT EXISTS reads_out_new AFTER INSERT ON messages \
+               WHEN NEW.read = 1 BEGIN INSERT OR IGNORE INTO reads_out VALUES (NEW.id); END;"
+        } else {
+            "DROP TRIGGER IF EXISTS reads_out_read; DROP TRIGGER IF EXISTS reads_out_new; DROP TABLE IF EXISTS reads_out;"
+        });
+    }
+
+    /// Reads the indexer has not been told of, oldest first: row id, the
+    /// source's plugin type (None when the row is gone) and the metadata.
+    pub fn reads_waiting(&self, limit: usize) -> Vec<(i64, Option<String>, String)> {
+        let conn = self.read();
+        let mut stmt = match conn.prepare(
+            "SELECT r.message_id, s.plugin_type, COALESCE(m.metadata, '') FROM reads_out r \
+             LEFT JOIN messages m ON m.id = r.message_id LEFT JOIN sources s ON s.id = m.source_id \
+             ORDER BY r.message_id LIMIT ?"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };
+        let rows = stmt.query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)));
+        match rows { Ok(rs) => rs.filter_map(|r| r.ok()).collect(), Err(_) => Vec::new() }
+    }
+
+    /// Forget the reads the indexer was told of.
+    pub fn reads_sent(&self, ids: &[i64]) {
+        if ids.is_empty() { return; }
+        let conn = self.conn.lock().unwrap();
+        let marks = vec!["?"; ids.len()].join(",");
+        let _ = conn.execute(&format!("DELETE FROM reads_out WHERE message_id IN ({})", marks),
+                             rusqlite::params_from_iter(ids.iter()));
+    }
+
     /// The newest message id, for the push feeder's first watermark.
     pub fn max_message_id(&self) -> i64 {
         let conn = self.read();
@@ -1974,7 +2012,7 @@ fn db_path() -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::sources::MessageData;
 
@@ -2004,7 +2042,7 @@ mod tests {
     /// Tests that point HOME at their own folder take this first. A read
     /// opens the database by the HOME of that moment, so two such tests
     /// at once would read each other's file.
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static HOME_LOCK: Mutex<()> = Mutex::new(());
 
     fn id_of(db: &Database, ext: &str) -> i64 {
         let conn = db.conn.lock().unwrap();
