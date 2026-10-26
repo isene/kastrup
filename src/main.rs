@@ -3442,9 +3442,9 @@ impl App {
         } else {
             format!("{}{}", badges_str, counts_str)
         };
-        // Drafts waiting in `+`: `[3]` at the end of the line, one space in.
+        // Drafts waiting in `+`: `[3]` at the end of the line.
         let right_info = if self.draft_count > 0 {
-            format!("{}  {} ", right_info, style::fg(&format!("[{}]", self.draft_count), tc.accent))
+            format!("{}  {}", right_info, style::fg(&format!("[{}]", self.draft_count), tc.accent))
         } else {
             right_info
         };
@@ -3487,8 +3487,9 @@ impl App {
         let left_part = format!("{}{}{}{}{}{}{}", prefix, view_label, sort_label, mode_label, pos_label, send_badge, alert);
         let left_width = crust::display_width(&left_part);
         let right_width = crust::display_width(&right_info);
+        // The line always ends one space before the edge.
         let padding = if self.cols as usize > left_width + right_width + 1 {
-            " ".repeat(self.cols as usize - left_width - right_width)
+            " ".repeat(self.cols as usize - left_width - right_width - 1)
         } else {
             " ".to_string()
         };
