@@ -8,7 +8,9 @@ use std::path::PathBuf;
 ///
 /// The Python script's path is read from the source's `config`:
 ///
-///     { "fetch_script": "~/.kastrup/plugins/messenger_fetch.py" }
+/// ```json
+/// { "fetch_script": "~/.kastrup/plugins/messenger_fetch.py" }
+/// ```
 ///
 /// `~/` and `$HOME` are expanded. Default if unset:
 /// `~/.kastrup/plugins/messenger_fetch.py`. Function is a no-op
