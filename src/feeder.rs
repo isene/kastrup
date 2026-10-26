@@ -12,6 +12,15 @@
 //! One way only: the indexer answers on its own channels. Nothing it
 //! sends comes back through kastrup.
 //!
+//! Reads go too, when the block names a `token_file`: a personal token of
+//! the person whose read marks follow kastrup's. A trigger notes each
+//! message that becomes read, or arrives read, and `push_reads` posts the
+//! notes to `{url}/api/items/seen` at most once a minute. A note stays
+//! until a post is answered, so reads made while the indexer is down go
+//! when it is back. The indexer keeps a mark for an item it has not read
+//! yet until the item comes. Mail goes by its Maildir file name, which no
+//! flag changes; the rest by the id the push sends.
+//!
 //! The indexer need not run. When nothing answers at its address and the
 //! `push:` block names a `folder`, the batch goes there as a file and the
 //! watermark moves as after a POST. The indexer reads the folder when it
@@ -33,6 +42,9 @@ pub struct PushConfig {
     /// Optional: a folder that takes each batch as a file while nothing
     /// answers at `url`. It must exist.
     pub folder: Option<String>,
+    /// Optional: a file holding a personal token, sent as `Authorization:
+    /// Bearer`. With it, what is read here is marked read there.
+    pub token_file: Option<String>,
 }
 
 const WATERMARK: &str = "push_sent_up_to";
@@ -175,6 +187,61 @@ fn deliver(cfg: &PushConfig, key: &str, body: &str, first_id: i64, filed: &mut O
     Ok(true)
 }
 
+/// The most reads one post carries; the indexer reads no more.
+const READS_AT_ONCE: usize = 500;
+
+/// The id the indexer files a message under. Mail is named by its folder
+/// and the part of its file name no flag and no move out of new/ changes;
+/// the rest as `record` names it. None for a row that is gone.
+fn indexed_as(id: i64, plugin_type: Option<&str>, metadata: &str) -> Option<String> {
+    if plugin_type? != "maildir" {
+        return Some(format!("kastrup:{}", id));
+    }
+    let meta: serde_json::Value = serde_json::from_str(metadata).ok()?;
+    let file = std::path::Path::new(meta.get("maildir_file")?.as_str()?);
+    let plain = file.file_name()?.to_str()?.split(':').next()?;
+    Some(format!("{}/cur/{}", file.parent()?.parent()?.display(), plain))
+}
+
+/// Tell the indexer what was read here. Returns how many reads went, or
+/// None when none did. A post nothing answers leaves the reads to wait; a
+/// refused one logs once until a post goes through.
+pub fn push_reads(db: &Arc<Database>, cfg: &PushConfig) -> Option<usize> {
+    static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let token = std::fs::read_to_string(cfg.token_file.as_deref()?).ok()?.trim().to_string();
+    if token.is_empty() { return None; }
+    let url = format!("{}/api/items/seen", cfg.url.trim_end_matches('/'));
+    let mut sent = 0;
+    loop {
+        let rows = db.reads_waiting(READS_AT_ONCE);
+        if rows.is_empty() { break; }
+        let ids: Vec<String> = rows.iter().filter_map(|(id, kind, meta)| indexed_as(*id, kind.as_deref(), meta)).collect();
+        if !ids.is_empty() {
+            let resp = sources::http_agent()
+                .post(&url)
+                .set("Authorization", &format!("Bearer {}", token))
+                .set("Content-Type", "application/json")
+                .timeout(std::time::Duration::from_secs(5))
+                .send_string(&serde_json::json!({"external_ids": ids}).to_string());
+            match resp {
+                Ok(_) => TOLD.store(false, std::sync::atomic::Ordering::Relaxed),
+                Err(e) => {
+                    if !unreachable(&e) && !TOLD.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        crate::log::info(&format!("reads: {} not taken: {}", ids.len(), e));
+                    }
+                    break;
+                }
+            }
+        }
+        sent += ids.len();
+        db.reads_sent(&rows.iter().map(|r| r.0).collect::<Vec<_>>());
+        if rows.len() < READS_AT_ONCE { break; }
+    }
+    if sent == 0 { return None; }
+    crate::log::info(&format!("reads: {} marked read at the indexer", sent));
+    Some(sent)
+}
+
 /// Send what arrived since the watermark. Returns (rows sent, how many
 /// of them went to the folder, ms), or None when there was nothing to
 /// send. Never raises: a batch that fails logs one line and leaves the
@@ -251,7 +318,7 @@ mod tests {
     }
 
     fn cfg(url: String, folder: Option<&std::path::Path>) -> PushConfig {
-        PushConfig { url, connector: "c".into(), key_file: String::new(), folder: folder.map(|f| f.to_string_lossy().into_owned()) }
+        PushConfig { url, connector: "c".into(), key_file: String::new(), folder: folder.map(|f| f.to_string_lossy().into_owned()), token_file: None }
     }
 
     /// An address where nothing listens.
@@ -351,5 +418,98 @@ mod tests {
         assert_eq!(serde_json::from_str::<serde_json::Value>(&some).unwrap().as_array().unwrap().len(), 2);
         // A single row over the limit still goes, alone.
         assert_eq!(batch(&rows, 10).1, 1);
+    }
+
+    #[test]
+    fn a_message_is_named_as_the_indexer_files_it() {
+        let mail = |file: &str| indexed_as(5, Some("maildir"), &serde_json::json!({"maildir_file": file}).to_string());
+        // In new/ or in cur/ under any flags: one name, the one the indexer gave it.
+        assert_eq!(mail("/m/.Box/new/17.M1.host").as_deref(), Some("/m/.Box/cur/17.M1.host"));
+        assert_eq!(mail("/m/.Box/cur/17.M1.host:2,RS").as_deref(), Some("/m/.Box/cur/17.M1.host"));
+        assert_eq!(indexed_as(5, Some("maildir"), "{}"), None);
+        assert_eq!(indexed_as(9, Some("discord"), "").as_deref(), Some("kastrup:9"));
+        // A row deleted before its read went: nothing to name.
+        assert_eq!(indexed_as(9, None, ""), None);
+    }
+
+    /// A server that answers each request with one status line, and keeps what it was sent.
+    fn recorder(status: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { break };
+                let (mut buf, mut chunk) = (Vec::new(), [0u8; 4096]);
+                loop {
+                    let n = s.read(&mut chunk).unwrap_or(0);
+                    if n == 0 { break; }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let Some(h) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                    let head = String::from_utf8_lossy(&buf[..h]).to_ascii_lowercase();
+                    let len = head.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+                    if buf.len() >= h + 4 + len { break; }
+                }
+                let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+                let _ = write!(s, "HTTP/1.1 {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status);
+            }
+        });
+        (url, rx)
+    }
+
+    #[test]
+    fn a_read_goes_to_the_indexer_once_and_waits_while_nothing_answers() {
+        let _home = crate::database::tests::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = scratch("reads");
+        std::fs::create_dir_all(home.join(".kastrup")).unwrap();
+        std::env::set_var("HOME", &home);
+        let db = Arc::new(Database::new().unwrap());
+        db.follow_reads(true);
+        db.add_source("Mail", "maildir", "{}", "[]", 60);
+        db.add_source("Chat", "discord", "{}", "[]", 60);
+        let source = |kind: &str| db.get_sources(false).into_iter().find(|s| s.plugin_type == kind).unwrap().id;
+        let message = |ext: &str, folder: &str, meta: serde_json::Value| crate::sources::MessageData {
+            external_id: ext.into(), sender: "ann@example.org".into(), sender_name: None, recipients: "me@example.org".into(),
+            cc: None, bcc: None, subject: Some("Hello".into()), content: "Hello.".into(), html_content: None, timestamp: 1,
+            labels: vec![], attachments: vec![], metadata: meta, folder: Some(folder.into()), thread_id: None,
+        };
+        db.insert_message(source("maildir"), &message("m1", "INBOX", serde_json::json!({"maildir_file": "/m/.Box/new/17.M1.host"})));
+        db.insert_message(source("discord"), &message("c1", "general", serde_json::json!({})));
+        // Sent mail arrives read, and is noted as it comes.
+        db.insert_message(source("maildir"), &message("m2", "Sent", serde_json::json!({"maildir_file": "/m/.Sent/cur/18.M1.host:2,S"})));
+        let id = |ext: &str| -> i64 { db.conn.lock().unwrap()
+            .query_row("SELECT id FROM messages WHERE external_id = ?", [ext], |r| r.get(0)).unwrap() };
+        assert_eq!(db.reads_waiting(10).len(), 1);
+        db.mark_as_read(id("m1"));
+        db.mark_as_read(id("c1"));
+        db.mark_as_read(id("c1"));
+        assert_eq!(db.reads_waiting(10).len(), 3);
+
+        let token = home.join("token");
+        std::fs::write(&token, "t0ken\n").unwrap();
+        let with = |url: String| PushConfig { token_file: Some(token.to_string_lossy().into_owned()), ..cfg(url, None) };
+        // Nothing answers: every read waits for the next try.
+        assert_eq!(push_reads(&db, &with(dead())), None);
+        assert_eq!(db.reads_waiting(10).len(), 3);
+        // Refused: the reads wait too.
+        let (url, _) = recorder("401 Unauthorized");
+        assert_eq!(push_reads(&db, &with(url)), None);
+        assert_eq!(db.reads_waiting(10).len(), 3);
+        // Taken: one post with the three names and the token, and nothing waits.
+        let (url, heard) = recorder("200 OK");
+        assert_eq!(push_reads(&db, &with(url)), Some(3));
+        let post = heard.recv().unwrap();
+        assert!(post.starts_with("POST /api/items/seen ") && post.contains("Bearer t0ken\r\n"), "{}", post);
+        let body: serde_json::Value = serde_json::from_str(&post[post.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(body, serde_json::json!({"external_ids": [
+            "/m/.Box/cur/17.M1.host", format!("kastrup:{}", id("c1")), "/m/.Sent/cur/18.M1.host"]}));
+        assert!(db.reads_waiting(10).is_empty() && push_reads(&db, &with(dead())).is_none());
+
+        // Off: the notes and their triggers go, so a read costs nothing.
+        db.follow_reads(false);
+        db.mark_as_unread(id("m1"));
+        db.mark_as_read(id("m1"));
+        assert!(db.reads_waiting(10).is_empty());
+        std::fs::remove_dir_all(&home).ok();
     }
 }

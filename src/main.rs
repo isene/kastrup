@@ -2093,6 +2093,10 @@ fn main() {
             None => println!("push: nothing to send (watermark {})",
                 db.get_setting("push_sent_up_to").unwrap_or_else(|| "unset".into())),
         }
+        if cfg.token_file.is_some() {
+            db.follow_reads(true);
+            println!("reads: {} marked read at the indexer", feeder::push_reads(&db, &cfg).unwrap_or(0));
+        }
         return;
     }
     if std::env::args().any(|a| a == "--backfill-text") {
@@ -2613,6 +2617,7 @@ fn main() {
     let (poller_tx, poller_rx) = std::sync::mpsc::channel();
     app.top_plugins = app.load_top_plugins();
     app.aliases = load_aliases(&alias_path(&app.config));
+    app.db.follow_reads(app.config.push.as_ref().is_some_and(|p| p.token_file.is_some()));
     let poller = poller::Poller::start(app.db.clone(), poller_tx, app.config.push.clone());
     app.poller = Some(poller);
     app.poller_rx = Some(poller_rx);

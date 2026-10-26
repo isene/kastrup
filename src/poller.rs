@@ -184,6 +184,9 @@ fn poller_loop(
     let mut forced = true;
     // True for one cycle after `fetch_all`: every source skips the gate.
     let mut all = false;
+    // Reads go to the indexer at most once a minute: one small query, and
+    // a post only when some wait.
+    let mut reads_at = std::time::Instant::now();
     // The first iteration also reads every folder in full (last_sync=0,
     // no mtime gate): a mail skipped or dropped on an earlier run (a
     // parse failure now fixed, say) sits in a folder whose mtime is at
@@ -357,6 +360,12 @@ fn poller_loop(
         // rows. Idle cycles never reach this line.
         if new_non_mail {
             if let Some(cfg) = &push { crate::feeder::push_new(&db, cfg); }
+        }
+        if let Some(cfg) = push.as_ref().filter(|c| c.token_file.is_some()) {
+            if reads_at.elapsed() >= std::time::Duration::from_secs(60) {
+                reads_at = std::time::Instant::now();
+                crate::feeder::push_reads(&db, cfg);
+            }
         }
 
         // Park until 10s elapse, inotify nudges Wake, or stop is
