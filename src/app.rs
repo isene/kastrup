@@ -1622,7 +1622,7 @@ fn muted_section_shows<'a>(h: &HiddenChannel, mut msgs: impl Iterator<Item = &'a
         })
 }
 
-struct App {
+pub struct App {
     top: Pane,
     left: Pane,
     right: Pane,
@@ -1797,6 +1797,12 @@ struct App {
     /// Wall clock at the previous loop turn: a gap of 30 s or more means
     /// the machine was suspended.
     last_wall: std::time::SystemTime,
+    /// The database writer thread, joined in `finish` so its last
+    /// checkpoint runs before the program ends.
+    writer: Option<std::thread::JoinHandle<()>>,
+    /// Under gluon, the tab names that start the top line in place
+    /// of "Kastrup - ".
+    tab_line: Option<String>,
     /// When the first hidden (snoozed) mail comes back, cached for the
     /// same reason: one integer compare per idle wake. `None` = none.
     next_wake_at: Option<i64>,
@@ -2026,7 +2032,10 @@ mod section_ref_tests {
     }
 }
 
-pub fn run() {
+/// Everything before the main loop: the flags that answer and leave
+/// (None), the terminal, the database, the threads and the first
+/// paint. gluon calls it to start the mail tab.
+pub fn start() -> Option<App> {
     // --help / --version answer before anything else, including the
     // no-terminal guard below: a CLI that cannot say what it is when
     // asked over a pipe is useless to any tool that asks (the fe2o3
@@ -2050,11 +2059,11 @@ pub fn run() {
         println!("Email, RSS, weechat (Slack / IRC / WhatsApp), Discord and the phone");
         println!("gateway in one inbox. Views 1-9, + composes, m mutes, ? shows every key.");
         println!("Data lives in ~/.kastrup/; config in ~/.kastrup/config.yml.");
-        return;
+        return None;
     }
     if std::env::args().skip(1).any(|a| a == "-v" || a == "--version") {
         println!("kastrup {}", env!("CARGO_PKG_VERSION"));
-        return;
+        return None;
     }
 
     // --draft mailto:...: a browser hands over a mail link. It becomes a
@@ -2067,7 +2076,7 @@ pub fn run() {
                 Ok(path) => println!("Draft queued for + in kastrup: {}", path.display()),
                 Err(e) => { eprintln!("kastrup --draft: {e}"); std::process::exit(1); }
             }
-            return;
+            return None;
         }
     }
 
@@ -2089,7 +2098,7 @@ pub fn run() {
                 Ok(false) => println!("kastrup has this feed already: {}", name),
                 Err(e) => { eprintln!("kastrup --add-feed: {e}"); std::process::exit(1); }
             }
-            return;
+            return None;
         }
     }
 
@@ -2116,7 +2125,7 @@ pub fn run() {
             db.follow_reads(true);
             println!("reads: {} marked read at the indexer", feeder::push_reads(&db, &cfg).unwrap_or(0));
         }
-        return;
+        return None;
     }
     if std::env::args().any(|a| a == "--backfill-text") {
         let db = match Database::new() {
@@ -2126,7 +2135,7 @@ pub fn run() {
         let total = db.content_text_missing();
         if total == 0 {
             println!("backfill: nothing to do — every message has a decoded body.");
-            return;
+            return None;
         }
         println!("backfill: {} message(s) to decode", total);
         let start = std::time::Instant::now();
@@ -2139,7 +2148,7 @@ pub fn run() {
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
         println!("\rbackfill: {} done in {:.1}s", done, start.elapsed().as_secs_f64());
-        return;
+        return None;
     }
 
     // --weechat-probe: M1 one-shot wire test for the relay client.
@@ -2546,6 +2555,8 @@ pub fn run() {
         draft_count: 0,
         relay_kill: relay_kill.clone(),
         last_wall: std::time::SystemTime::now(),
+        writer: Some(writer_handle),
+        tab_line: None,
         next_wake_at: None,
         compose_source_type: None,
         compose_force_review: false,
@@ -2677,18 +2688,30 @@ pub fn run() {
     app.refresh_next_send_at();
     app.next_wake_at = app.db.next_snooze_wake();
 
+    Some(app)
+}
+
+/// The kastrup program: start, the main loop, finish.
+pub fn run() {
+    let Some(mut app) = start() else { return };
     while app.running {
         let wait = app.before_wait();
         let key = Input::getchr(Some(wait));
         app.after_wait(key);
     }
+    finish(app);
+}
 
+/// Stop the threads, let the database writer drain, and give the
+/// terminal back.
+pub fn finish(mut app: App) {
     // Stop poller immediately (don't wait for drop)
     log::info("Stopping poller...");
     if let Some(mut p) = app.poller.take() {
         p.stop();
     }
     log::info("Dropping app...");
+    let writer_handle = app.writer.take();
     drop(app);
     // Wait for the writer thread to finish draining the channel +
     // running its shutdown wal_checkpoint(TRUNCATE). Bounded by the
@@ -2696,7 +2719,7 @@ pub fn run() {
     // before quit) plus the checkpoint itself (~ms on a sub-MB WAL).
     // Worth the wait: next startup has zero WAL replay work.
     let t = std::time::Instant::now();
-    let _ = writer_handle.join();
+    if let Some(h) = writer_handle { let _ = h.join(); }
     log::info(&format!("writer thread joined in {} ms", t.elapsed().as_millis()));
     log::info("Cleanup...");
     Crust::cleanup();
@@ -2704,6 +2727,19 @@ pub fn run() {
 }
 
 impl App {
+    /// Under gluon: the tab names to start the top line with.
+    pub fn set_tab_line(&mut self, tabs: Option<String>) {
+        self.tab_line = tabs;
+    }
+
+    /// Draw everything again from nothing, after another tab had the
+    /// screen; it also takes up a resize made meanwhile.
+    pub fn repaint(&mut self) {
+        self.handle_resize();
+    }
+
+    pub fn running(&self) -> bool { self.running }
+
     /// One turn of the main loop is `before_wait`, a wait of at most the
     /// seconds it gives for a key, then `after_wait` with the key or None.
     /// The kastrup program runs that loop in `run`; gluon runs the same.
@@ -3458,7 +3494,10 @@ impl App {
         };
 
         // Build top bar: " Kastrup - [key] ViewName [Sort] [Mode] [pos] ... N unread / T msgs"
-        let prefix = style::fg(" Kastrup - ", tc.prefix_fg);
+        let prefix = match &self.tab_line {
+            Some(tabs) => format!("{} ", tabs),
+            None => style::fg(" Kastrup - ", tc.prefix_fg),
+        };
         // In-flight SMTP badge: shows immediately when a send is
         // spawned and stays up until `pump_pending_send` clears it,
         // giving the user a stable "still working" cue while they
