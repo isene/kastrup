@@ -3442,9 +3442,9 @@ impl App {
         } else {
             format!("{}{}", badges_str, counts_str)
         };
-        // Drafts waiting in `+`: `[3]` at the very end of the line.
+        // Drafts waiting in `+`: `[3]` at the end of the line, one space in.
         let right_info = if self.draft_count > 0 {
-            format!("{}  {}", right_info, style::fg(&format!("[{}]", self.draft_count), tc.accent))
+            format!("{}  {} ", right_info, style::fg(&format!("[{}]", self.draft_count), tc.accent))
         } else {
             right_info
         };
