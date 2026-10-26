@@ -1791,6 +1791,12 @@ struct App {
     /// top line. Recounted at start, after a database write, in the
     /// minute check and after `+`; the top line only reads it.
     draft_count: usize,
+    /// The live relay socket, so the resume watchdog in `after_wait` can
+    /// shut it down after a suspend and force a reconnect.
+    relay_kill: Arc<std::sync::Mutex<Option<std::net::TcpStream>>>,
+    /// Wall clock at the previous loop turn: a gap of 30 s or more means
+    /// the machine was suspended.
+    last_wall: std::time::SystemTime,
     /// When the first hidden (snoozed) mail comes back, cached for the
     /// same reason: one integer compare per idle wake. `None` = none.
     next_wake_at: Option<i64>,
@@ -2538,6 +2544,8 @@ pub fn run() {
         next_send_at: None,
         last_sched_check: 0,
         draft_count: 0,
+        relay_kill: relay_kill.clone(),
+        last_wall: std::time::SystemTime::now(),
         next_wake_at: None,
         compose_source_type: None,
         compose_force_review: false,
@@ -2669,224 +2677,10 @@ pub fn run() {
     app.refresh_next_send_at();
     app.next_wake_at = app.db.next_snooze_wake();
 
-    // Resume watchdog state: wall-clock at the previous loop turn.
-    let mut last_wall = std::time::SystemTime::now();
-
     while app.running {
-        // Pick up any completed background SMTP send. Cheap try_recv
-        // when nothing's queued.
-        app.pump_pending_send();
-
-        // Apply any message bodies the DB read worker finished off-thread,
-        // and re-render the right pane if the open message just got its body.
-        // Cheap try_recv (no-op when nothing's loading).
-        if app.drain_loaded_bodies() {
-            app.render_message_content();
-        }
-
-        // Check feedback expiry
-        if let Some(expires) = app.feedback_expires {
-            if std::time::Instant::now() >= expires {
-                app.feedback_message = None;
-                app.feedback_expires = None;
-                app.render_bottom_bar();
-            }
-        }
-
-        // Idle wake cadence: stay snappy while a feedback toast is on
-        // screen (so it expires on time) OR while a send is in flight
-        // (so the "Sent" toast lands within a second of the wire send
-        // succeeding). Otherwise sleep longer. New-mail toasts and DB
-        // refreshes lag by up to this many seconds, which is fine for
-        // a background-poll inbox.
-        let timeout_secs: u64 = if app.feedback_expires.is_some() || app.sends_outstanding() > 0 || !app.content_loading.is_empty() { 1 } else { 10 };
-        let key = Input::getchr(Some(timeout_secs));
-
-        // Resume watchdog. Battery-free: one vDSO clock read per turn, no new
-        // timer or wakeup. The loop wakes at most every `timeout_secs` (≤10s),
-        // so a wall-clock gap ≥30s means the machine was suspended. On resume,
-        // threads parked across the suspend don't reliably self-heal — the
-        // poller's CLOCK_MONOTONIC condvar timeout under-counts suspend, and
-        // the relay's blocking read sits on a half-open socket TCP keepalive
-        // can't kill. Kick both so mail + chat re-sync immediately.
-        let wall_now = std::time::SystemTime::now();
-        if wall_now.duration_since(last_wall).map(|g| g.as_secs() >= 30).unwrap_or(false) {
-            crate::log::info("resume: suspend gap detected — waking poller + recycling relay");
-            if let Some(p) = app.poller.as_ref() { p.wake(); }
-            if let Ok(slot) = relay_kill.lock() {
-                if let Some(s) = slot.as_ref() { let _ = s.shutdown(std::net::Shutdown::Both); }
-            }
-        }
-        last_wall = wall_now;
-
-        match key {
-            Some(k) => {
-                // A sticky send-result toast clears on the first
-                // keypress after it appeared, so the user always gets
-                // to see it but it doesn't linger once they resume.
-                if app.feedback_clear_on_key {
-                    app.feedback_message = None;
-                    app.feedback_expires = None;
-                    app.feedback_clear_on_key = false;
-                    app.render_bottom_bar();
-                }
-                // Freeze watchdog. Everything the user experiences as a
-                // hang happens between these two clock reads, so a
-                // "kastrup froze" report can name the key that did it
-                // instead of guessing. Same vDSO cost as the resume
-                // watchdog above, and only on an actual keypress.
-                let key_start = std::time::Instant::now();
-                app.handle_key(&k);
-                // A muted channel the user just caught up on re-hides once
-                // they navigate off it (cheap no-op unless a recheck is armed).
-                app.honor_pending_mute_rehide();
-                let key_ms = key_start.elapsed().as_millis();
-                if key_ms >= 250 {
-                    log::warn(&format!("slow key '{}': {} ms", k, key_ms));
-                }
-            }
-            None => {
-                // Same watchdog for the idle tick: a background refresh
-                // that stalls looks exactly like a hang to the user, and
-                // this arm runs at most once per second.
-                let tick_start = std::time::Instant::now();
-                // Check for new messages from poller
-                let mut new_count = 0usize;
-                if let Some(ref rx) = app.poller_rx {
-                    while let Ok(event) = rx.try_recv() {
-                        match event {
-                            poller::PollerEvent::NewMessages(count) => {
-                                new_count += count;
-                            }
-                        }
-                    }
-                }
-                if new_count > 0 {
-                    app.set_feedback(
-                        &format!("{} new message(s)", new_count),
-                        app.config.theme_colors.feedback_ok,
-                    );
-                    app.refresh_current_view();
-                }
-                // Anything scheduled that has come due. Gated on a cached
-                // timestamp, so this is one integer compare when nothing
-                // is waiting — no new timer, no query per wake.
-                app.send_due_scheduled();
-                // Hidden mail whose time has come: the same kind of gate.
-                app.wake_due_snoozed();
-                // Periodic DB refresh (skip when showing inline images: a
-                // rebuild would wipe the picture the user is looking at).
-                // Gated on messages_dirty so an idle kastrup doesn't rerun
-                // get_messages() every 5s for no reason.
-                //
-                // Not gated on pending delete marks any more. Marks are a
-                // set of message ids and rows read them from that set, so
-                // a refresh keeps them. Gating on them held the list still
-                // for as long as anything was marked, and a Workspace reply
-                // that ws-bridge-listen had already written stayed
-                // invisible until Ctrl-R.
-                if !app.showing_image && app.last_db_refresh.elapsed().as_secs() >= 5 {
-                    app.last_db_refresh = std::time::Instant::now();
-                    if app.messages_dirty.swap(false, Ordering::Relaxed) {
-                        app.refresh_current_view();
-                    }
-                }
-                // Refresh the inactive-view highlight cache on the same
-                // cadence — independent of messages_dirty because a
-                // background relay-fired notify-send for an OTHER view
-                // doesn't always trip the dirty flag.
-                if app.last_highlight_refresh.elapsed().as_secs() >= 5 {
-                    app.last_highlight_refresh = std::time::Instant::now();
-                    // Both counts are index scans over a multi-GB table, and
-                    // on an idle session they return what they returned five
-                    // seconds ago. Two stat()s say whether any writer ran;
-                    // when none did, there is nothing to recount.
-                    let sig = app.db.write_signature();
-                    if sig != app.last_db_sig {
-                    app.last_db_sig = sig;
-                    // A reply sent from here comes back from ws-bridge-listen
-                    // stored as read, so no unread count below moves. A new
-                    // newest id says a row landed: one seek on the key.
-                    let top = app.db.max_message_id();
-                    if top != app.last_max_id {
-                        app.last_max_id = top;
-                        app.messages_dirty.store(true, Ordering::Relaxed);
-                    }
-                    let new_unread = app.db.unread_count_by_folder();
-                    let new_src_unread = app.db.unread_count_by_source();
-                    // External writers (the systemd ws-bridge-listen writing
-                    // Workspace rows straight into kastrup.db) don't trip
-                    // messages_dirty, so the gated list refresh above never
-                    // fires for them. This unread requery already runs on the
-                    // existing loop wake — if its result changed, an external
-                    // insert landed, so flag dirty and the next gated refresh
-                    // surfaces it. No new query / timer / wakeup: idle cost is
-                    // one in-memory comparison.
-                    if new_unread != app.unread_cache || new_src_unread != app.source_unread_cache {
-                        app.messages_dirty.store(true, Ordering::Relaxed);
-                        // Unread changed from a source that bypasses the
-                        // DbWriteOp counts_dirty gate (poller new mail,
-                        // external/maildir writers marking read). Those never
-                        // rewrite the asmite count file, so ~/.mail drifts
-                        // until a UI op or restart. Reuse new_unread (already
-                        // computed above) — NOT all_folder_counts, whose
-                        // unfiltered full-table scan of the multi-GB DB froze
-                        // the UI thread in folio_wait on a cold page cache.
-                        if let Some(ref cfg) = app.mailfile_cfg {
-                            mailfile::write_count_file(cfg, &new_unread);
-                        }
-                    }
-                    app.unread_cache = new_unread;
-                    app.source_unread_cache = new_src_unread;
-                    app.source_errors = app.db.failing_sources();
-                    app.refresh_view_unread_cache();
-                    app.refresh_draft_count();
-                    app.render_top_bar();
-                    }
-                }
-                // Periodic stuck-maildir reconcile. A read whose new/→cur/
-                // move slipped through leaves the asmite counting a phantom
-                // unread until restart; re-run the cheap scan every ~2 min on
-                // a short-lived thread so a stray self-clears. Piggybacks on
-                // this existing loop wake — no new timer — and runs off the
-                // UI thread so even a cold scan can't stall input.
-                if app.last_reconcile.elapsed().as_secs() >= 120 {
-                    app.last_reconcile = std::time::Instant::now();
-                    let db = app.db.clone();
-                    let wtx = app.write_tx.clone();
-                    std::thread::spawn(move || reconcile_stuck_maildir(&db, &wtx));
-                }
-                // Read state with the phone. Gated twice over: no folder
-                // configured and this is a null check; folder configured
-                // and it is an atomic load plus a couple of stat()s. The
-                // database is only touched when a mark actually moved.
-                if app.last_read_sync.elapsed().as_secs() >= 5 {
-                    app.last_read_sync = std::time::Instant::now();
-                    let ours = app.db.take_read_dirty();
-                    if let Some(ref mut rs) = app.read_sync {
-                        if ours || rs.others_changed() {
-                            if rs.sync(&app.db) > 0 {
-                                // The phone moved something; our own
-                                // write set the flag again, and it has
-                                // already been published.
-                                app.db.take_read_dirty();
-                                app.messages_dirty.store(true, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-                // Surface phone delivery results for queued gateway replies.
-                // Only touches the filesystem while a reply is outstanding, so
-                // it's cold once the phone has reported (or timed out).
-                if !app.pending_gateway_replies.is_empty() {
-                    app.poll_gateway_reply_status();
-                }
-                let tick_ms = tick_start.elapsed().as_millis();
-                if tick_ms >= 250 {
-                    log::warn(&format!("slow idle tick: {} ms", tick_ms));
-                }
-            }
-        }
+        let wait = app.before_wait();
+        let key = Input::getchr(Some(wait));
+        app.after_wait(key);
     }
 
     // Stop poller immediately (don't wait for drop)
@@ -2907,6 +2701,231 @@ pub fn run() {
     log::info("Cleanup...");
     Crust::cleanup();
     log::info("Exit.");
+}
+
+impl App {
+    /// One turn of the main loop is `before_wait`, a wait of at most the
+    /// seconds it gives for a key, then `after_wait` with the key or None.
+    /// The kastrup program runs that loop in `run`; gluon runs the same.
+    pub fn before_wait(&mut self) -> u64 {
+        // Pick up any completed background SMTP send. Cheap try_recv
+        // when nothing's queued.
+        self.pump_pending_send();
+
+        // Apply any message bodies the DB read worker finished off-thread,
+        // and re-render the right pane if the open message just got its body.
+        // Cheap try_recv (no-op when nothing's loading).
+        if self.drain_loaded_bodies() {
+            self.render_message_content();
+        }
+
+        // Check feedback expiry
+        if let Some(expires) = self.feedback_expires {
+            if std::time::Instant::now() >= expires {
+                self.feedback_message = None;
+                self.feedback_expires = None;
+                self.render_bottom_bar();
+            }
+        }
+
+        // Idle wake cadence: stay snappy while a feedback toast is on
+        // screen (so it expires on time) OR while a send is in flight
+        // (so the "Sent" toast lands within a second of the wire send
+        // succeeding). Otherwise sleep longer. New-mail toasts and DB
+        // refreshes lag by up to this many seconds, which is fine for
+        // a background-poll inbox.
+        let timeout_secs: u64 = if self.feedback_expires.is_some() || self.sends_outstanding() > 0 || !self.content_loading.is_empty() { 1 } else { 10 };
+        timeout_secs
+    }
+
+    pub fn after_wait(&mut self, key: Option<String>) {
+
+        // Resume watchdog. Battery-free: one vDSO clock read per turn, no new
+        // timer or wakeup. The loop wakes at most every `timeout_secs` (≤10s),
+        // so a wall-clock gap ≥30s means the machine was suspended. On resume,
+        // threads parked across the suspend don't reliably self-heal — the
+        // poller's CLOCK_MONOTONIC condvar timeout under-counts suspend, and
+        // the relay's blocking read sits on a half-open socket TCP keepalive
+        // can't kill. Kick both so mail + chat re-sync immediately.
+        let wall_now = std::time::SystemTime::now();
+        if wall_now.duration_since(self.last_wall).map(|g| g.as_secs() >= 30).unwrap_or(false) {
+            crate::log::info("resume: suspend gap detected — waking poller + recycling relay");
+            if let Some(p) = self.poller.as_ref() { p.wake(); }
+            if let Ok(slot) = self.relay_kill.lock() {
+                if let Some(s) = slot.as_ref() { let _ = s.shutdown(std::net::Shutdown::Both); }
+            }
+        }
+        self.last_wall = wall_now;
+
+        match key {
+            Some(k) => {
+                // A sticky send-result toast clears on the first
+                // keypress after it appeared, so the user always gets
+                // to see it but it doesn't linger once they resume.
+                if self.feedback_clear_on_key {
+                    self.feedback_message = None;
+                    self.feedback_expires = None;
+                    self.feedback_clear_on_key = false;
+                    self.render_bottom_bar();
+                }
+                // Freeze watchdog. Everything the user experiences as a
+                // hang happens between these two clock reads, so a
+                // "kastrup froze" report can name the key that did it
+                // instead of guessing. Same vDSO cost as the resume
+                // watchdog above, and only on an actual keypress.
+                let key_start = std::time::Instant::now();
+                self.handle_key(&k);
+                // A muted channel the user just caught up on re-hides once
+                // they navigate off it (cheap no-op unless a recheck is armed).
+                self.honor_pending_mute_rehide();
+                let key_ms = key_start.elapsed().as_millis();
+                if key_ms >= 250 {
+                    log::warn(&format!("slow key '{}': {} ms", k, key_ms));
+                }
+            }
+            None => {
+                // Same watchdog for the idle tick: a background refresh
+                // that stalls looks exactly like a hang to the user, and
+                // this arm runs at most once per second.
+                let tick_start = std::time::Instant::now();
+                // Check for new messages from poller
+                let mut new_count = 0usize;
+                if let Some(ref rx) = self.poller_rx {
+                    while let Ok(event) = rx.try_recv() {
+                        match event {
+                            poller::PollerEvent::NewMessages(count) => {
+                                new_count += count;
+                            }
+                        }
+                    }
+                }
+                if new_count > 0 {
+                    self.set_feedback(
+                        &format!("{} new message(s)", new_count),
+                        self.config.theme_colors.feedback_ok,
+                    );
+                    self.refresh_current_view();
+                }
+                // Anything scheduled that has come due. Gated on a cached
+                // timestamp, so this is one integer compare when nothing
+                // is waiting — no new timer, no query per wake.
+                self.send_due_scheduled();
+                // Hidden mail whose time has come: the same kind of gate.
+                self.wake_due_snoozed();
+                // Periodic DB refresh (skip when showing inline images: a
+                // rebuild would wipe the picture the user is looking at).
+                // Gated on messages_dirty so an idle kastrup doesn't rerun
+                // get_messages() every 5s for no reason.
+                //
+                // Not gated on pending delete marks any more. Marks are a
+                // set of message ids and rows read them from that set, so
+                // a refresh keeps them. Gating on them held the list still
+                // for as long as anything was marked, and a Workspace reply
+                // that ws-bridge-listen had already written stayed
+                // invisible until Ctrl-R.
+                if !self.showing_image && self.last_db_refresh.elapsed().as_secs() >= 5 {
+                    self.last_db_refresh = std::time::Instant::now();
+                    if self.messages_dirty.swap(false, Ordering::Relaxed) {
+                        self.refresh_current_view();
+                    }
+                }
+                // Refresh the inactive-view highlight cache on the same
+                // cadence — independent of messages_dirty because a
+                // background relay-fired notify-send for an OTHER view
+                // doesn't always trip the dirty flag.
+                if self.last_highlight_refresh.elapsed().as_secs() >= 5 {
+                    self.last_highlight_refresh = std::time::Instant::now();
+                    // Both counts are index scans over a multi-GB table, and
+                    // on an idle session they return what they returned five
+                    // seconds ago. Two stat()s say whether any writer ran;
+                    // when none did, there is nothing to recount.
+                    let sig = self.db.write_signature();
+                    if sig != self.last_db_sig {
+                    self.last_db_sig = sig;
+                    // A reply sent from here comes back from ws-bridge-listen
+                    // stored as read, so no unread count below moves. A new
+                    // newest id says a row landed: one seek on the key.
+                    let top = self.db.max_message_id();
+                    if top != self.last_max_id {
+                        self.last_max_id = top;
+                        self.messages_dirty.store(true, Ordering::Relaxed);
+                    }
+                    let new_unread = self.db.unread_count_by_folder();
+                    let new_src_unread = self.db.unread_count_by_source();
+                    // External writers (the systemd ws-bridge-listen writing
+                    // Workspace rows straight into kastrup.db) don't trip
+                    // messages_dirty, so the gated list refresh above never
+                    // fires for them. This unread requery already runs on the
+                    // existing loop wake — if its result changed, an external
+                    // insert landed, so flag dirty and the next gated refresh
+                    // surfaces it. No new query / timer / wakeup: idle cost is
+                    // one in-memory comparison.
+                    if new_unread != self.unread_cache || new_src_unread != self.source_unread_cache {
+                        self.messages_dirty.store(true, Ordering::Relaxed);
+                        // Unread changed from a source that bypasses the
+                        // DbWriteOp counts_dirty gate (poller new mail,
+                        // external/maildir writers marking read). Those never
+                        // rewrite the asmite count file, so ~/.mail drifts
+                        // until a UI op or restart. Reuse new_unread (already
+                        // computed above) — NOT all_folder_counts, whose
+                        // unfiltered full-table scan of the multi-GB DB froze
+                        // the UI thread in folio_wait on a cold page cache.
+                        if let Some(ref cfg) = self.mailfile_cfg {
+                            mailfile::write_count_file(cfg, &new_unread);
+                        }
+                    }
+                    self.unread_cache = new_unread;
+                    self.source_unread_cache = new_src_unread;
+                    self.source_errors = self.db.failing_sources();
+                    self.refresh_view_unread_cache();
+                    self.refresh_draft_count();
+                    self.render_top_bar();
+                    }
+                }
+                // Periodic stuck-maildir reconcile. A read whose new/→cur/
+                // move slipped through leaves the asmite counting a phantom
+                // unread until restart; re-run the cheap scan every ~2 min on
+                // a short-lived thread so a stray self-clears. Piggybacks on
+                // this existing loop wake — no new timer — and runs off the
+                // UI thread so even a cold scan can't stall input.
+                if self.last_reconcile.elapsed().as_secs() >= 120 {
+                    self.last_reconcile = std::time::Instant::now();
+                    let db = self.db.clone();
+                    let wtx = self.write_tx.clone();
+                    std::thread::spawn(move || reconcile_stuck_maildir(&db, &wtx));
+                }
+                // Read state with the phone. Gated twice over: no folder
+                // configured and this is a null check; folder configured
+                // and it is an atomic load plus a couple of stat()s. The
+                // database is only touched when a mark actually moved.
+                if self.last_read_sync.elapsed().as_secs() >= 5 {
+                    self.last_read_sync = std::time::Instant::now();
+                    let ours = self.db.take_read_dirty();
+                    if let Some(ref mut rs) = self.read_sync {
+                        if ours || rs.others_changed() {
+                            if rs.sync(&self.db) > 0 {
+                                // The phone moved something; our own
+                                // write set the flag again, and it has
+                                // already been published.
+                                self.db.take_read_dirty();
+                                self.messages_dirty.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                // Surface phone delivery results for queued gateway replies.
+                // Only touches the filesystem while a reply is outstanding, so
+                // it's cold once the phone has reported (or timed out).
+                if !self.pending_gateway_replies.is_empty() {
+                    self.poll_gateway_reply_status();
+                }
+                let tick_ms = tick_start.elapsed().as_millis();
+                if tick_ms >= 250 {
+                    log::warn(&format!("slow idle tick: {} ms", tick_ms));
+                }
+            }
+        }
+    }
 }
 
 fn create_panes(cols: u16, rows: u16, width: u16, border: u8, config: &Config) -> (Pane, Pane, Pane, Pane) {
