@@ -2752,6 +2752,20 @@ impl App {
 
     pub fn running(&self) -> bool { self.running }
 
+    /// Ends kastrup, unless a send is still in flight: then it says so
+    /// and keeps running.
+    pub fn quit(&mut self) {
+        if self.sends_outstanding() > 0 {
+            let force = if self.tab_line.is_some() { ":Q" } else { "Q" };
+            self.set_feedback(
+                &format!("A send is still in flight — wait for it to finish, or press {force} to force-quit"),
+                self.config.theme_colors.feedback_warn,
+            );
+        } else {
+            self.running = false;
+        }
+    }
+
     /// Under gluon, for its Claude tab: the message under the cursor, by
     /// its kastrup:ID so the kastrup skill can read the rest. None on a
     /// section header.
@@ -3336,16 +3350,8 @@ impl App {
             // `Q` (shift-q) force-quits anyway. This is a guard, not a
             // confirmation prompt — the user gets a clear toast naming
             // what's still running.
-            "q" => {
-                if self.sends_outstanding() > 0 {
-                    self.set_feedback(
-                        "A send is still in flight — wait for it to finish, or press Q to force-quit",
-                        self.config.theme_colors.feedback_warn,
-                    );
-                } else {
-                    self.running = false;
-                }
-            }
+            // Under gluon, gluon takes Q and calls quit(); q does nothing.
+            "q" if self.tab_line.is_none() => self.quit(),
             "Q" => { self.running = false; }
 
             _ => {}
@@ -4581,8 +4587,10 @@ impl App {
         let left = if let Some((ref msg, color)) = self.feedback_message {
             format!(" {}", style::fg(msg, color))
         } else {
+            // Under gluon, Q ends the whole app and q does nothing.
+            let quit = if self.tab_line.is_some() { "Q" } else { "q" };
             style::fg(
-                " q:Quit | ?:Help | =:All | N:New | 0-9:Views | a/A:Read | Space:Fold | t/T:Tag | s:Save | B:Browse | F:Fav",
+                &format!(" {quit}:Quit | ?:Help | =:All | N:New | 0-9:Views | a/A:Read | Space:Fold | t/T:Tag | s:Save | B:Browse | F:Fav"),
                 tc.hint_fg
             )
         };
