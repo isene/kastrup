@@ -2740,6 +2740,25 @@ impl App {
 
     pub fn running(&self) -> bool { self.running }
 
+    /// Under gluon, for its Claude tab: the message under the cursor, by
+    /// its kastrup:ID so the kastrup skill can read the rest. None on a
+    /// section header.
+    pub fn claude_context(&self) -> Option<String> {
+        let m = self.current_filtered_index().and_then(|i| self.filtered_messages.get(i))?;
+        if m.is_header {
+            return None;
+        }
+        let mut ctx = format!(
+            "In kastrup I have message kastrup:{} selected.\nFrom: {}\nSubject: {}\n",
+            m.id, m.display_name(), m.subject.as_deref().unwrap_or("")
+        );
+        if let Some(tid) = m.thread_id.as_deref().filter(|t| !t.is_empty()) {
+            ctx.push_str(&format!("Thread id: {}\n", tid));
+        }
+        ctx.push_str("The kastrup skill reads the message, its thread and its sender's history from the database.");
+        Some(ctx)
+    }
+
     /// One turn of the main loop is `before_wait`, a wait of at most the
     /// seconds it gives for a key, then `after_wait` with the key or None.
     /// The kastrup program runs that loop in `run`; gluon runs the same.
