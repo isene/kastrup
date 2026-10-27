@@ -3997,185 +3997,12 @@ impl App {
         redraw
     }
 
-    fn render_message_content(&mut self) {
-        // The pane is going back to a message — any AI answer is gone.
-        self.ai_pane = None;
-        // Auto-mark as read when displayed in right pane
-        let msg_ref = if self.show_threaded {
-            self.display_messages.get(self.index)
-        } else {
-            self.filtered_messages.get(self.index)
-        };
-        if let Some(msg) = msg_ref {
-            // Clear unseen protection if user navigated away and came back.
-            // Skipped during a background refresh: when a new message lands
-            // under a stationary cursor, right_pane_msg_id still points at the
-            // PREVIOUS message, so this heuristic would mistake "arrived here"
-            // for "navigated here" and wrongly mark the new message read.
-            if !self.suppress_automark_read
-                && self.unseen_ids.contains(&msg.id) && self.right_pane_msg_id != Some(msg.id) {
-                self.unseen_ids.remove(&msg.id);
-            }
-            if !self.suppress_automark_read
-                && !msg.read && !msg.is_header && msg.id > 0 && !self.unseen_ids.contains(&msg.id) {
-                let id = msg.id;
-                let metadata = msg.metadata.clone();
-                let folder = msg.folder.clone();
-                // Fire-and-forget: DB write + maildir flag sync on background thread
-                let _ = self.write_tx.send(DbWriteOp::MarkRead(id));
-                let _ = self.write_tx.send(DbWriteOp::SyncMaildirFlag(metadata, id));
-                self.browsed_ids.insert(id);
-                // Update in-memory state
-                if let Some(m) = self.filtered_messages.iter_mut().find(|m| m.id == id) {
-                    m.read = true;
-                }
-                if self.show_threaded {
-                    if let Some(m) = self.display_messages.get_mut(self.index) {
-                        m.read = true;
-                    }
-                }
-                // If this read happened inside a muted channel that had
-                // resurfaced, arm a deferred re-hide. We don't rebuild here:
-                // the rest of this function still draws the right pane from
-                // self.index, and hiding the channel now would yank the row
-                // out from under the message being read. The main loop honours
-                // the flag once the cursor leaves the channel.
-                if self.group_by_folder {
-                    if let Some(f) = folder.as_deref() {
-                        if self.current_hidden_channels.iter().any(|h| h.name == f) {
-                            self.mute_recheck_pending = Some(f.to_string());
-                        }
-                    }
-                }
-                // Update left pane and top bar to reflect read status
-                self.render_message_list();
-                self.render_top_bar();
-            }
-        }
-
-        let messages = if self.show_threaded {
-            &self.display_messages
-        } else {
-            &self.filtered_messages
-        };
-        if messages.is_empty() {
-            self.right.set_text("");
-            self.right.ix = 0;
-            self.right.full_refresh();
-            return;
-        }
-
-        // In threaded mode, if current item is a header, show section info
-        if self.show_threaded {
-            if let Some(m) = messages.get(self.index) {
-                if m.is_header {
-                    let tc = &self.config.theme_colors;
-                    let subj = m.subject.as_deref().unwrap_or("Section");
-                    let given = m.thread_id.as_ref().and_then(|n| self.section_names.get(n));
-                    let mut lines = Vec::new();
-                    lines.push(style::bold(&style::fg(given.map(String::as_str).unwrap_or(subj), tc.thread)));
-                    // The full name stays readable under the short one.
-                    if given.is_some() { lines.push(style::fg(subj, tc.hint_fg)); }
-                    lines.push(String::new());
-                    lines.push(format!("{} {}", style::fg("Messages:", tc.header_date), m.content));
-                    let (_, m_scolor) = source_info(&m.source_type, tc);
-                    lines.push(format!("{} {}", style::fg("Type:", tc.header_date),
-                        style::fg(&m.source_type, m_scolor)));
-                    let is_collapsed = m.thread_id.as_ref()
-                        .and_then(|name| self.section_collapsed.get(name))
-                        .copied()
-                        .unwrap_or(self.group_by_folder);
-                    lines.push(format!("{} {}", style::fg("State:", tc.header_date),
-                        if is_collapsed { "Collapsed" } else { "Expanded" }));
-                    lines.push(String::new());
-                    lines.push(style::fg("ENTER/Space: Toggle collapse", tc.hint_fg));
-                    lines.push(style::fg("h: Collapse", tc.hint_fg));
-                    lines.push(style::fg("c: Give it a name of its own", tc.hint_fg));
-                    self.right.set_text(&lines.join("\n"));
-                    self.right.ix = 0;
-                    self.right.full_refresh();
-                    if self.right.border { self.right.border_refresh(); }
-                    return;
-                }
-            }
-        }
-
-        // Lazy-load the full body OFF the render thread (see DB read worker).
-        // Request by id and return immediately. A warm read is caught right
-        // away by the short recv_timeout so the common case stays instant; a
-        // cold/contended read falls through to async — the main loop drains it
-        // on a later tick and re-renders, and the body shows "loading…" until
-        // then. This keeps a cold kastrup.db page from freezing the UI.
-        let need = (if self.show_threaded {
-            self.display_messages.get(self.index)
-        } else {
-            self.filtered_messages.get(self.index)
-        }).filter(|m| !m.full_loaded && m.id != 0).map(|m| m.id);
-        if let Some(id) = need {
-            if self.content_loading.insert(id) {
-                let _ = self.read_req_tx.send(id);
-            }
-            if let Ok(res) =
-                self.read_res_rx.recv_timeout(std::time::Duration::from_millis(40))
-            {
-                self.apply_loaded_body(res);
-            }
-        }
-
-        // Clamp self.index in case a view refresh shrank the list while the
-        // cursor was parked past the new end. Previously panicked at the
-        // messages[self.index] below with "len is N but index is M".
-        let list_len = if self.show_threaded {
-            self.display_messages.len()
-        } else {
-            self.filtered_messages.len()
-        };
-        if list_len == 0 {
-            self.right.set_text("");
-            self.right.ix = 0;
-            self.right.full_refresh();
-            return;
-        }
-        if self.index >= list_len {
-            self.index = list_len - 1;
-        }
-        let messages = if self.show_threaded {
-            &self.display_messages
-        } else {
-            &self.filtered_messages
-        };
-        let msg = &messages[self.index];
+    /// The lines the right pane shows for `msg`, headers and body, for a
+    /// pane `width` columns wide; and the attachments found in the body
+    /// when the message had none listed.
+    fn message_lines(&self, msg: &Message, width: usize) -> (Vec<String>, Option<Vec<serde_json::Value>>) {
         let tc = &self.config.theme_colors;
         let (_, scolor) = source_info(&msg.source_type, tc);
-
-        // Body-render cache: re-rendering the same message (cursor bounce,
-        // resize, return-from-editor) reuses the pre-styled lines instead
-        // of running the full MIME → html_to_text → collapse → linkify
-        // pipeline again. Fingerprint = content + html_content lengths;
-        // changes if either body grew/shrank (which is what happens on
-        // full-content lazy-load).
-        let content_fp = (msg.content.len() as u64)
-            ^ ((msg.html_content.as_ref().map_or(0, |h| h.len()) as u64) << 32);
-        let cache_key = (msg.id, content_fp);
-        let current_id = Some(msg.id);
-        let msg_changed = current_id != self.right_pane_msg_id;
-        if !msg_changed && msg.id != 0 {
-            if let Some((cid, cfp, ref text)) = self.body_cache {
-                if (cid, cfp) == cache_key {
-                    // Cache hit — reuse rendered text; skip the heavy pipeline.
-                    if self.find_needle.is_empty() {
-                        self.right.set_text(text);
-                    } else {
-                        let base = text.clone();
-                        self.set_right_found(&base);
-                    }
-                    self.right.full_refresh();
-                    if self.right.border { self.right.border_refresh(); }
-                    return;
-                }
-            }
-        }
-
         let mut lines = Vec::new();
 
         // Headers — use header_row helper: KEY bold, VALUE non-bold, both
@@ -4445,7 +4272,7 @@ impl App {
         // Detect and render Markdown tables in-place with Unicode box
         // borders. Non-table text passes through untouched, so the
         // subsequent quote/signature coloring still works.
-        let pane_w = (self.right.w as usize).saturating_sub(4).max(20);
+        let pane_w = width.saturating_sub(4).max(20);
         let content = crust::text::format_markdown_tables(&content, pane_w);
         // Collapse plain-text bracketed-link syntax `[anchor <URL>]` (with
         // the URL possibly wrapped to the next line) into OSC 8 links
@@ -4493,6 +4320,204 @@ impl App {
                 None    => lines.push(linked),
             }
         }
+
+        (lines, mime_atts_to_inject)
+    }
+
+    /// Under gluon, for its Home tab: message `id` as the right pane shows
+    /// it, for a pane `width` columns wide. It stays unread.
+    pub fn message_text(&self, id: i64, width: usize) -> String {
+        let filters = Filters { message_id: Some(id), ..Default::default() };
+        let Some(mut msg) = self.db.get_messages(&filters, 1, 0).into_iter().next() else { return String::new() };
+        resolve_source_type(&self.source_type_map, &mut msg);
+        if !msg.full_loaded {
+            if let Some((content, html)) = self.db.get_message_content(id) {
+                msg.content = content;
+                msg.html_content = html;
+                msg.full_loaded = true;
+            }
+        }
+        self.message_lines(&msg, width).0.join("\n")
+    }
+
+    fn render_message_content(&mut self) {
+        // The pane is going back to a message — any AI answer is gone.
+        self.ai_pane = None;
+        // Auto-mark as read when displayed in right pane
+        let msg_ref = if self.show_threaded {
+            self.display_messages.get(self.index)
+        } else {
+            self.filtered_messages.get(self.index)
+        };
+        if let Some(msg) = msg_ref {
+            // Clear unseen protection if user navigated away and came back.
+            // Skipped during a background refresh: when a new message lands
+            // under a stationary cursor, right_pane_msg_id still points at the
+            // PREVIOUS message, so this heuristic would mistake "arrived here"
+            // for "navigated here" and wrongly mark the new message read.
+            if !self.suppress_automark_read
+                && self.unseen_ids.contains(&msg.id) && self.right_pane_msg_id != Some(msg.id) {
+                self.unseen_ids.remove(&msg.id);
+            }
+            if !self.suppress_automark_read
+                && !msg.read && !msg.is_header && msg.id > 0 && !self.unseen_ids.contains(&msg.id) {
+                let id = msg.id;
+                let metadata = msg.metadata.clone();
+                let folder = msg.folder.clone();
+                // Fire-and-forget: DB write + maildir flag sync on background thread
+                let _ = self.write_tx.send(DbWriteOp::MarkRead(id));
+                let _ = self.write_tx.send(DbWriteOp::SyncMaildirFlag(metadata, id));
+                self.browsed_ids.insert(id);
+                // Update in-memory state
+                if let Some(m) = self.filtered_messages.iter_mut().find(|m| m.id == id) {
+                    m.read = true;
+                }
+                if self.show_threaded {
+                    if let Some(m) = self.display_messages.get_mut(self.index) {
+                        m.read = true;
+                    }
+                }
+                // If this read happened inside a muted channel that had
+                // resurfaced, arm a deferred re-hide. We don't rebuild here:
+                // the rest of this function still draws the right pane from
+                // self.index, and hiding the channel now would yank the row
+                // out from under the message being read. The main loop honours
+                // the flag once the cursor leaves the channel.
+                if self.group_by_folder {
+                    if let Some(f) = folder.as_deref() {
+                        if self.current_hidden_channels.iter().any(|h| h.name == f) {
+                            self.mute_recheck_pending = Some(f.to_string());
+                        }
+                    }
+                }
+                // Update left pane and top bar to reflect read status
+                self.render_message_list();
+                self.render_top_bar();
+            }
+        }
+
+        let messages = if self.show_threaded {
+            &self.display_messages
+        } else {
+            &self.filtered_messages
+        };
+        if messages.is_empty() {
+            self.right.set_text("");
+            self.right.ix = 0;
+            self.right.full_refresh();
+            return;
+        }
+
+        // In threaded mode, if current item is a header, show section info
+        if self.show_threaded {
+            if let Some(m) = messages.get(self.index) {
+                if m.is_header {
+                    let tc = &self.config.theme_colors;
+                    let subj = m.subject.as_deref().unwrap_or("Section");
+                    let given = m.thread_id.as_ref().and_then(|n| self.section_names.get(n));
+                    let mut lines = Vec::new();
+                    lines.push(style::bold(&style::fg(given.map(String::as_str).unwrap_or(subj), tc.thread)));
+                    // The full name stays readable under the short one.
+                    if given.is_some() { lines.push(style::fg(subj, tc.hint_fg)); }
+                    lines.push(String::new());
+                    lines.push(format!("{} {}", style::fg("Messages:", tc.header_date), m.content));
+                    let (_, m_scolor) = source_info(&m.source_type, tc);
+                    lines.push(format!("{} {}", style::fg("Type:", tc.header_date),
+                        style::fg(&m.source_type, m_scolor)));
+                    let is_collapsed = m.thread_id.as_ref()
+                        .and_then(|name| self.section_collapsed.get(name))
+                        .copied()
+                        .unwrap_or(self.group_by_folder);
+                    lines.push(format!("{} {}", style::fg("State:", tc.header_date),
+                        if is_collapsed { "Collapsed" } else { "Expanded" }));
+                    lines.push(String::new());
+                    lines.push(style::fg("ENTER/Space: Toggle collapse", tc.hint_fg));
+                    lines.push(style::fg("h: Collapse", tc.hint_fg));
+                    lines.push(style::fg("c: Give it a name of its own", tc.hint_fg));
+                    self.right.set_text(&lines.join("\n"));
+                    self.right.ix = 0;
+                    self.right.full_refresh();
+                    if self.right.border { self.right.border_refresh(); }
+                    return;
+                }
+            }
+        }
+
+        // Lazy-load the full body OFF the render thread (see DB read worker).
+        // Request by id and return immediately. A warm read is caught right
+        // away by the short recv_timeout so the common case stays instant; a
+        // cold/contended read falls through to async — the main loop drains it
+        // on a later tick and re-renders, and the body shows "loading…" until
+        // then. This keeps a cold kastrup.db page from freezing the UI.
+        let need = (if self.show_threaded {
+            self.display_messages.get(self.index)
+        } else {
+            self.filtered_messages.get(self.index)
+        }).filter(|m| !m.full_loaded && m.id != 0).map(|m| m.id);
+        if let Some(id) = need {
+            if self.content_loading.insert(id) {
+                let _ = self.read_req_tx.send(id);
+            }
+            if let Ok(res) =
+                self.read_res_rx.recv_timeout(std::time::Duration::from_millis(40))
+            {
+                self.apply_loaded_body(res);
+            }
+        }
+
+        // Clamp self.index in case a view refresh shrank the list while the
+        // cursor was parked past the new end. Previously panicked at the
+        // messages[self.index] below with "len is N but index is M".
+        let list_len = if self.show_threaded {
+            self.display_messages.len()
+        } else {
+            self.filtered_messages.len()
+        };
+        if list_len == 0 {
+            self.right.set_text("");
+            self.right.ix = 0;
+            self.right.full_refresh();
+            return;
+        }
+        if self.index >= list_len {
+            self.index = list_len - 1;
+        }
+        let messages = if self.show_threaded {
+            &self.display_messages
+        } else {
+            &self.filtered_messages
+        };
+        let msg = &messages[self.index];
+
+        // Body-render cache: re-rendering the same message (cursor bounce,
+        // resize, return-from-editor) reuses the pre-styled lines instead
+        // of running the full MIME → html_to_text → collapse → linkify
+        // pipeline again. Fingerprint = content + html_content lengths;
+        // changes if either body grew/shrank (which is what happens on
+        // full-content lazy-load).
+        let content_fp = (msg.content.len() as u64)
+            ^ ((msg.html_content.as_ref().map_or(0, |h| h.len()) as u64) << 32);
+        let cache_key = (msg.id, content_fp);
+        let current_id = Some(msg.id);
+        let msg_changed = current_id != self.right_pane_msg_id;
+        if !msg_changed && msg.id != 0 {
+            if let Some((cid, cfp, ref text)) = self.body_cache {
+                if (cid, cfp) == cache_key {
+                    // Cache hit — reuse rendered text; skip the heavy pipeline.
+                    if self.find_needle.is_empty() {
+                        self.right.set_text(text);
+                    } else {
+                        let base = text.clone();
+                        self.set_right_found(&base);
+                    }
+                    self.right.full_refresh();
+                    if self.right.border { self.right.border_refresh(); }
+                    return;
+                }
+            }
+        }
+
+        let (mut lines, mime_atts_to_inject) = self.message_lines(msg, self.right.w as usize);
 
         // Reset scroll only when viewing a different message; reuse the
         // earlier-computed `current_id`/`msg_changed` so we don't recompute
