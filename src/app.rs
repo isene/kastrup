@@ -1629,6 +1629,10 @@ pub struct Unread {
     /// The key of the view it is in, and that view's colour (its top_bg).
     pub view: String,
     pub colour: u8,
+    /// The icon and colour of its kind (mail, chat, RSS...), as kastrup's
+    /// list shows them.
+    pub icon: String,
+    pub kind: u8,
     pub time: i64,
     pub from: String,
     pub subject: String,
@@ -2686,7 +2690,7 @@ pub fn start() -> Option<App> {
 
     // A message id on the command line: show that one and open it.
     if let Some(id) = goto_message {
-        app.goto_message(id);
+        app.goto_message(id, false);
     }
 
     // Handle --compose-to from CLI (e.g. from Tock)
@@ -2752,6 +2756,19 @@ impl App {
 
     pub fn running(&self) -> bool { self.running }
 
+    /// Under gluon: back to the view from the one message goto_message
+    /// showed.
+    pub fn leave_message(&mut self) {
+        if self.active_search_filter.take().is_some() {
+            self.active_search_label.clear();
+            let key = self.current_view.clone();
+            // Unseen, so it marks nothing read.
+            self.suppress_automark_read = true;
+            self.switch_to_view(&key);
+            self.suppress_automark_read = false;
+        }
+    }
+
     /// For gluon's Home: marks `read` read and deletes `delete`, as R, d
     /// and < would here.
     pub fn read_and_delete(&mut self, read: Vec<i64>, delete: Vec<i64>) {
@@ -2813,10 +2830,12 @@ impl App {
             filters.is_read = Some(false);
             let colour = json["top_bg"].as_str().and_then(|c| c.parse().ok())
                 .or(view.color.map(|c| c as u8)).unwrap_or(245);
-            for m in self.db.get_messages(&filters, n, 0) {
+            for mut m in self.db.get_messages(&filters, n, 0) {
+                resolve_source_type(&self.source_type_map, &mut m);
+                let (icon, kind) = source_info(&m.source_type, &self.config.theme_colors);
                 let from = m.sender_name.clone().filter(|s| !s.trim().is_empty()).unwrap_or(m.sender.clone());
                 out.push(Unread {
-                    id: m.id, view: key.to_string(), colour, time: m.timestamp,
+                    id: m.id, view: key.to_string(), colour, icon, kind, time: m.timestamp,
                     from, subject: m.subject.clone().unwrap_or_default(),
                 });
             }
@@ -8092,7 +8111,7 @@ impl App {
         self.render_bottom_bar();
         if input.trim().is_empty() { return; }
         match parse_message_id(&input) {
-            Some(id) => self.goto_message(id),
+            Some(id) => self.goto_message(id, false),
             None => self.set_feedback(
                 &format!("Not a message id: {}", input.trim()),
                 self.config.theme_colors.feedback_warn),
@@ -8105,8 +8124,9 @@ impl App {
     /// A sticky filter rather than a list built by hand: the five-second
     /// reconciliation re-runs the current view's rules and would blank
     /// anything else, exactly as it once blanked search results.
-    /// gluon calls it for a message picked on its Home tab.
-    pub fn goto_message(&mut self, id: i64) {
+    /// gluon calls it for a message picked on its Home tab; `keep_unread`
+    /// shows it without marking it read.
+    pub fn goto_message(&mut self, id: i64, keep_unread: bool) {
         let filters = Filters { message_id: Some(id), ..Default::default() };
         self.filtered_messages = self.db.get_messages(&filters, 1, 0);
         for msg in &mut self.filtered_messages {
@@ -8124,7 +8144,22 @@ impl App {
         self.active_search_filter = Some(filters);
         self.set_feedback(&format!("kastrup:{}  (Esc clears)", id),
             self.config.theme_colors.feedback_ok);
-        self.open_message();
+        if !keep_unread {
+            self.open_message();
+            return;
+        }
+        // gluon's Home keeps its own read marks: show it, leave it unread.
+        self.unseen_ids.insert(id);
+        if let Some(m) = self.filtered_messages.first_mut() {
+            if let Some((content, html)) = self.db.get_message_content(id) {
+                m.content = content;
+                m.html_content = html;
+                m.full_loaded = true;
+            }
+        }
+        self.suppress_automark_read = true;
+        self.render_all();
+        self.suppress_automark_read = false;
     }
 
     /// `h`: hide the message under the cursor, or the tagged ones, until a
@@ -14600,7 +14635,7 @@ impl App {
         // `#` key would accept (`kastrup:<id>` or a bare id) opens it.
         if picked.len() == 1 {
             if let Some(id) = parse_message_id(&picked[0]) {
-                self.goto_message(id);
+                self.goto_message(id, false);
                 return;
             }
         }
