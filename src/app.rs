@@ -2752,6 +2752,22 @@ impl App {
 
     pub fn running(&self) -> bool { self.running }
 
+    /// For gluon's Home: marks `read` read and deletes `delete`, as R, d
+    /// and < would here.
+    pub fn read_and_delete(&mut self, read: Vec<i64>, delete: Vec<i64>) {
+        if !read.is_empty() {
+            for m in self.filtered_messages.iter_mut().chain(self.display_messages.iter_mut()) {
+                if read.contains(&m.id) { m.read = true; }
+            }
+            let _ = self.write_tx.send(DbWriteOp::MarkReadByIds(read));
+            self.sync_mail_count();
+        }
+        if !delete.is_empty() {
+            self.delete_marked.extend(delete);
+            self.purge_deleted();
+        }
+    }
+
     /// Ends kastrup, unless a send is still in flight: then it says so
     /// and keeps running.
     pub fn quit(&mut self) {
