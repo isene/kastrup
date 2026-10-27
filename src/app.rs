@@ -765,10 +765,10 @@ fn buffer_admitted_by_filter(
         (None, None) => true,
     };
     if !source_ok { return false; }
-    // A platform rule admits only buffers of that platform. A sender rule
-    // admits none: an empty buffer has no sender to match.
+    // A platform rule admits only buffers of that platform. A sender
+    // or subject rule admits none: an empty buffer has neither to match.
     if f.platform.as_deref().is_some_and(|p| p != sources::weechat_relay::classify_buffer(buf).0) { return false; }
-    if f.sender_pattern.is_some() { return false; }
+    if f.sender_pattern.is_some() || f.subject_pattern.is_some() { return false; }
     if let Some(ref fold) = f.folder { return buf == fold; }
     if let Some(ref pat) = f.folder_pattern {
         return pat.split('|').map(|s| s.trim()).filter(|s| !s.is_empty()).any(|s| buf.contains(s));
@@ -824,6 +824,7 @@ fn apply_view_rules(rules: &[serde_json::Value], filters: &mut Filters) {
             }
             "source_id" => { filters.source_id = value.as_i64(); }
             "sender" => { filters.sender_pattern = value.as_str().map(|s| s.to_string()); }
+            "subject" => { filters.subject_pattern = value.as_str().map(|s| s.to_string()); }
             "source_type" => { filters.source_type = value.as_str().map(|s| s.to_string()); }
             "platform" => { filters.platform = value.as_str().map(|s| s.to_string()); }
             _ => {}
@@ -2795,6 +2796,28 @@ impl App {
         out
     }
 
+    /// A box at the top right (herald, through notify-send) for each
+    /// unread message newer than `after` in a view whose filters say
+    /// `"notify": true`. Views without the flag cost nothing.
+    fn notify_new(&self, after: i64) {
+        for view in &self.views {
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&view.filters) else { continue };
+            if json["notify"].as_bool() != Some(true) {
+                continue;
+            }
+            let mut filters = parse_view_filters_json(&json);
+            filters.is_read = Some(false);
+            for m in self.db.get_messages(&filters, 5, 0).into_iter().filter(|m| m.id > after) {
+                let from = m.sender_name.clone().filter(|s| !s.trim().is_empty()).unwrap_or(m.sender.clone());
+                let title = format!("{}: {from}", view.name);
+                let body: String = m.subject.clone().unwrap_or_default().chars().take(120).collect();
+                std::thread::spawn(move || {
+                    let _ = std::process::Command::new("notify-send").args(["-a", "kastrup", &title, &body]).status();
+                });
+            }
+        }
+    }
+
     /// Two stat()s that change whenever anything writes to the database,
     /// so gluon asks `unread_in_views` again only after a write.
     pub fn db_signature(&self) -> (u64, u128, u128) {
@@ -2939,11 +2962,24 @@ impl App {
                     let sig = self.db.write_signature();
                     if sig != self.last_db_sig {
                     self.last_db_sig = sig;
+                    // A view made or changed from outside (Claude in gluon,
+                    // sqlite3) shows at once; the table is a few rows.
+                    let views = self.db.get_views();
+                    let filters = |vs: &[crate::database::View]| vs.iter()
+                        .find(|v| v.key_binding.as_deref() == Some(self.current_view.as_str()))
+                        .map(|v| v.filters.clone());
+                    if filters(&views) != filters(&self.views) {
+                        self.messages_dirty.store(true, Ordering::Relaxed);
+                    }
+                    self.views = views;
                     // A reply sent from here comes back from ws-bridge-listen
                     // stored as read, so no unread count below moves. A new
                     // newest id says a row landed: one seek on the key.
                     let top = self.db.max_message_id();
                     if top != self.last_max_id {
+                        if self.last_max_id > 0 {
+                            self.notify_new(self.last_max_id);
+                        }
                         self.last_max_id = top;
                         self.messages_dirty.store(true, Ordering::Relaxed);
                     }

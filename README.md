@@ -304,7 +304,12 @@ To express OR across heterogeneous criteria — e.g. one view for "everything re
 
 There's nothing source-specific about which view-key gets a "chat" badge or layout — any view (numbered or F-key) can mix mail folders, chat channels, and sender / content patterns however the user wants.
 
-Supported rule fields: `read`, `starred`, `folder`, `source_id`, `source_type`, `sender`. Supported `op` values: `=` (exact) and `like` (SQL `LIKE %value%`, pipe-separated value gives OR-of-LIKE within the field).
+Supported rule fields: `read`, `starred`, `folder`, `source_id`, `source_type`, `platform`, `sender`, `subject`. Supported `op` values: `=` (exact) and `like` (SQL `LIKE %value%`, pipe-separated value gives OR-of-LIKE within the field).
+
+`sender` and `subject` always match anywhere and in any case, and `a|b`
+matches either word. `"notify": true` beside `rules` shows a desktop box
+(notify-send) for each new unread message in the view. A view written by
+another program, such as sqlite3 or Claude, shows within five seconds.
 
 ## AI triage (`z` key)
 

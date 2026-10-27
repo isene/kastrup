@@ -34,6 +34,9 @@ pub struct Filters {
     /// `field=folder, op=like`.
     pub folder_pattern: Option<String>,
     pub sender_pattern: Option<String>,
+    /// `subject LIKE %word%`, pipe-separated for OR, as `sender_pattern`.
+    /// Set when a view rule has `field=subject`.
+    pub subject_pattern: Option<String>,
     pub source_type: Option<String>,
     pub content_pattern: Option<String>,
     /// Match gateway/phone messages by their `metadata.platform` value
@@ -189,6 +192,14 @@ fn build_branch_where(filters: &Filters) -> (String, Vec<Box<dyn rusqlite::types
             let like = format!("%{}%", p.trim());
             params.push(Box::new(like.clone()));
             params.push(Box::new(like));
+        }
+    }
+    if let Some(ref pattern) = filters.subject_pattern {
+        let parts_p: Vec<&str> = pattern.split('|').collect();
+        let conditions: Vec<String> = parts_p.iter().map(|_| "subject LIKE ?".to_string()).collect();
+        parts.push(format!("({})", conditions.join(" OR ")));
+        for p in &parts_p {
+            params.push(Box::new(format!("%{}%", p.trim())));
         }
     }
     if let Some(ref stype) = filters.source_type {
@@ -2085,6 +2096,31 @@ pub(crate) mod tests {
         // The same address again changes nothing, whatever it is called.
         assert_eq!(db.add_feed("https://example.org/feed.xml", "Other name"), Ok(false));
         assert_eq!(feeds(&db), got);
+    }
+
+    #[test]
+    fn a_subject_rule_matches_any_of_its_words() {
+        let _home = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join("kastrup-subject-test");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(tmp.join(".kastrup")).unwrap();
+        std::env::set_var("HOME", &tmp);
+        let db = Database::new().unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO sources (id, name, plugin_type, config, capabilities, \
+                 created_at, updated_at) VALUES (78, 'subj', 'maildir', '{}', '[]', 0, 0)", [],
+            ).unwrap();
+        }
+        let t = 1_787_000_000i64;
+        db.insert_message(78, &msg("subj-a", "a@example.com", "me@example.com", "Coaching on Friday", "INBOX", t, "<subj-a>", None));
+        db.insert_message(78, &msg("subj-b", "b@example.com", "me@example.com", "The audit plan", "INBOX", t + 1, "<subj-b>", None));
+        db.insert_message(78, &msg("subj-c", "c@example.com", "me@example.com", "Lunch", "INBOX", t + 2, "<subj-c>", None));
+        let (a, b) = (id_of(&db, "subj-a"), id_of(&db, "subj-b"));
+        let f = Filters { source_id: Some(78), subject_pattern: Some("coach|AUDIT".into()), ..Default::default() };
+        let got: Vec<i64> = db.get_messages(&f, 50, 0).iter().map(|m| m.id).collect();
+        assert_eq!(got, vec![b, a], "either word, in any case; not the lunch");
     }
 
     #[test]
