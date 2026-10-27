@@ -1776,6 +1776,9 @@ pub struct App {
     pending_forward_ids: Vec<i64>,
     pending_forward_attachments: Vec<String>,
     pending_reply_id: Option<i64>,
+    /// A body for the next reply, from gluon's ideas: it goes on the
+    /// reply's first body line.
+    reply_body: Option<String>,
     /// In-flight SMTP send. The worker thread runs the shell command
     /// and posts its (ok, stderr) result through this channel; the
     /// main loop calls `pump_pending_send` each tick to finish the
@@ -2563,6 +2566,7 @@ pub fn start() -> Option<App> {
         pending_forward_ids: Vec::new(),
         pending_forward_attachments: Vec::new(),
         pending_reply_id: None,
+        reply_body: None,
         pending_send: None,
         send_queue: std::collections::VecDeque::new(),
         draft_row: None,
@@ -2767,6 +2771,11 @@ impl App {
             self.switch_to_view(&key);
             self.suppress_automark_read = false;
         }
+    }
+
+    /// For gluon's ideas: the next reply (r) opens with `body` written.
+    pub fn reply_with(&mut self, body: String) {
+        self.reply_body = Some(body);
     }
 
     /// For gluon's Home: marks `read` read and deletes `delete`, as R, d
@@ -9893,6 +9902,8 @@ impl App {
     }
 
     fn reply(&mut self, _force_editor: bool) {
+        // Taken first, so a reply that stops early leaves none behind.
+        let body = self.reply_body.take().unwrap_or_default();
         if self.maybe_external_reply() { return; }
         let Some(idx) = self.current_filtered_index() else {
             // Cursor on a section header in threaded view, or nothing
@@ -9916,8 +9927,12 @@ impl App {
                 self.set_feedback(&format!("Reply to {}", desc),
                     self.config.theme_colors.feedback_info);
                 self.compose_kind = kind;
-                let template = format!("Channel: {}\n\n", channel);
+                let template = format!("Channel: {}\n\n{}", channel, body);
+                // A written body is already a draft: unchanged, it goes
+                // to the review, as a recalled draft does.
+                self.compose_force_review = !body.is_empty();
                 self.run_editor_compose_at_full(&template, Some(3), Some(1), true);
+                self.compose_force_review = false;
                 self.compose_kind = DraftKind::Email;
                 return;
             }
@@ -9954,6 +9969,10 @@ impl App {
         template.push_str(&format!("Reply-To: {}\n", reply_to));
         template.push_str(&format!("Subject: {}\n", re_subject));
         template.push('\n');
+        if !body.is_empty() {
+            template.push_str(&body);
+            template.push('\n');
+        }
         template.push('\n');
         template.push_str(&self.quote_block(msg));
 
@@ -9963,7 +9982,9 @@ impl App {
             template.push('\n');
         }
 
+        self.compose_force_review = !body.is_empty();
         self.run_editor_compose_at(&template, None);
+        self.compose_force_review = false;
     }
 
     /// "On date, name wrote:" and the message's rendered text, each line
