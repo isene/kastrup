@@ -2053,8 +2053,10 @@ mod section_ref_tests {
 
 /// Everything before the main loop: the flags that answer and leave
 /// (None), the terminal, the database, the threads and the first
-/// paint. gluon calls it to start the mail tab.
-pub fn start() -> Option<App> {
+/// paint. gluon calls it to start the mail tab, with `paint` false: the
+/// first paint then goes nowhere, since gluon draws Home first and calls
+/// repaint() when the mail tab shows.
+pub fn start(paint: bool) -> Option<App> {
     // --help / --version answer before anything else, including the
     // no-terminal guard below: a CLI that cannot say what it is when
     // asked over a pipe is useless to any tool that asks (the fe2o3
@@ -2682,6 +2684,7 @@ pub fn start() -> Option<App> {
     // for filtered_messages) and re-render. On a cold start with thousands
     // of messages this turns a noticeable startup pause into two paints
     // separated by a few ms — the first one looks like instant boot.
+    let screen = (!paint).then(hide_output);
     if app.left.border { app.left.border_refresh(); }
     if app.right.border { app.right.border_refresh(); }
     app.render_all();
@@ -2691,6 +2694,9 @@ pub fn start() -> Option<App> {
     app.switch_to_view(&default_view);
     app.refresh_draft_count();
     app.render_all();
+    if let Some(fd) = screen {
+        show_output(fd);
+    }
 
     // A message id on the command line: show that one and open it.
     if let Some(id) = goto_message {
@@ -2711,9 +2717,30 @@ pub fn start() -> Option<App> {
     Some(app)
 }
 
+/// Sends what is drawn to /dev/null until show_output, and returns the
+/// screen's own descriptor for it.
+fn hide_output() -> i32 {
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    let screen = unsafe { libc::dup(1) };
+    if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+        unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&null), 1) };
+    }
+    screen
+}
+
+fn show_output(screen: i32) {
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    unsafe {
+        libc::dup2(screen, 1);
+        libc::close(screen);
+    }
+}
+
 /// The kastrup program: start, the main loop, finish.
 pub fn run() {
-    let Some(mut app) = start() else { return };
+    let Some(mut app) = start(true) else { return };
     while app.running {
         let wait = app.before_wait();
         let key = Input::getchr(Some(wait));
