@@ -8056,7 +8056,8 @@ impl App {
     /// A sticky filter rather than a list built by hand: the five-second
     /// reconciliation re-runs the current view's rules and would blank
     /// anything else, exactly as it once blanked search results.
-    fn goto_message(&mut self, id: i64) {
+    /// gluon calls it for a message picked on its Home tab.
+    pub fn goto_message(&mut self, id: i64) {
         let filters = Filters { message_id: Some(id), ..Default::default() };
         self.filtered_messages = self.db.get_messages(&filters, 1, 0);
         for msg in &mut self.filtered_messages {
