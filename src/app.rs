@@ -4067,8 +4067,10 @@ impl App {
         };
         lines.push(header_row("From:", &from_display, tc.header_from));
 
+        // A chat DM names the other person as To and Subject too; a line
+        // that only says the sender's name again is left out.
         let to_display = parse_json_recipients(&msg.recipients);
-        if !to_display.is_empty() {
+        if !to_display.is_empty() && to_display != name {
             lines.push(header_row("To:", &to_display, tc.header_from));
         }
 
@@ -4107,7 +4109,9 @@ impl App {
 
         if let Some(ref subj) = msg.subject {
             let decoded_subj = sources::maildir::decode_rfc2047(subj);
-            lines.push(header_row("Subject:", &decoded_subj, tc.header_subj));
+            if decoded_subj != name {
+                lines.push(header_row("Subject:", &decoded_subj, tc.header_subj));
+            }
         }
 
         let full_date = format_timestamp(msg.timestamp, "%Y-%m-%d %H:%M");
