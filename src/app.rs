@@ -1622,6 +1622,17 @@ fn muted_section_shows<'a>(h: &HiddenChannel, mut msgs: impl Iterator<Item = &'a
         })
 }
 
+/// One unread message, as gluon's Home tab lists it.
+pub struct Unread {
+    pub id: i64,
+    /// The key of the view it is in, and that view's colour (its top_bg).
+    pub view: String,
+    pub colour: u8,
+    pub time: i64,
+    pub from: String,
+    pub subject: String,
+}
+
 pub struct App {
     top: Pane,
     left: Pane,
@@ -2757,6 +2768,37 @@ impl App {
         }
         ctx.push_str("The kastrup skill reads the message, its thread and its sender's history from the database.");
         Some(ctx)
+    }
+
+    /// Under gluon, for its Home tab: the newest `n` unread messages in the
+    /// views on `keys`, each with its view's colour, newest first.
+    pub fn unread_in_views(&self, keys: &[&str], n: usize) -> Vec<Unread> {
+        let mut out = Vec::new();
+        for key in keys {
+            let Some(view) = self.views.iter().find(|v| v.key_binding.as_deref() == Some(key)) else { continue };
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&view.filters) else { continue };
+            let mut filters = parse_view_filters_json(&json);
+            // On a view with branches, the top-level fields still apply.
+            filters.is_read = Some(false);
+            let colour = json["top_bg"].as_str().and_then(|c| c.parse().ok())
+                .or(view.color.map(|c| c as u8)).unwrap_or(245);
+            for m in self.db.get_messages(&filters, n, 0) {
+                let from = m.sender_name.clone().filter(|s| !s.trim().is_empty()).unwrap_or(m.sender.clone());
+                out.push(Unread {
+                    id: m.id, view: key.to_string(), colour, time: m.timestamp,
+                    from, subject: m.subject.clone().unwrap_or_default(),
+                });
+            }
+        }
+        out.sort_by(|a, b| b.time.cmp(&a.time));
+        out.truncate(n);
+        out
+    }
+
+    /// Two stat()s that change whenever anything writes to the database,
+    /// so gluon asks `unread_in_views` again only after a write.
+    pub fn db_signature(&self) -> (u64, u128, u128) {
+        self.db.write_signature()
     }
 
     /// One turn of the main loop is `before_wait`, a wait of at most the
