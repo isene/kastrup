@@ -2870,12 +2870,10 @@ impl App {
         for key in keys {
             let Some(view) = self.views.iter().find(|v| v.key_binding.as_deref() == Some(key)) else { continue };
             let Ok(json) = serde_json::from_str::<serde_json::Value>(&view.filters) else { continue };
-            let mut filters = parse_view_filters_json(&json);
-            // On a view with branches, the top-level fields still apply.
-            filters.is_read = Some(false);
+            let filters = parse_view_filters_json(&json);
             let colour = json["top_bg"].as_str().and_then(|c| c.parse().ok())
                 .or(view.color.map(|c| c as u8)).unwrap_or(245);
-            for mut m in self.db.get_messages(&filters, n, 0) {
+            for mut m in self.db.newest_unread(&filters, n) {
                 resolve_source_type(&self.source_type_map, &mut m);
                 let (icon, kind) = source_info(&m.source_type, &self.config.theme_colors);
                 let from = m.sender_name.clone().filter(|s| !s.trim().is_empty()).unwrap_or(m.sender.clone());
@@ -4751,7 +4749,7 @@ impl App {
         lines.push(format!("{} {}s", style::fg("Poll interval:", tc.header_date), src.poll_interval));
 
         if let Some(ref ts) = src.last_sync {
-            lines.push(format!("{} {}", style::fg("Last sync:", tc.header_date),
+            lines.push(format!("{} {}", style::fg("Last news:", tc.header_date),
                 format_timestamp(*ts, "%Y-%m-%d %H:%M")));
         }
         if let Some(ref err) = src.last_error {
