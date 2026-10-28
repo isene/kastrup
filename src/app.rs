@@ -2685,6 +2685,8 @@ pub fn start(paint: bool) -> Option<App> {
     // of messages this turns a noticeable startup pause into two paints
     // separated by a few ms — the first one looks like instant boot.
     let screen = (!paint).then(hide_output);
+    // Unseen under gluon, so the message under the cursor stays unread.
+    app.suppress_automark_read = !paint;
     if app.left.border { app.left.border_refresh(); }
     if app.right.border { app.right.border_refresh(); }
     app.render_all();
@@ -2694,6 +2696,7 @@ pub fn start(paint: bool) -> Option<App> {
     app.switch_to_view(&default_view);
     app.refresh_draft_count();
     app.render_all();
+    app.suppress_automark_read = false;
     if let Some(fd) = screen {
         show_output(fd);
     }
@@ -2798,6 +2801,12 @@ impl App {
             self.switch_to_view(&key);
             self.suppress_automark_read = false;
         }
+    }
+
+    /// Under gluon: the inline image (V) off the screen, before another tab
+    /// is drawn. The terminal keeps an image until told to drop it.
+    pub fn hide_image(&mut self) {
+        self.clear_inline_image();
     }
 
     /// For gluon's ideas: the next reply (r) opens with `body` written.
