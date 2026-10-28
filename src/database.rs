@@ -50,6 +50,9 @@ pub struct Filters {
     /// The list of hidden (snoozed) mail: only messages that wait for
     /// their time. Every other list leaves those out.
     pub snoozed: bool,
+    /// Sort the rows the WHERE finds, instead of reading them in time
+    /// order. For a short list only; see `newest_unread`.
+    pub sort_found: bool,
     /// Optional OR-of-Filters. When present, takes precedence over
     /// the other fields of this struct — each branch is rendered as
     /// its own AND-group and combined with `OR`.
@@ -727,7 +730,11 @@ impl Database {
             }
         }
 
-        sql.push_str(" ORDER BY timestamp DESC LIMIT ? OFFSET ?");
+        sql.push_str(if filters.sort_found {
+            " ORDER BY +timestamp DESC LIMIT ? OFFSET ?"
+        } else {
+            " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+        });
         param_values.push(Box::new(limit as i64));
         param_values.push(Box::new(offset as i64));
 
@@ -747,6 +754,32 @@ impl Database {
             Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// The newest `limit` unread messages a view shows, one query per
+    /// branch, each sorted after it is found. In one OR query SQLite takes
+    /// `read = 0` out of every branch and walks all unread rows in time
+    /// order: 20 ms for a quiet view on 10,000 unread. Alone, a branch
+    /// reads its few rows from (folder, read) or (source_id, read).
+    pub fn newest_unread(&self, filters: &Filters, limit: usize) -> Vec<Message> {
+        // On a view with branches, the top-level fields still apply.
+        let mut top = filters.clone();
+        top.is_read = Some(false);
+        top.sort_found = true;
+        let parts = match top.branches.take() {
+            Some(bs) => bs.into_iter()
+                .map(|b| Filters { branches: Some(vec![b]), ..top.clone() })
+                .collect(),
+            None => vec![top],
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut out: Vec<Message> = parts.iter()
+            .flat_map(|f| self.get_messages(f, limit, 0))
+            .filter(|m| seen.insert(m.id))
+            .collect();
+        out.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        out.truncate(limit);
+        out
     }
 
     /// Does this view's *actual* filter match at least one non-archived
@@ -2121,6 +2154,50 @@ pub(crate) mod tests {
         let f = Filters { source_id: Some(78), subject_pattern: Some("coach|AUDIT".into()), ..Default::default() };
         let got: Vec<i64> = db.get_messages(&f, 50, 0).iter().map(|m| m.id).collect();
         assert_eq!(got, vec![b, a], "either word, in any case; not the lunch");
+    }
+
+    #[test]
+    fn newest_unread_finds_what_the_view_finds() {
+        let _home = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join("kastrup-unread-test");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(tmp.join(".kastrup")).unwrap();
+        std::env::set_var("HOME", &tmp);
+        let db = Database::new().unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO sources (id, name, plugin_type, config, capabilities, \
+                 created_at, updated_at) VALUES (79, 'unread', 'maildir', '{}', '[]', 0, 0)", [],
+            ).unwrap();
+        }
+        let t = 1_787_000_000i64;
+        let add = |ext: &str, folder: &str, ts: i64| {
+            db.insert_message(79, &msg(ext, "a@example.com", "me@example.com", ext, folder, ts, &format!("<{ext}>"), None));
+            id_of(&db, ext)
+        };
+        let a = add("u-a", "Work", t);
+        let b = add("u-b", "Home", t + 1);
+        let read = add("u-read", "Work", t + 2);
+        let _other = add("u-other", "Lists", t + 3);
+        let both = add("u-both", "Work", t + 4);
+        db.mark_as_read(read);
+        // Two branches, and a message both of them match.
+        let view = Filters {
+            branches: Some(vec![
+                Filters { folder: Some("Work".into()), ..Default::default() },
+                Filters { folder: Some("Home".into()), ..Default::default() },
+                Filters { source_id: Some(79), folder: Some("Work".into()), ..Default::default() },
+            ]),
+            ..Default::default()
+        };
+        let one = Filters { is_read: Some(false), ..view.clone() };
+        let want: Vec<i64> = db.get_messages(&one, 50, 0).iter().map(|m| m.id).collect();
+        assert_eq!(want, vec![both, b, a], "unread in Work or Home, newest first");
+        let got: Vec<i64> = db.newest_unread(&view, 50).iter().map(|m| m.id).collect();
+        assert_eq!(got, want, "the same rows, each once, in the same order");
+        let got: Vec<i64> = db.newest_unread(&view, 2).iter().map(|m| m.id).collect();
+        assert_eq!(got, vec![both, b], "the newest two");
     }
 
     #[test]

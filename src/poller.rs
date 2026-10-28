@@ -154,13 +154,12 @@ fn poller_loop(
     // worth building if VmRSS actually creeps up — the periodic log
     // below lets us confirm whether that ever matters in practice.
     let mut known_cache: HashMap<i64, HashSet<String>> = HashMap::new();
-    // When each source was last polled, and when that was last written
-    // down. The poll-interval gate only needs the number in memory; a
-    // row rewritten every tick is a database write every tick, and the
-    // UI's unread recount watches the database for changes. So an idle
-    // poller kept the UI recounting a multi-GB table every five
-    // seconds, for nothing. Persist on real news, or every 5 minutes so
-    // a restart does not rescan the world.
+    // When each source was last polled. The poll-interval gate only
+    // needs the number in memory. The row is written only on real news:
+    // kastrup and gluon reload their unread lists after any database
+    // write, and a write every 5 minutes per source made that about one
+    // reload a minute (100 ms in gluon) with nothing new. After a
+    // restart, a source with no recent news is polled at once.
     // Seeded from the database, not empty: an error written before the
     // last restart is still on screen, and only a cycle that knows
     // about it will clear it.
@@ -168,8 +167,6 @@ fn poller_loop(
         .map(|(id, _, err, _)| (id, err))
         .collect();
     let mut polled_at: HashMap<i64, i64> = HashMap::new();
-    let mut persisted_at: HashMap<i64, i64> = HashMap::new();
-    const PERSIST_EVERY: i64 = 300;
     log_process_memory("poller startup", &known_cache);
     let mut next_mem_log = std::time::Instant::now()
         + std::time::Duration::from_secs(3600);
@@ -344,11 +341,8 @@ fn poller_loop(
             clear_error(&db, source.id, &mut failing);
 
             polled_at.insert(source.id, now);
-            let written = *persisted_at.get(&source.id)
-                .unwrap_or(&source.last_sync.unwrap_or(0));
-            if count > 0 || now - written >= PERSIST_EVERY {
+            if count > 0 {
                 db.update_source_sync_time(source.id);
-                persisted_at.insert(source.id, now);
             }
 
             if count > 0 {
