@@ -1624,6 +1624,17 @@ fn muted_section_shows<'a>(h: &HiddenChannel, mut msgs: impl Iterator<Item = &'a
 }
 
 /// One unread message, as gluon's Home tab lists it.
+/// The replied / forwarded flag of a message, as the list shows it.
+fn reply_flag(msg: &Message, colour: u8) -> String {
+    let forwarded = msg.metadata.get("forwarded").and_then(|v| v.as_bool()).unwrap_or(false);
+    match (msg.replied, forwarded) {
+        (true, true) => style::fg("\u{2194}", colour),
+        (true, false) => style::fg("\u{2190}", colour),
+        (false, true) => style::fg("\u{2192}", colour),
+        _ => " ".to_string(),
+    }
+}
+
 pub struct Unread {
     pub id: i64,
     /// The key of the view it is in, and that view's colour (its top_bg).
@@ -1636,6 +1647,8 @@ pub struct Unread {
     pub time: i64,
     pub from: String,
     pub subject: String,
+    /// ← replied, → forwarded, ↔ both, in kastrup's colour; else a space.
+    pub flag: String,
 }
 
 pub struct App {
@@ -1787,6 +1800,9 @@ pub struct App {
     /// We only allow one at a time — UI feedback when a second
     /// attempt starts before the first completes.
     pending_send: Option<PendingSend>,
+    /// The toast of the send that finished last, until `take_sent`: an
+    /// app around kastrup shows it where kastrup's bar is not on screen.
+    sent_note: Option<(String, u8)>,
     /// Sends made while another was on the wire, oldest first. Drained
     /// by `pump_pending_send` as each transaction finishes.
     send_queue: std::collections::VecDeque<QueuedSend>,
@@ -2570,6 +2586,7 @@ pub fn start(paint: bool) -> Option<App> {
         pending_reply_id: None,
         reply_body: None,
         pending_send: None,
+        sent_note: None,
         send_queue: std::collections::VecDeque::new(),
         draft_row: None,
         next_send_at: None,
@@ -2880,6 +2897,7 @@ impl App {
                 out.push(Unread {
                     id: m.id, view: key.to_string(), colour, icon, kind, time: m.timestamp,
                     from, subject: m.subject.clone().unwrap_or_default(),
+                    flag: reply_flag(&m, self.config.theme_colors.replied),
                 });
             }
         }
@@ -2912,6 +2930,26 @@ impl App {
 
     /// Two stat()s that change whenever anything writes to the database,
     /// so gluon asks `unread_in_views` again only after a write.
+    /// "↑ Sending to X…" while a mail is on the wire, with how many wait
+    /// behind it. The recipient is cut at 30 characters.
+    pub fn send_note(&self) -> Option<String> {
+        let ps = self.pending_send.as_ref()?;
+        let mut who = ps.to_display.clone();
+        if crust::display_width(&who) > 30 {
+            who = who.chars().take(28).collect::<String>();
+            who.push_str("\u{2026}");
+        }
+        let waiting = self.send_queue.len();
+        let tail = if waiting > 0 { format!(" (+{} waiting)", waiting) } else { String::new() };
+        Some(format!("\u{2191} Sending to {}\u{2026}{}", who, tail))
+    }
+
+    /// The toast of the send that finished last ("Sent to X", or why it
+    /// failed) and its colour, once.
+    pub fn take_sent(&mut self) -> Option<(String, u8)> {
+        self.sent_note.take()
+    }
+
     pub fn db_signature(&self) -> (u64, u128, u128) {
         self.db.write_signature()
     }
@@ -3684,18 +3722,8 @@ impl App {
         // giving the user a stable "still working" cue while they
         // navigate. Truncate the recipient at 30 chars so the badge
         // doesn't push the right-side counts off the bar.
-        let send_badge = if let Some(ps) = &self.pending_send {
-            let mut who = ps.to_display.clone();
-            if crust::display_width(&who) > 30 {
-                who = who.chars().take(28).collect::<String>();
-                who.push_str("\u{2026}");
-            }
-            let waiting = self.send_queue.len();
-            let tail = if waiting > 0 { format!(" (+{} waiting)", waiting) } else { String::new() };
-            style::fg(&format!("  \u{2191} Sending to {}\u{2026}{}", who, tail), tc.feedback_warn)
-        } else {
-            String::new()
-        };
+        let send_badge = self.send_note()
+            .map_or(String::new(), |n| style::fg(&format!("  {n}"), tc.feedback_warn));
         // A source that stopped working says so here, because this is
         // the one line always on screen. An expired Workspace token
         // once hid five hours of mail behind a normal-looking inbox.
@@ -3897,17 +3925,7 @@ impl App {
             " ".to_string()
         };
 
-        // Replied/forwarded flag
-        let forwarded = msg.metadata.get("forwarded").and_then(|v| v.as_bool()).unwrap_or(false);
-        let rflag = if msg.replied && forwarded {
-            style::fg("\u{2194}", self.config.theme_colors.replied) // ↔ both
-        } else if msg.replied {
-            style::fg("\u{2190}", self.config.theme_colors.replied) // ← replied
-        } else if forwarded {
-            style::fg("\u{2192}", self.config.theme_colors.replied) // → forwarded
-        } else {
-            " ".to_string()
-        };
+        let rflag = reply_flag(msg, self.config.theme_colors.replied);
 
         // Hidden (snoozed) mail, seen in the list of hidden mail or in a
         // search: a clock mark, and the day it comes back as its date.
@@ -12655,6 +12673,7 @@ impl App {
                 self.set_feedback_sticky(&note, 196);
             }
         }
+        self.sent_note = self.feedback_message.clone();
         // Next one straight onto the wire; it repaints the badge itself.
         self.start_next_send();
         if self.pending_send.is_none() { self.render_top_bar(); }
