@@ -9615,11 +9615,27 @@ impl App {
     }
 
     /// Render a sender template: substitute @conv, @msg, @to, @emoji placeholders.
+    /// Each value goes in single quotes, in one pass, so a value from
+    /// another user (an attachment named `x$(cmd).png`) stays one argument
+    /// and never runs, and a value holding `@dest` is not filled in again.
     fn render_sender_template(template: &str, repl: &[(&str, &str)]) -> String {
-        let mut out = template.to_string();
-        for (k, v) in repl {
-            out = out.replace(&format!("@{}", k), v);
+        let mut out = String::new();
+        let mut rest = template;
+        while let Some(i) = rest.find('@') {
+            out.push_str(&rest[..i]);
+            let after = &rest[i + 1..];
+            match repl.iter().filter(|(k, _)| after.starts_with(k)).max_by_key(|(k, _)| k.len()) {
+                Some((k, v)) => {
+                    out.push_str(&format!("'{}'", v.replace('\'', "'\\''")));
+                    rest = &after[k.len()..];
+                }
+                None => {
+                    out.push('@');
+                    rest = after;
+                }
+            }
         }
+        out.push_str(rest);
         out
     }
 
@@ -13288,10 +13304,7 @@ impl App {
                 let home = std::env::var("HOME").unwrap_or_default();
                 let dir = std::path::PathBuf::from(home).join(".kastrup").join("attachments");
                 let _ = std::fs::create_dir_all(&dir);
-                let safe_name: String = name.chars()
-                    .map(|c| if c.is_alphanumeric() || ".-_".contains(c) { c } else { '_' })
-                    .collect();
-                let cached = dir.join(format!("{}_{}", file_id, safe_name));
+                let cached = dir.join(format!("{}_{}", file_id, safe_name(name)));
 
                 if !cached.exists() {
                     self.set_feedback(&format!("Downloading {}…", name),
@@ -13637,7 +13650,7 @@ impl App {
                 let name = att.get("name").or_else(|| att.get("filename"))
                     .and_then(|v| v.as_str()).unwrap_or("image");
                 if let Some(fid) = file_id {
-                    let dest = cache_dir.join(format!("{}_{}", fid, name))
+                    let dest = cache_dir.join(format!("{}_{}", safe_name(fid), safe_name(name)))
                         .to_string_lossy().to_string();
                     jobs.push((fid.to_string(), name.to_string(), dest));
                 }
@@ -15399,6 +15412,18 @@ fn a_mail_says_how_to_unsubscribe() {
 
 #[cfg(test)]
 #[test]
+fn a_name_from_another_user_never_runs_in_the_shell() {
+    let canary = std::env::temp_dir().join(format!("kastrup-canary-{}", std::process::id()));
+    let name = format!("Big Thumbs $(touch {})'; touch {} '@dest.png", canary.display(), canary.display());
+    let cmd = App::render_sender_template("printf '%s|' @name @dest", &[("name", &name), ("dest", "/c/a b.png")]);
+    let out = std::process::Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{name}|/c/a b.png|"));
+    assert!(!canary.exists());
+    assert_eq!(safe_name("Big Thumbs Up/../x.png"), "Big_Thumbs_Up_.._x.png");
+}
+
+#[cfg(test)]
+#[test]
 fn one_click_unsubscribe_is_one_post() {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -15747,10 +15772,13 @@ fn extract_mime_attachments(content: &str, msg_id: i64) -> Vec<serde_json::Value
 /// to `_` so the written path and the opened path always agree, and the
 /// extension survives.
 fn att_temp_path(name: &str) -> String {
-    let safe: String = name.chars()
-        .map(|c| if c.is_alphanumeric() || ".-_".contains(c) { c } else { '_' })
-        .collect();
-    format!("/tmp/kastrup_att_{}", safe)
+    format!("/tmp/kastrup_att_{}", safe_name(name))
+}
+
+/// A file name with only letters, digits and `.-_`: no spaces, slashes or
+/// quotes from a name another user chose.
+fn safe_name(name: &str) -> String {
+    name.chars().map(|c| if c.is_alphanumeric() || ".-_".contains(c) { c } else { '_' }).collect()
 }
 
 /// Office-type documents LibreOffice can render to PDF (attachment
