@@ -2906,6 +2906,13 @@ impl App {
         out
     }
 
+    /// Mail sent `min` to `max` days ago that no later message answers,
+    /// newest first: (id, recipients, subject, time).
+    pub fn unanswered(&self, min: i64, max: i64, n: usize) -> Vec<(i64, String, String, i64)> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        self.db.unanswered(now - max * 86_400, now - min * 86_400, n)
+    }
+
     /// A box at the top right (herald, through notify-send) for each
     /// unread message newer than `after` in a view whose filters say
     /// `"notify": true`. Views without the flag cost nothing.
