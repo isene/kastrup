@@ -120,14 +120,14 @@ pub fn sync_maildir(maildir_path: &str, known_ids: &HashSet<String>, last_sync: 
 }
 
 fn parse_maildir_file(path: &Path, folder: &str, filename: &str) -> Option<MessageData> {
-    // Read as bytes and decode lossily, NOT read_to_string: a mail with
-    // a non-UTF-8 body (charset=windows-1252 / latin-1 with 8bit transfer
-    // encoding — common in marketing mail) is invalid UTF-8, so
-    // read_to_string returns Err and the whole message was silently
-    // dropped — never ingested, while gmail-idle still counted the new/
-    // file (asmite vs kastrup unread-count mismatch). Headers are ASCII
-    // so they parse fine; lossy only touches stray body bytes.
-    let content = String::from_utf8_lossy(&std::fs::read(path).ok()?).into_owned();
+    // Read as bytes, NOT read_to_string: a mail with a non-UTF-8 body
+    // (charset=windows-1252 / latin-1 with 8bit transfer encoding) is
+    // invalid UTF-8, so read_to_string returned Err and the whole message
+    // was silently dropped, while gmail-idle still counted the new/ file.
+    let content = match String::from_utf8(std::fs::read(path).ok()?) {
+        Ok(s) => s,
+        Err(e) => decode_8bit(e.into_bytes()),
+    };
 
     // Parse headers (everything before first blank line)
     let mut from = String::new();
@@ -247,6 +247,21 @@ fn parse_maildir_file(path: &Path, folder: &str, filename: &str) -> Option<Messa
         folder: Some(folder.to_string()),
         thread_id: message_id,
     })
+}
+
+/// A mail that is not valid UTF-8 carries raw 8-bit text in the charset
+/// it names (ISO-8859-15 from an old mail client, windows-1252 from a
+/// newsletter). Decode the whole file with the first such charset, so
+/// "går" stays "går" instead of "g\u{FFFD}r". Headers and base64 or
+/// quoted-printable parts are ASCII and come through unchanged; with no
+/// charset named, the mail crate falls back to latin-1.
+fn decode_8bit(bytes: Vec<u8>) -> String {
+    let lower = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+    let charset = lower
+        .match_indices("charset=")
+        .filter_map(|(i, _)| mail::charset_of(&lower[i..]))
+        .find(|c| !matches!(c.as_str(), "utf-8" | "utf8" | "us-ascii"));
+    mail::decode_body_bytes(&bytes, charset.as_deref())
 }
 
 /// Case-insensitive `Header-Name:` strip. Discards the `"NAME:"` /
@@ -462,6 +477,26 @@ mod tests {
     fn basename_none_when_no_epoch_anchor() {
         let s = "not-a-maildir-name";
         assert_eq!(extract_maildir_basename(s), None);
+    }
+
+    #[test]
+    fn an_8bit_latin9_body_keeps_its_letters() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"From: Alice <alice@example.com>\r\n");
+        bytes.extend_from_slice(b"Subject: Hei\r\n");
+        bytes.extend_from_slice(b"Content-Type: text/plain; charset=ISO-8859-15\r\n");
+        bytes.extend_from_slice(b"Content-Transfer-Encoding: 8BIT\r\n\r\n");
+        bytes.extend_from_slice(b"Denne meldingen g\xe5r til noen f\xe5 \xa4\r\n");
+
+        let dir = std::env::temp_dir().join("kastrup_latin9_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let fp = dir.join("1782571312.test_1.host:2,");
+        std::fs::write(&fp, &bytes).unwrap();
+        let msg = parse_maildir_file(&fp, "Geir", "1782571312.test_1.host:2,");
+        let _ = std::fs::remove_file(&fp);
+
+        // 0xA4 is the euro sign in ISO-8859-15, not latin-1's currency sign.
+        assert_eq!(msg.unwrap().content, "Denne meldingen går til noen få €");
     }
 
     #[test]
