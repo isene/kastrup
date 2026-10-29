@@ -109,27 +109,32 @@ pub fn read_calendars() -> Vec<String> {
 }
 
 /// Read the existing top-level categories from a hyperlist file.
-/// First-indent-level lines are the categories. Returns an empty list
+/// The least indented lines are the categories. Returns an empty list
 /// if the file doesn't exist yet — Claude will get to invent the
 /// initial set of categories.
 pub fn read_categories(todo_hl: &Path) -> Vec<String> {
     let Ok(content) = std::fs::read_to_string(todo_hl) else {
         return Vec::new();
     };
+    let top = top_depth(&content);
     let mut out: Vec<String> = Vec::new();
-    for line in content.lines() {
-        // First-level lines: exactly one leading tab, then the name.
-        // Two or more tabs = child items. Zero tabs = blank/comment.
-        if let Some(rest) = line.strip_prefix('\t') {
-            if !rest.starts_with('\t') && !rest.trim().is_empty() {
-                let name = rest.trim();
-                if !out.contains(&name.to_string()) {
-                    out.push(name.to_string());
-                }
-            }
+    for line in content.lines().filter(|l| !l.trim().is_empty() && tabs(l) == top) {
+        let name = line.trim().to_string();
+        if !out.contains(&name) {
+            out.push(name);
         }
     }
     out
+}
+
+fn tabs(line: &str) -> usize {
+    line.chars().take_while(|c| *c == '\t').count()
+}
+
+/// The indent of the least indented line: sections sit there, tasks one
+/// tab further in. An empty file starts at no indent.
+fn top_depth(content: &str) -> usize {
+    content.lines().filter(|l| !l.trim().is_empty()).map(tabs).min().unwrap_or(0)
 }
 
 /// Spawn the triage wrapper with the message context JSON on stdin
@@ -183,11 +188,11 @@ pub fn append_todo(todo_hl: &Path, category: &str, text: &str) -> Result<(), Str
 fn insert_todo(existing: &str, category: &str, text: &str) -> String {
     let mut lines: Vec<String> = existing.lines().map(String::from).collect();
 
-    // Find the category line: exactly one leading tab + the category name.
-    let cat_marker = format!("\t{}", category);
+    let top = top_depth(existing);
+    let cat_marker = format!("{}{}", "\t".repeat(top), category);
     let cat_idx = lines.iter().position(|l| l.trim_end() == cat_marker);
 
-    let new_item = format!("\t\t{}", text);
+    let new_item = format!("{}{}", "\t".repeat(top + 1), text);
 
     match cat_idx {
         Some(i) => {
@@ -195,9 +200,7 @@ fn insert_todo(existing: &str, category: &str, text: &str) -> String {
             // line or end of file).
             let mut insert_at = lines.len();
             for (j, line) in lines.iter().enumerate().skip(i + 1) {
-                let leading_tabs = line.chars().take_while(|c| *c == '\t').count();
-                let trimmed = line.trim();
-                if leading_tabs <= 1 && !trimmed.is_empty() {
+                if tabs(line) <= top && !line.trim().is_empty() {
                     insert_at = j;
                     break;
                 }
@@ -212,7 +215,7 @@ fn insert_todo(existing: &str, category: &str, text: &str) -> String {
             {
                 lines.push(String::new());
             }
-            lines.push(format!("\t{}", category));
+            lines.push(cat_marker);
             lines.push(new_item);
         }
     }
@@ -345,6 +348,15 @@ mod tests {
     #[test]
     fn append_into_empty_file() {
         let after = insert_todo("", "Personal", "First todo");
-        assert_eq!(after, "\tPersonal\n\t\tFirst todo\n");
+        assert_eq!(after, "Personal\n\tFirst todo\n");
+    }
+
+    #[test]
+    fn a_file_with_sections_at_no_indent_gets_tasks_one_tab_in() {
+        let before = "Personal\n\tBuy milk\nWork\n\tFinish report\n";
+        let after = insert_todo(before, "Personal", "Call the dentist");
+        assert_eq!(after, "Personal\n\tBuy milk\n\tCall the dentist\nWork\n\tFinish report\n");
+        let after = insert_todo(before, "Side Project", "Review the design draft");
+        assert!(after.ends_with("\nSide Project\n\tReview the design draft\n"));
     }
 }
