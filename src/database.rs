@@ -851,6 +851,56 @@ impl Database {
     }
 
     /// Get a single message with full content
+    /// Mail the user sent between `from` and `to` that nothing later
+    /// answers: no message names it in In-Reply-To or References, and
+    /// none from one of its recipients has its subject. Only the newest
+    /// mail of a subject counts, so a reminder already sent hides the
+    /// first. Newest first, at most `limit`: (id, recipients, subject,
+    /// time). One read of the mail since `from`; gluon asks it on Ctrl+S.
+    pub fn unanswered(&self, from: i64, to: i64, limit: usize) -> Vec<(i64, String, String, i64)> {
+        struct Row { id: i64, mid: String, sender: String, to: String, title: String, subject: String, ts: i64, sent: bool, refs: String }
+        let conn = self.read();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, coalesce(thread_id, ''), lower(sender), recipients || ' ' || coalesce(cc, ''), \
+             coalesce(subject, ''), timestamp, folder, \
+             CASE WHEN json_valid(metadata) THEN coalesce(json_extract(metadata, '$.in_reply_to'), '') \
+             || ' ' || coalesce(json_extract(metadata, '$.references'), '') ELSE '' END \
+             FROM messages WHERE timestamp >= ? ORDER BY timestamp DESC",
+        ) else { return Vec::new() };
+        let rows: Vec<Row> = stmt
+            .query_map(params![from], |r| {
+                let title: String = r.get(4)?;
+                Ok(Row {
+                    id: r.get(0)?, mid: r.get(1)?, sender: r.get(2)?, to: r.get(3)?,
+                    subject: normalise_subject(&title).to_lowercase(), title, ts: r.get(5)?,
+                    sent: is_sent_folder(r.get::<_, Option<String>>(6)?.as_deref()), refs: r.get(7)?,
+                })
+            })
+            .map(|it| it.flatten().collect())
+            .unwrap_or_default();
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for m in rows.iter().filter(|m| m.sent) {
+            if !m.subject.is_empty() && !seen.insert(m.subject.as_str()) || m.ts > to {
+                continue;
+            }
+            let to_lower = m.to.to_lowercase();
+            let answered = rows.iter().any(|r| {
+                r.ts > m.ts && !r.sent
+                    && ((!m.mid.is_empty() && r.refs.contains(&m.mid))
+                        || (!m.subject.is_empty() && r.subject == m.subject
+                            && !r.sender.is_empty() && to_lower.contains(&r.sender)))
+            });
+            if !answered {
+                out.push((m.id, m.to.trim().to_string(), m.title.clone(), m.ts));
+                if out.len() == limit {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     pub fn get_message(&self, id: i64) -> Option<Message> {
         let conn = self.read();
         let mut stmt = conn.prepare(
@@ -2098,6 +2148,39 @@ pub(crate) mod tests {
         let conn = db.conn.lock().unwrap();
         conn.query_row("SELECT replied, parent_id FROM messages WHERE external_id = ?",
                        params![ext], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+    }
+
+    #[test]
+    fn sent_mail_with_no_answer_is_found() {
+        let _home = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join("kastrup-unanswered-test");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(tmp.join(".kastrup")).unwrap();
+        std::env::set_var("HOME", &tmp);
+        let db = Database::new().unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO sources (id, name, plugin_type, config, capabilities, \
+                 created_at, updated_at) VALUES (79, 'mail', 'maildir', '{}', '[]', 0, 0)", [],
+            ).unwrap();
+        }
+        let (t, day) = (1_787_000_000i64, 86_400);
+        let me = "me@example.com";
+        // Answered by its Message-Id, answered by subject and sender, and
+        // not answered at all.
+        db.insert_message(79, &msg("s1", me, "ann@example.com", "Invoice", "Sent", t, "s1@x", None));
+        db.insert_message(79, &msg("r1", "ann@example.com", me, "Your mail", "INBOX", t + day, "r1@x", Some("<s1@x>")));
+        db.insert_message(79, &msg("s2", me, "Bob <bob@example.com>", "Lunch on Friday", "Sent", t + 1, "s2@x", None));
+        db.insert_message(79, &msg("r2", "bob@example.com", me, "Re: Lunch on Friday", "INBOX", t + 2 * day, "r2@x", None));
+        db.insert_message(79, &msg("s3", me, "cat@example.com", "The roof quote", "Sent", t + 2, "s3@x", None));
+        // The same subject from someone else is no answer.
+        db.insert_message(79, &msg("r3", "dan@example.com", me, "Re: The roof quote", "INBOX", t + day, "r3@x", None));
+        // A reminder sent later hides the first mail of its subject.
+        db.insert_message(79, &msg("s4", me, "eve@example.com", "The keys", "Sent", t + 3, "s4@x", None));
+        db.insert_message(79, &msg("s5", me, "eve@example.com", "Re: The keys", "Sent", t + 4, "s5@x", None));
+        let got: Vec<String> = db.unanswered(t - day, t + 6 * day, 10).into_iter().map(|u| u.2).collect();
+        assert_eq!(got, ["Re: The keys", "The roof quote"]);
     }
 
     #[test]
