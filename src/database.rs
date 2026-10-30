@@ -352,6 +352,9 @@ impl Database {
         // anything at all, since most bodies arrive base64'd. Error
         // ignored: the column is already there on the second run.
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN content_text TEXT", []);
+        // Who a failed send was for. The draft keeps it until it is sent
+        // or deleted, so the top line can say a mail did not go.
+        let _ = conn.execute("ALTER TABLE postponed ADD COLUMN failed TEXT", []);
         // Added after create_schema stopped running for this database. One
         // full scan the first time, then every unread recount is covered.
         let t = std::time::Instant::now();
@@ -469,7 +472,8 @@ impl Database {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_id INTEGER,
                 data TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                failed TEXT
             );
             -- Outgoing messages held until their time comes. `kind` is the
             -- DraftKind tag so a scheduled Workspace post goes out the
