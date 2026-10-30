@@ -55,8 +55,12 @@ const TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 ///   internal corporate relay reachable only on a VPN — entirely
 ///   outside kastrup: the helper binary owns all the addressing, so
 ///   no private endpoints are committed to this repo.
+/// * `graph:<file>` → Microsoft 365 through Graph's sendMail, so the
+///   mail leaves the way Outlook sends it, with no VPN. The file holds
+///   `client_id`, `tenant_id` and `refresh_token`.
 pub enum Transport {
     GmailXoauth2,
+    Graph(PathBuf),
     Command(String),
 }
 
@@ -68,6 +72,10 @@ pub fn transport_for(smtp_spec: &str) -> Transport {
     let spec = smtp_spec.trim();
     if spec.is_empty() {
         return Transport::GmailXoauth2;
+    }
+    if let Some(file) = spec.strip_prefix("graph:") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        return Transport::Graph(PathBuf::from(file.trim().replacen("~/", &format!("{}/", home), 1)));
     }
     let prog = spec.split_whitespace().next().unwrap_or("");
     let base = prog.rsplit('/').next().unwrap_or(prog);
@@ -92,9 +100,73 @@ pub fn send_email(
     match transport {
         Transport::GmailXoauth2 =>
             send_email_gmail(safedir, from_email, recipients, eml_body),
+        Transport::Graph(login) => send_via_graph(login, eml_body),
         Transport::Command(cmd) =>
             send_via_command(cmd, from_email, recipients, eml_body),
     }
+}
+
+const GRAPH_SEND_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Microsoft 365: a token from the login file, then the whole message,
+/// base64, posted to Graph's sendMail. Microsoft reads To, Cc and Bcc
+/// from the message itself and files a copy in Sent Items. It hands out
+/// a new refresh token with each access token; that goes back in the
+/// file, which stays readable by its owner only.
+fn send_via_graph(login: &Path, eml_body: &[u8]) -> Result<(), String> {
+    let shown = login.display();
+    let text = std::fs::read_to_string(login).map_err(|e| format!("read {}: {}", shown, e))?;
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse {}: {}", shown, e))?;
+    let field = |k: &str| -> Result<String, String> {
+        cfg.get(k).and_then(|v| v.as_str()).map(str::to_string)
+            .ok_or_else(|| format!("{}: no {}", shown, k))
+    };
+    let (client_id, tenant, refresh) = (field("client_id")?, field("tenant_id")?, field("refresh_token")?);
+    let reply = ureq::post(&format!("https://login.microsoftonline.com/{}/oauth2/v2.0/token", tenant))
+        .timeout(TOKEN_REFRESH_TIMEOUT)
+        .send_form(&[
+            ("client_id", client_id.as_str()),
+            ("refresh_token", refresh.as_str()),
+            ("grant_type", "refresh_token"),
+            ("scope", "https://graph.microsoft.com/Mail.Send offline_access"),
+        ])
+        .map_err(|e| format!("microsoft token: {}", e))?
+        .into_string()
+        .map_err(|e| format!("microsoft token: {}", e))?;
+    let token: serde_json::Value =
+        serde_json::from_str(&reply).map_err(|e| format!("microsoft token: {}", e))?;
+    let access = token.get("access_token").and_then(|v| v.as_str())
+        .ok_or("microsoft token: no access_token")?;
+    if let Some(next) = token.get("refresh_token").and_then(|v| v.as_str()) {
+        cfg["refresh_token"] = next.into();
+        keep_private(login, &cfg.to_string()).map_err(|e| format!("write {}: {}", shown, e))?;
+    }
+    let crlf = String::from_utf8_lossy(eml_body).replace("\r\n", "\n").replace('\n', "\r\n");
+    match ureq::post("https://graph.microsoft.com/v1.0/me/sendMail")
+        .timeout(GRAPH_SEND_TIMEOUT)
+        .set("Authorization", &format!("Bearer {}", access))
+        .set("Content-Type", "text/plain")
+        .send_string(&B64.encode(crlf.as_bytes()))
+    {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(code, r)) => Err(format!(
+            "microsoft said {}: {}", code,
+            r.into_string().unwrap_or_default().chars().take(200).collect::<String>(),
+        )),
+        Err(e) => Err(format!("microsoft send: {}", e)),
+    }
+}
+
+/// Replace a file with new text that only its owner can read: written
+/// beside it first, then renamed over it, so a crash leaves the old one.
+fn keep_private(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Default OAuth secret directory: `~/.kastrup/oauth`. To keep the
@@ -429,5 +501,12 @@ mod tests {
         assert!(matches!(transport_for("gmail"), Transport::GmailXoauth2));
         assert!(matches!(transport_for(""), Transport::GmailXoauth2));
         assert!(matches!(transport_for("~/bin/relay -t"), Transport::Command(c) if c == "~/bin/relay -t"));
+    }
+
+    #[test]
+    fn a_graph_value_names_its_login_file() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert!(matches!(transport_for("graph:/x/login.json"), Transport::Graph(p) if p == Path::new("/x/login.json")));
+        assert!(matches!(transport_for("graph: ~/m.json"), Transport::Graph(p) if p == PathBuf::from(format!("{}/m.json", home))));
     }
 }
