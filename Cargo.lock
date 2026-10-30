@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-mail"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "encoding_rs",
  "regex",
