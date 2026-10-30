@@ -419,3 +419,15 @@ impl<S: Read + Write> SmtpIo<S> {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gmail_and_an_empty_value_send_natively_and_a_relay_is_a_command() {
+        assert!(matches!(transport_for("gmail"), Transport::GmailXoauth2));
+        assert!(matches!(transport_for(""), Transport::GmailXoauth2));
+        assert!(matches!(transport_for("~/bin/relay -t"), Transport::Command(c) if c == "~/bin/relay -t"));
+    }
+}
