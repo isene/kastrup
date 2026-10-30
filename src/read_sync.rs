@@ -8,6 +8,11 @@
 //!   read here                   → read on the phone
 //!   merely opened on the phone  → nothing
 //!   marked READ on the phone    → read here
+//!   deleted on the phone        → deleted here
+//!
+//! A phone's deletions come in its own `mail-delete-<device>.txt`, one
+//! Message-ID per line. Applying one twice does nothing, so the phone
+//! keeps a line for its fetch window and nothing here keeps track.
 //!
 //! Storage is one file per device in a folder Syncthing carries, so
 //! there is never a second writer for it to leave a `.sync-conflict-`
@@ -34,6 +39,11 @@ pub struct ReadSync {
     marks: Marks,
     /// Other devices' files and the mtime we last folded in.
     others: Vec<(PathBuf, i64)>,
+    /// The phones' delete lists, watched the same way.
+    drops: Vec<(PathBuf, i64)>,
+    /// Rows a phone deleted, found by the last sync, for the caller to
+    /// delete with their files.
+    gone: Vec<i64>,
     dir_mtime: i64,
     days: i64,
 }
@@ -65,7 +75,7 @@ impl ReadSync {
             .map(|s| read_state::parse(&s))
             .unwrap_or_default();
         let mut rs = Self {
-            dir, mine, marks, others: Vec::new(), dir_mtime: 0,
+            dir, mine, marks, others: Vec::new(), drops: Vec::new(), gone: Vec::new(), dir_mtime: 0,
             days: days.max(1),
         };
         rs.rescan();
@@ -77,6 +87,7 @@ impl ReadSync {
     fn rescan(&mut self) {
         self.dir_mtime = mtime(&self.dir);
         let mut found = Vec::new();
+        let mut drops = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for e in entries.flatten() {
                 let p = e.path();
@@ -84,12 +95,18 @@ impl ReadSync {
                 let name = match p.file_name().and_then(|n| n.to_str()) {
                     Some(n) => n, None => continue,
                 };
+                if name.starts_with("mail-delete-") && name.ends_with(".txt") {
+                    let seen = self.drops.iter().find(|(q, _)| *q == p).map(|(_, t)| *t);
+                    drops.push((p, seen.unwrap_or(0)));
+                    continue;
+                }
                 if !name.starts_with("mail-read-") || !name.ends_with(".json") { continue; }
                 let seen = self.others.iter().find(|(q, _)| *q == p).map(|(_, t)| *t);
                 found.push((p, seen.unwrap_or(0)));
             }
         }
         self.others = found;
+        self.drops = drops;
     }
 
     /// Has another device said anything since we last looked? Three
@@ -98,7 +115,7 @@ impl ReadSync {
         let dm = mtime(&self.dir);
         if dm != self.dir_mtime { self.rescan(); }
         let mut changed = false;
-        for (p, seen) in self.others.iter_mut() {
+        for (p, seen) in self.others.iter_mut().chain(self.drops.iter_mut()) {
             let m = mtime(p);
             if m != *seen { *seen = m; changed = true; }
         }
@@ -111,6 +128,10 @@ impl ReadSync {
         let since = now_secs() - self.days * 86_400;
         let rows = db.recent_mail_read_state(since);
         let deleted = db.recent_deleted_message_ids(since);
+        self.gone = phone_deletes(
+            &rows,
+            &self.drops.iter().filter_map(|(p, _)| std::fs::read_to_string(p).ok()).collect::<Vec<_>>(),
+        );
         if rows.is_empty() && deleted.is_empty() { return 0; }
 
         let theirs = read_state::merge_all(
@@ -130,6 +151,25 @@ impl ReadSync {
         }
         plan.apply.len()
     }
+}
+
+impl ReadSync {
+    /// Rows a phone deleted, once. The caller deletes them as `d` would,
+    /// files and all.
+    pub fn take_gone(&mut self) -> Vec<i64> {
+        std::mem::take(&mut self.gone)
+    }
+}
+
+/// The rows named in the phones' delete lists. A line is a Message-ID,
+/// then anything after a space or tab (the phone's timestamp).
+pub fn phone_deletes(rows: &[(i64, String, bool)], lists: &[String]) -> Vec<i64> {
+    let wanted: std::collections::HashSet<&str> = lists.iter()
+        .flat_map(|s| s.lines())
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    if wanted.is_empty() { return Vec::new(); }
+    rows.iter().filter(|(_, mid, _)| wanted.contains(mid.as_str())).map(|(id, _, _)| *id).collect()
 }
 
 pub struct Plan {
@@ -307,6 +347,23 @@ mod tests {
         assert!(rs.others_changed(), "first look folds in what is already there");
         assert!(!rs.others_changed(), "and then goes quiet");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_phone_delete_list_names_rows_and_is_watched() {
+        let r = rows(&[(1, "a@x", true), (2, "b@x", false), (3, "c@x", false)]);
+        let lists = vec!["b@x\t1700000000\n\nmissing@x\t1\n".to_string(), "c@x\n".to_string()];
+        assert_eq!(phone_deletes(&r, &lists), vec![2, 3]);
+        assert!(phone_deletes(&r, &[]).is_empty());
+
+        let dir = std::env::temp_dir().join(format!("kastrup-rd-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("mail-delete-phone.txt"), "b@x\n").unwrap();
+        let mut rs = ReadSync::new(dir.to_str().unwrap(), 30).expect("folder exists");
+        assert_eq!(rs.drops.len(), 1);
+        assert!(rs.others_changed(), "a new delete list is news");
+        assert!(!rs.others_changed());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
