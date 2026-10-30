@@ -4,9 +4,10 @@
 //! can be verified without bringing up the full kastrup TUI.
 //!
 //! Usage:
-//!   cargo run --release --bin email_send_test [from] [to]
+//!   cargo run --release --bin email_send_test [from] [to] [file.eml|-]
 //!
-//! Defaults to from=geir@isene.com, to=same. Writes the result to
+//! Defaults to from=geir@isene.com, to=same. A third argument sends that
+//! whole RFC822 message instead (`-` reads it from stdin). Writes the result to
 //! stdout and exits 0 on success, 1 on failure (with the error
 //! message on stderr).
 
@@ -18,7 +19,12 @@ fn main() {
     let from = args.first().cloned().unwrap_or_else(|| "geir@isene.com".to_string());
     let to = args.get(1).cloned().unwrap_or_else(|| from.clone());
 
-    let rfc822 = format!(
+    let given = match args.get(2).map(String::as_str) {
+        None => None,
+        Some("-") => { let mut s = String::new(); std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).ok(); Some(s) }
+        Some(f) => Some(std::fs::read_to_string(f).unwrap_or_else(|e| { eprintln!("[!] {f}: {e}"); std::process::exit(1) })),
+    };
+    let rfc822 = given.unwrap_or_else(|| format!(
         "From: {}\r\n\
          To: {}\r\n\
          Subject: kastrup native-SMTP self-test\r\n\
@@ -32,7 +38,7 @@ fn main() {
         from, to,
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs()).unwrap_or(0),
-    );
+    ));
 
     let safedir = email_send::default_safedir();
     eprintln!("[+] from: {}", from);
