@@ -284,12 +284,18 @@ fn queue_phone_sends(send: &std::path::Path, conn: &rusqlite::Connection, now: i
 
 /// How many drafts `+` lists: postponed rows not on their way out,
 /// scheduled rows, and the files in the drop folder that the picker
-/// reads (dotfiles are left out there too).
-fn count_drafts(conn: &rusqlite::Connection, dir: &std::path::Path, in_flight: &[i64]) -> usize {
+/// reads (dotfiles are left out there too). Also who each failed send
+/// was for, from the same rows.
+fn count_drafts(conn: &rusqlite::Connection, dir: &std::path::Path, in_flight: &[i64]) -> (usize, Vec<String>) {
     let mut n = 0;
-    if let Ok(mut stmt) = conn.prepare("SELECT id FROM postponed") {
-        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, i64>(0)) {
-            n += rows.flatten().filter(|id| !in_flight.contains(id)).count();
+    let mut unsent = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT id, failed FROM postponed ORDER BY created_at DESC") {
+        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))) {
+            for (id, failed) in rows.flatten() {
+                if in_flight.contains(&id) { continue; }
+                n += 1;
+                unsent.extend(failed);
+            }
         }
     }
     n += conn.query_row("SELECT COUNT(*) FROM scheduled", [], |r| r.get::<_, i64>(0))
@@ -299,7 +305,7 @@ fn count_drafts(conn: &rusqlite::Connection, dir: &std::path::Path, in_flight: &
             .filter(|e| !e.file_name().to_string_lossy().starts_with('.') && e.path().is_file())
             .count();
     }
-    n
+    (n, unsent)
 }
 
 fn drafts_drop_dir() -> std::path::PathBuf {
@@ -1826,6 +1832,9 @@ pub struct App {
     /// top line. Recounted at start, after a database write, in the
     /// minute check and after `+`; the top line only reads it.
     draft_count: usize,
+    /// Who each send that failed was for, newest first. Its draft keeps
+    /// a red mark on the top line until it is sent or deleted.
+    unsent: Vec<String>,
     /// The live relay socket, so the resume watchdog in `after_wait` can
     /// shut it down after a suspend and force a reconnect.
     relay_kill: Arc<std::sync::Mutex<Option<std::net::TcpStream>>>,
@@ -2592,6 +2601,7 @@ pub fn start(paint: bool) -> Option<App> {
         next_send_at: None,
         last_sched_check: 0,
         draft_count: 0,
+        unsent: Vec::new(),
         relay_kill: relay_kill.clone(),
         last_wall: std::time::SystemTime::now(),
         writer: Some(writer_handle),
@@ -2949,6 +2959,20 @@ impl App {
         let waiting = self.send_queue.len();
         let tail = if waiting > 0 { format!(" (+{} waiting)", waiting) } else { String::new() };
         Some(format!("\u{2191} Sending to {}\u{2026}{}", who, tail))
+    }
+
+    /// "✗ Not sent to X" while a failed send waits in the drafts, with
+    /// how many more. Gone once it is sent or deleted.
+    pub fn unsent_note(&self) -> Option<String> {
+        let first = self.unsent.first()?;
+        let mut who = first.clone();
+        if crust::display_width(&who) > 30 {
+            who = who.chars().take(28).collect::<String>();
+            who.push_str("\u{2026}");
+        }
+        let more = self.unsent.len() - 1;
+        let tail = if more > 0 { format!(" (+{} more)", more) } else { String::new() };
+        Some(format!("\u{2717} Not sent to {}{}, + to resend", who, tail))
     }
 
     /// The toast of the send that finished last ("Sent to X", or why it
@@ -3741,7 +3765,8 @@ impl App {
         // navigate. Truncate the recipient at 30 chars so the badge
         // doesn't push the right-side counts off the bar.
         let send_badge = self.send_note()
-            .map_or(String::new(), |n| style::fg(&format!("  {n}"), tc.feedback_warn));
+            .map_or(String::new(), |n| style::fg(&format!("  {n}"), tc.feedback_warn))
+            + &self.unsent_note().map_or(String::new(), |n| style::fg(&format!("  {n}"), 196));
         // A source that stopped working says so here, because this is
         // the one line always on screen. An expired Workspace token
         // once hid five hours of mail behind a normal-looking inbox.
@@ -10435,10 +10460,10 @@ impl App {
         // DB-side: postponed rows
         let conn = self.db.conn.lock().unwrap();
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT id, data, created_at FROM postponed ORDER BY created_at DESC"
+            "SELECT id, data, created_at, failed IS NOT NULL FROM postponed ORDER BY created_at DESC"
         ) {
             let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, bool>(3)?))
             });
             // A draft whose send is on the wire or waiting behind one is
             // still in `postponed` on purpose. Hide it, or recalling it
@@ -10448,10 +10473,11 @@ impl App {
                 .collect();
             if let Ok(rows) = rows {
                 for row in rows.flatten() {
-                    let (id, data, ts) = row;
+                    let (id, data, ts, failed) = row;
                     if in_flight.contains(&id) { continue; }
                     let kind = DraftKind::Email;
-                    let (subject, body_preview) = parse_draft_preview(&data, kind);
+                    let (mut subject, body_preview) = parse_draft_preview(&data, kind);
+                    if failed { subject = format!("{} {}", style::fg("\u{2717} not sent \u{b7}", 196), subject); }
                     out.push(DraftCandidate {
                         source: DraftSource::Postponed(id),
                         kind, subject, body_preview, data, created_at: ts,
@@ -10555,7 +10581,7 @@ impl App {
             .chain(self.send_queue.iter().filter_map(|q| q.postponed_id))
             .collect();
         let conn = self.db.conn.lock().unwrap();
-        self.draft_count = count_drafts(&conn, &drafts_drop_dir(), &in_flight);
+        (self.draft_count, self.unsent) = count_drafts(&conn, &drafts_drop_dir(), &in_flight);
     }
 
     /// Re-read the earliest due time. One query, only when the table
@@ -10580,9 +10606,9 @@ impl App {
             self.last_sched_check = now;
             self.take_phone_sends(now);
             self.refresh_next_send_at();
-            let before = self.draft_count;
+            let before = (self.draft_count, self.unsent.len());
             self.refresh_draft_count();
-            if self.draft_count != before { self.render_top_bar(); }
+            if (self.draft_count, self.unsent.len()) != before { self.render_top_bar(); }
         }
         match self.next_send_at {
             Some(at) if at <= now => {}
@@ -12449,8 +12475,16 @@ impl App {
                                     continue;
                                 }
                                 "ESC" => {
-                                    self.drop_draft_row();
-                                    self.set_feedback("Cancelled", tc.feedback_info);
+                                    // A recalled draft goes back where it was:
+                                    // Esc here once lost a mail that had failed
+                                    // to send. A new one is thrown away.
+                                    if recalled {
+                                        self.draft_row = None;
+                                        self.set_feedback("Kept in the drafts (+ to recall)", tc.feedback_info);
+                                    } else {
+                                        self.drop_draft_row();
+                                        self.set_feedback("Cancelled", tc.feedback_info);
+                                    }
                                     break;
                                 }
                                 _ => {
@@ -12680,14 +12714,19 @@ impl App {
                 // The compose-format text is used (NOT rfc_msg / tmpfile,
                 // which hold assembled MIME that won't round-trip).
                 log::info(&format!("SMTP send failed for {}: {}", ps.to_display, msg));
-                let saved = if ps.postponed_id.is_some() {
+                // The row is marked, so the top line says so until the
+                // draft is sent or deleted.
+                let saved = if let Some(id) = ps.postponed_id {
+                    let conn = self.db.conn.lock().unwrap();
+                    let _ = conn.execute("UPDATE postponed SET failed = ? WHERE id = ?",
+                        rusqlite::params![ps.to_display, id]);
                     true                      // already on disk since the compose
                 } else if !ps.compose_draft.trim().is_empty() {
                     let now = database::now_secs();
                     let conn = self.db.conn.lock().unwrap();
                     let ok = conn.execute(
-                        "INSERT INTO postponed (data, created_at) VALUES (?, ?)",
-                        rusqlite::params![ps.compose_draft, now],
+                        "INSERT INTO postponed (data, created_at, failed) VALUES (?, ?, ?)",
+                        rusqlite::params![ps.compose_draft, now, ps.to_display],
                     ).is_ok();
                     drop(conn);
                     ok
@@ -12710,6 +12749,7 @@ impl App {
         self.sent_note = self.feedback_message.clone();
         // Next one straight onto the wire; it repaints the badge itself.
         self.start_next_send();
+        self.refresh_draft_count();
         if self.pending_send.is_none() { self.render_top_bar(); }
     }
 
@@ -17677,17 +17717,21 @@ fn the_top_line_counts_the_drafts_that_plus_lists() {
     std::fs::create_dir_all(dir.join("send")).unwrap();
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch("CREATE TABLE postponed (id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER,
-        data TEXT NOT NULL, created_at INTEGER NOT NULL);
+        data TEXT NOT NULL, created_at INTEGER NOT NULL, failed TEXT);
         CREATE TABLE scheduled (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
         data TEXT NOT NULL, send_at INTEGER NOT NULL, created_at INTEGER NOT NULL, last_error TEXT);
         INSERT INTO postponed (data, created_at) VALUES ('a', 1), ('b', 2);
         INSERT INTO scheduled (kind, data, send_at, created_at) VALUES ('email', 'c', 9, 1);").unwrap();
     // Two postponed, one scheduled, one file; the dotfile and the folder are not drafts.
-    assert_eq!(count_drafts(&conn, &dir, &[]), 4);
+    assert_eq!(count_drafts(&conn, &dir, &[]).0, 4);
     // A postponed row on its way out is hidden in `+`, so it is not counted.
-    assert_eq!(count_drafts(&conn, &dir, &[1]), 3);
+    assert_eq!(count_drafts(&conn, &dir, &[1]).0, 3);
     // No drop folder: the rows alone.
-    assert_eq!(count_drafts(&conn, &dir.join("none"), &[]), 3);
+    assert_eq!(count_drafts(&conn, &dir.join("none"), &[]).0, 3);
+    // A failed send is named until its row goes, and not while it is on the wire again.
+    conn.execute("UPDATE postponed SET failed = 'Alice' WHERE id = 2", []).unwrap();
+    assert_eq!(count_drafts(&conn, &dir, &[]).1, vec!["Alice".to_string()]);
+    assert!(count_drafts(&conn, &dir, &[2]).1.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
