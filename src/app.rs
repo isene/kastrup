@@ -3171,6 +3171,7 @@ impl App {
                 if self.last_read_sync.elapsed().as_secs() >= 5 {
                     self.last_read_sync = std::time::Instant::now();
                     let ours = self.db.take_read_dirty();
+                    let mut gone = Vec::new();
                     if let Some(ref mut rs) = self.read_sync {
                         if ours || rs.others_changed() {
                             if rs.sync(&self.db) > 0 {
@@ -3180,7 +3181,17 @@ impl App {
                                 self.db.take_read_dirty();
                                 self.messages_dirty.store(true, Ordering::Relaxed);
                             }
+                            gone = rs.take_gone();
                         }
+                    }
+                    // Mail deleted on the phone goes the way `d` sends
+                    // it, files and all. The user's own marks wait.
+                    if !gone.is_empty() {
+                        log::info(&format!("phone deleted {} message(s)", gone.len()));
+                        let mine = std::mem::take(&mut self.delete_marked);
+                        self.delete_marked.extend(gone.iter().copied());
+                        self.purge_deleted();
+                        self.delete_marked = mine.into_iter().filter(|id| !gone.contains(id)).collect();
                     }
                 }
                 // Surface phone delivery results for queued gateway replies.
