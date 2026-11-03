@@ -1998,6 +1998,25 @@ fn ensure_slack_source(db: &Arc<Database>) {
 /// how one gets copied out of a note or a chat, and the bare number is
 /// what is left after trimming it. One parser, so the command line and
 /// the `#` prompt cannot disagree about what counts.
+/// Mail senders whose name or address has `query`, newest first, one row
+/// per address: (address, name).
+fn email_contacts(db: &Database, query: &str) -> Vec<(String, String)> {
+    let conn = db.conn.lock().unwrap();
+    let rows: Vec<(String, String)> = conn.prepare(
+        "SELECT DISTINCT sender, sender_name FROM messages \
+         WHERE (sender_name LIKE ?1 OR sender LIKE ?1) AND sender LIKE '%@%' \
+         ORDER BY timestamp DESC LIMIT 20"
+    ).ok().and_then(|mut stmt| {
+        let pattern = format!("%{}%", query);
+        stmt.query_map(rusqlite::params![pattern], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1).unwrap_or_default()))
+        }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect())
+    }).unwrap_or_default();
+    drop(conn);
+    let mut seen = std::collections::HashSet::new();
+    rows.into_iter().filter(|(email, _)| seen.insert(email.to_lowercase())).collect()
+}
+
 /// Where the aliases live: the config's `alias_file`, else `~/.kastrup/aliases`.
 fn alias_path(cfg: &Config) -> std::path::PathBuf {
     if cfg.alias_file.trim().is_empty() {
@@ -2805,6 +2824,23 @@ pub fn finish(mut app: App) {
 
 impl App {
     /// Under gluon: the tab names to start the top line with.
+    /// Who a short name may be, for a program beside kastrup (gluon's
+    /// calendar): the alias of that name, else the mail senders that match,
+    /// as `Name <address>`. The alias file is read on each call, so an edit
+    /// to it counts at once.
+    pub fn contact_lookup(&self) -> Box<dyn Fn(&str) -> Vec<String>> {
+        let db = self.db.clone();
+        let path = alias_path(&self.config);
+        Box::new(move |name| {
+            if let Some(full) = load_aliases(&path).get(&name.to_lowercase()) {
+                return vec![full.clone()];
+            }
+            email_contacts(&db, name).into_iter()
+                .map(|(email, n)| if n.is_empty() { email } else { format!("{n} <{email}>") })
+                .collect()
+        })
+    }
+
     pub fn set_tab_line(&mut self, tabs: Option<String>) {
         self.tab_line = tabs;
     }
@@ -11410,21 +11446,12 @@ impl App {
             // gmail/imap correspondent from the picker. Non-email composes
             // (Discord, Slack, RSS, etc.) filter to the same source plugin
             // so an IM compose doesn't suggest an email address.
-            let conn = self.db.conn.lock().unwrap();
             let stype = self.compose_source_type.as_deref().unwrap_or("email");
             let is_email = matches!(stype, "email" | "maildir" | "imap" | "gmail");
             let matches: Vec<(String, String)> = if is_email {
-                conn.prepare(
-                    "SELECT DISTINCT sender, sender_name FROM messages \
-                     WHERE (sender_name LIKE ?1 OR sender LIKE ?1) AND sender LIKE '%@%' \
-                     ORDER BY timestamp DESC LIMIT 20"
-                ).ok().and_then(|mut stmt| {
-                    let pattern = format!("%{}%", addr);
-                    stmt.query_map(rusqlite::params![pattern], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1).unwrap_or_default()))
-                    }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect())
-                }).unwrap_or_default()
+                email_contacts(&self.db, addr)
             } else {
+                let conn = self.db.conn.lock().unwrap();
                 // sources.plugin_type, not source_type — the column was
                 // renamed in v0.1.82 and this branch was missed.
                 conn.prepare(
@@ -11439,7 +11466,6 @@ impl App {
                     }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect())
                 }).unwrap_or_default()
             };
-            drop(conn);
 
             // Deduplicate by sender
             let mut seen = std::collections::HashSet::new();
@@ -11468,21 +11494,12 @@ impl App {
         // Mirror the address-pool rules from expand_address_field: an email
         // compose (any of email/maildir/imap/gmail) searches every email
         // contact; other source types filter to their own plugin family.
-        let conn = self.db.conn.lock().unwrap();
         let stype = self.compose_source_type.as_deref().unwrap_or("email");
         let is_email = matches!(stype, "email" | "maildir" | "imap" | "gmail");
         let matches: Vec<(String, String)> = if is_email {
-            conn.prepare(
-                "SELECT DISTINCT sender, sender_name FROM messages \
-                 WHERE (sender_name LIKE ?1 OR sender LIKE ?1) AND sender LIKE '%@%' \
-                 ORDER BY timestamp DESC LIMIT 20"
-            ).ok().and_then(|mut stmt| {
-                let pattern = format!("%{}%", query);
-                stmt.query_map(rusqlite::params![pattern], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1).unwrap_or_default()))
-                }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect())
-            }).unwrap_or_default()
+            email_contacts(&self.db, query)
         } else {
+            let conn = self.db.conn.lock().unwrap();
             // sources.plugin_type, not source_type — the column was
             // renamed in v0.1.82 and this branch was missed.
             conn.prepare(
@@ -11497,7 +11514,6 @@ impl App {
                 }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect())
             }).unwrap_or_default()
         };
-        drop(conn);
 
         let mut seen = std::collections::HashSet::new();
         let unique: Vec<_> = matches.into_iter().filter(|(email, _)| {
