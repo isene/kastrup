@@ -308,6 +308,17 @@ fn count_drafts(conn: &rusqlite::Connection, dir: &std::path::Path, in_flight: &
     (n, unsent)
 }
 
+/// The messages `s` files: every tagged one, shown or not (gluon shows
+/// one message at a time), or else the one under the cursor.
+fn ids_to_file(tagged: &HashSet<i64>, cursor: Option<i64>) -> Vec<i64> {
+    if tagged.is_empty() {
+        return cursor.into_iter().collect();
+    }
+    let mut ids: Vec<i64> = tagged.iter().copied().collect();
+    ids.sort_unstable();
+    ids
+}
+
 fn drafts_drop_dir() -> std::path::PathBuf {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
@@ -3003,6 +3014,20 @@ impl App {
     /// scheduled), the number in kastrup's own top bar.
     pub fn draft_count(&self) -> usize {
         self.draft_count
+    }
+
+    /// Under gluon: whether a message is tagged, and tag it or not, so a
+    /// t at Home is kastrup's tag and s there files every tagged message.
+    pub fn is_tagged(&self, id: i64) -> bool {
+        self.tagged.contains(&id)
+    }
+
+    pub fn tag(&mut self, id: i64, on: bool) {
+        if on {
+            self.tagged.insert(id);
+        } else {
+            self.tagged.remove(&id);
+        }
     }
 
     pub fn unsent_note(&self) -> Option<String> {
@@ -7065,24 +7090,14 @@ impl App {
         // filtered_messages by id so we route the actual message
         // under the cursor, not whatever happens to sit at the same
         // numeric offset in filtered_messages.
-        let msg_ids: Vec<i64> = if !self.tagged.is_empty() {
-            self.filtered_messages.iter()
-                .filter(|m| self.tagged.contains(&m.id))
+        let cursor_id = if self.show_threaded {
+            self.display_messages.get(self.index)
+                .filter(|m| !m.is_header)
                 .map(|m| m.id)
-                .collect()
         } else {
-            let cursor_id = if self.show_threaded {
-                self.display_messages.get(self.index)
-                    .filter(|m| !m.is_header)
-                    .map(|m| m.id)
-            } else {
-                self.filtered_messages.get(self.index).map(|m| m.id)
-            };
-            match cursor_id {
-                Some(id) => vec![id],
-                None => return,
-            }
+            self.filtered_messages.get(self.index).map(|m| m.id)
         };
+        let msg_ids = ids_to_file(&self.tagged, cursor_id);
 
         if msg_ids.is_empty() { return; }
 
@@ -17379,6 +17394,14 @@ mod tests {
         // And a real name is a real name.
         m.sender_name = Some("Rons Org".to_string());
         assert_eq!(m.display_name(), "Rons Org");
+    }
+
+    #[test]
+    fn s_files_every_tagged_message_shown_or_not() {
+        let tagged: HashSet<i64> = [9, 5].into();
+        assert_eq!(ids_to_file(&tagged, Some(7)), vec![5, 9]);
+        assert_eq!(ids_to_file(&HashSet::new(), Some(7)), vec![7]);
+        assert!(ids_to_file(&HashSet::new(), None).is_empty());
     }
 
     #[test]
