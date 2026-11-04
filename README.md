@@ -192,7 +192,7 @@ link are used. Any other header the link asks for is left out.
 | **`:`** | **Colon prompt** — type any verb explicitly: `:claude PROMPT`, `:search QUERY`, `:chat`, `:triage`, `:q`/`:quit` |
 | Esc | Clear sticky search, return to current view |
 | **z** | **AI triage** — Claude reads the current message (+ optional hint) and proposes calendar events / hyperlist todos; multi-pick preview before committing to `~/.tock/incoming/` and `~/.tasks/todo.hl` |
-| Z | Open in Tock (regex date capture → calendar event) |
+| Z | Open in Tock (regex date capture → calendar event). On an invite, with `invite_accept: <command>` in the config, it asks: a accepts (the command gets the UID as its last word), t sends to Tock |
 | **`:triage`** | Show the most recent 20 triage decisions from `~/.kastrup/triage.log` |
 
 ### UI

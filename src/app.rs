@@ -3493,7 +3493,7 @@ impl App {
             }
             "k" => { self.external_react(false); }
             "I" => { self.claude_command(); }
-            "Z" => { self.open_in_tock(); }
+            "Z" => { self.z_key(); }
             "z" => { self.triage_message(); }
 
             // UI
@@ -14945,6 +14945,55 @@ impl App {
     }
 
     // Batch L: Calendar/Tock
+    /// Z: on an invite, when `invite_accept` names a command, a choice
+    /// between accepting it and sending it to tock; else straight to tock.
+    fn z_key(&mut self) {
+        let invite = if self.config.invite_accept.is_empty() { None } else { self.current_invite() };
+        let Some(e) = invite else { return self.open_in_tock() };
+        self.bottom.say(&style::fg(" Invite: a=accept  t=to tock", 226));
+        match Input::getchr(Some(5)).as_deref() {
+            Some("a") => self.accept_invite(&e),
+            Some("t") => self.open_in_tock(),
+            _ => self.render_bottom_bar(),
+        }
+    }
+
+    /// The invite in the message under the cursor, if it asks for an answer.
+    fn current_invite(&self) -> Option<mail::ical::Event> {
+        let msg = self.current_filtered_index().and_then(|i| self.filtered_messages.get(i))?;
+        let file = msg.metadata.get("maildir_file")?.as_str()?;
+        let raw = std::fs::read_to_string(file).ok()?;
+        let ical = std::cell::RefCell::new(String::new());
+        mail::mime::extract_mime_text_with(&raw, &|c| { ical.borrow_mut().push_str(c); String::new() });
+        let e = mail::ical::Event::parse(&ical.borrow());
+        (e.method.eq_ignore_ascii_case("REQUEST") && !e.uid.is_empty()).then_some(e)
+    }
+
+    /// Run `invite_accept` with the UID as its last word. No shell: the
+    /// UID comes from whoever sent the mail.
+    fn accept_invite(&mut self, e: &mail::ical::Event) {
+        let mut words = self.config.invite_accept.split_whitespace();
+        let Some(cmd) = words.next() else { return };
+        self.bottom.say(&style::fg(&format!(" Accepting {}...", e.summary), 226));
+        let out = std::process::Command::new(cmd).args(words).arg(&e.uid).output();
+        let tc = &self.config.theme_colors;
+        match out {
+            Ok(o) if o.status.success() => {
+                let (msg, c) = (format!("Accepted: {}", e.summary), tc.feedback_ok);
+                self.set_feedback(&msg, c);
+            }
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or("failed").to_string();
+                let c = tc.feedback_warn;
+                self.set_feedback(&format!("Accept failed: {err}"), c);
+            }
+            Err(err) => {
+                let c = tc.feedback_warn;
+                self.set_feedback(&format!("Accept failed: {cmd}: {err}"), c);
+            }
+        }
+    }
+
     fn open_in_tock(&mut self) {
         let msg = match self.current_filtered_index().and_then(|i| self.filtered_messages.get(i)) {
             Some(m) => m.clone(),

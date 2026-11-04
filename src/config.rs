@@ -216,6 +216,9 @@ pub struct Config {
     pub editor_args: String,
     pub default_email: String,
     pub smtp_command: String,
+    /// The command Z runs to accept an invite, with its UID added as the
+    /// last word, e.g. `cal-dualog accept`. Empty: Z only sends to tock.
+    pub invite_accept: String,
     pub confirm_purge: bool,
     /// The mutt-style alias file `@` opens and sending expands. Default
     /// `~/.kastrup/aliases`.
@@ -287,6 +290,7 @@ impl Default for Config {
             editor_args: String::new(),
             default_email: String::new(),
             smtp_command: String::new(),
+            invite_accept: String::new(),
             confirm_purge: false,
             alias_file: String::new(),
             message_log: 10,
@@ -393,6 +397,7 @@ impl Config {
         data["colors"] = serde_json::Value::Object(colors_map);
         data["default_email"] = serde_json::json!(self.default_email);
         data["smtp_command"] = serde_json::json!(self.smtp_command);
+        data["invite_accept"] = serde_json::json!(self.invite_accept);
         data["download_folder"] = serde_json::json!(self.download_folder);
 
         // Save save_folders
@@ -476,6 +481,9 @@ impl Config {
         }
         if let Some(v) = yaml.get("smtp_command").and_then(|v| v.as_str()) {
             self.smtp_command = v.to_string();
+        }
+        if let Some(v) = yaml.get("invite_accept").and_then(|v| v.as_str()) {
+            self.invite_accept = v.to_string();
         }
         if let Some(v) = yaml.get("download_folder").and_then(|v| v.as_str()) {
             self.download_folder = v.to_string();
@@ -725,6 +733,7 @@ impl Config {
                     "default_view" => { self.default_view = val.to_string(); }
                     "default_email" => { self.default_email = val.to_string(); }
                     "smtp_command" => { self.smtp_command = val.to_string(); }
+                    "invite_accept" => { self.invite_accept = val.to_string(); }
                     "download_folder" => { self.download_folder = val.to_string(); }
                     _ => {}
                 }
