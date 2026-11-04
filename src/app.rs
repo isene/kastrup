@@ -2999,6 +2999,12 @@ impl App {
 
     /// "✗ Not sent to X" while a failed send waits in the drafts, with
     /// how many more. Gone once it is sent or deleted.
+    /// Under gluon: how many messages `+` lists (drafts, postponed and
+    /// scheduled), the number in kastrup's own top bar.
+    pub fn draft_count(&self) -> usize {
+        self.draft_count
+    }
+
     pub fn unsent_note(&self) -> Option<String> {
         let first = self.unsent.first()?;
         let mut who = first.clone();
