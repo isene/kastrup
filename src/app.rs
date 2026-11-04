@@ -1841,8 +1841,12 @@ pub struct App {
     last_sched_check: i64,
     /// What `count_drafts` gave last, shown as `[N]` at the end of the
     /// top line. Recounted at start, after a database write, in the
-    /// minute check and after `+`; the top line only reads it.
+    /// minute check, after `+`, and when the drop folder changes; the
+    /// top line only reads it.
     draft_count: usize,
+    /// The drop folder's mtime at the last look. A file put in or taken
+    /// out changes it, so one stat per wake finds a new draft.
+    drafts_mtime: Option<std::time::SystemTime>,
     /// Who each send that failed was for, newest first. Its draft keeps
     /// a red mark on the top line until it is sent or deleted.
     unsent: Vec<String>,
@@ -2631,6 +2635,7 @@ pub fn start(paint: bool) -> Option<App> {
         next_send_at: None,
         last_sched_check: 0,
         draft_count: 0,
+        drafts_mtime: None,
         unsent: Vec::new(),
         relay_kill: relay_kill.clone(),
         last_wall: std::time::SystemTime::now(),
@@ -10659,10 +10664,18 @@ impl App {
     /// simpler than queueing behind it.
     fn send_due_scheduled(&mut self) {
         let now = database::now_secs();
-        if now - self.last_sched_check >= 60 {
+        // A draft dropped in the folder shows at the next wake instead of
+        // within a minute: one stat, no read_dir or query unless it moved.
+        let drafts_mtime = std::fs::metadata(drafts_drop_dir()).and_then(|m| m.modified()).ok();
+        let drafts_moved = drafts_mtime != self.drafts_mtime;
+        self.drafts_mtime = drafts_mtime;
+        let minute = now - self.last_sched_check >= 60;
+        if minute {
             self.last_sched_check = now;
             self.take_phone_sends(now);
             self.refresh_next_send_at();
+        }
+        if minute || drafts_moved {
             let before = (self.draft_count, self.unsent.len());
             self.refresh_draft_count();
             if (self.draft_count, self.unsent.len()) != before { self.render_top_bar(); }
