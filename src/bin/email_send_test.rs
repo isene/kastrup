@@ -6,7 +6,7 @@
 //! Usage:
 //!   cargo run --release --bin email_send_test [from] [to] [file.eml|-]
 //!
-//! Defaults to from=geir@isene.com, to=same. A third argument sends that
+//! Defaults to from=`$default` in ~/.smtp.conf, to=same. A third argument sends that
 //! whole RFC822 message instead (`-` reads it from stdin). Writes the result to
 //! stdout and exits 0 on success, 1 on failure (with the error
 //! message on stderr).
@@ -16,7 +16,10 @@ mod email_send;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let from = args.first().cloned().unwrap_or_else(|| "geir@isene.com".to_string());
+    let from = args.first().cloned().or_else(email_send::default_from).unwrap_or_else(|| {
+        eprintln!("[!] give a from address, or set $default in ~/.smtp.conf");
+        std::process::exit(1)
+    });
     let to = args.get(1).cloned().unwrap_or_else(|| from.clone());
 
     let given = match args.get(2).map(String::as_str) {

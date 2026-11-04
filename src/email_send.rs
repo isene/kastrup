@@ -176,9 +176,19 @@ pub fn default_safedir() -> PathBuf {
     PathBuf::from(home).join(".kastrup").join("oauth")
 }
 
-/// Default "From" email used when the requested account's OAuth
-/// files don't exist. Mirrors the script's `$default` fallback.
-pub const DEFAULT_FROM: &str = "geir@isene.com";
+/// The account whose OAuth files stand in when the requested one has
+/// none: `$default` in ~/.smtp.conf, the file the Ruby script reads.
+pub fn default_from() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    parse_default_from(&std::fs::read_to_string(Path::new(&home).join(".smtp.conf")).ok()?)
+}
+
+fn parse_default_from(conf: &str) -> Option<String> {
+    conf.lines().find_map(|l| {
+        let v = l.trim().strip_prefix("$default")?.trim_start().strip_prefix('=')?;
+        Some(v.trim().trim_matches(|c| c == '"' || c == '\'').to_string()).filter(|v| !v.is_empty())
+    })
+}
 
 /// High-level: send a complete RFC822 message from a Gmail OAuth
 /// account. Returns `Ok(())` on a successful 250 to end-of-data.
@@ -218,12 +228,14 @@ fn ensure_crypto_provider() {
 
 /// Read `{safedir}/{from}.json` (Google client_secret `web` block)
 /// and `{safedir}/{from}.txt` (refresh_token). Falls back to
-/// `{safedir}/{DEFAULT_FROM}.json` when the per-email file is absent
+/// the `default_from()` account's files when the per-email file is absent
 /// — same lookup as the Ruby script so existing setups keep working.
 fn load_oauth_creds(safedir: &Path, from: &str) -> Result<(String, String, String), String> {
     let mut json_path = safedir.join(format!("{}.json", from));
     if !json_path.exists() {
-        json_path = safedir.join(format!("{}.json", DEFAULT_FROM));
+        if let Some(d) = default_from() {
+            json_path = safedir.join(format!("{}.json", d));
+        }
     }
     let txt_path = json_path.with_extension("txt");
 
@@ -501,6 +513,14 @@ mod tests {
         assert!(matches!(transport_for("gmail"), Transport::GmailXoauth2));
         assert!(matches!(transport_for(""), Transport::GmailXoauth2));
         assert!(matches!(transport_for("~/bin/relay -t"), Transport::Command(c) if c == "~/bin/relay -t"));
+    }
+
+    #[test]
+    fn the_default_account_comes_from_smtp_conf() {
+        assert_eq!(parse_default_from("$safedir = \"/s\"\n$default = \"me@example.com\"\n").as_deref(), Some("me@example.com"));
+        assert_eq!(parse_default_from("$default='a@b.c'").as_deref(), Some("a@b.c"));
+        assert_eq!(parse_default_from("$defaults = \"x@y.z\""), None);
+        assert_eq!(parse_default_from("$default = \"\""), None);
     }
 
     #[test]

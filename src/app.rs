@@ -17377,7 +17377,7 @@ mod tests {
 
     #[test]
     fn attach_headers_come_out_of_an_email_draft() {
-        let draft = "From: Geir Isene <geir@isene.com>\n\
+        let draft = "From: Geir Isene <me@example.com>\n\
                      To: alice@example.com\n\
                      Attach: /tmp/one.pdf\n\
                      Subject: Follow-up\n\
@@ -17403,7 +17403,7 @@ mod tests {
     // saved draft had lost its attachment (2026-10-15).
     #[test]
     fn a_saved_draft_keeps_its_attachments() {
-        let draft = "From: geir@isene.com\nTo: alice@example.com\nSubject: Fwd: News\n\n[Forwarded message attached]\n";
+        let draft = "From: me@example.com\nTo: alice@example.com\nSubject: Fwd: News\n\n[Forwarded message attached]\n";
         let atts = vec!["/tmp/kastrup_fwd_7.eml".to_string(), "/tmp/two.pdf".to_string()];
         let saved = put_email_attach_headers(draft, &atts);
         let (back, got) = take_email_attach_headers(&saved);
@@ -17414,7 +17414,7 @@ mod tests {
 
     #[test]
     fn kastrup_link_headers_come_out_of_a_drop_draft() {
-        let draft = "From: geir@isene.com\n\
+        let draft = "From: me@example.com\n\
                      X-Kastrup-Reply-To: 7964934\n\
                      To: alice@example.com\n\
                      X-Kastrup-Forward-Of: 11, 12\n\
@@ -17426,7 +17426,7 @@ mod tests {
         assert!(!stripped.contains("X-Kastrup-Reply-To: 7964934"));
         assert!(!stripped.contains("Forward-Of"));
         assert!(stripped.contains("X-Kastrup-Reply-To: 99 in the body stays."));
-        assert!(stripped.starts_with("From: geir@isene.com\nTo: alice@example.com"));
+        assert!(stripped.starts_with("From: me@example.com\nTo: alice@example.com"));
     }
 
     #[test]
@@ -17451,7 +17451,7 @@ mod tests {
             "See attached <CV-EN.pdf>",
             "<CV-EN.pdf>",
             // Not filenames: an address, a URL, a bare word.
-            "mail me at<geir@isene.com>",
+            "mail me at<me@example.com>",
             "my site is<https://isene.com>",
             "the tag is<div>",
             // An extension is one to five alphanumerics, no more.

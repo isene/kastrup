@@ -2370,30 +2370,30 @@ pub(crate) mod tests {
         assert_eq!(link_of(&db, "out1").1, Some(id_of(&db, "in1")), "sent copy linked");
 
         // 2. No header at all: same subject, going to the original sender.
-        db.insert_message(1, &msg("in2", "alice@x.com", "geir@isene.com",
+        db.insert_message(1, &msg("in2", "alice@x.com", "me@example.com",
             "Project X", "Geir", t, "MID-3", None));
-        db.insert_message(1, &msg("out2", "geir@isene.com", "alice@x.com",
+        db.insert_message(1, &msg("out2", "me@example.com", "alice@x.com",
             "Re: Project X", "Sent.2026-08", t + 900, "MID-4", None));
         assert_eq!(link_of(&db, "in2").0, 1, "subject fallback marked replied");
         assert_eq!(link_of(&db, "out2").1, Some(id_of(&db, "in2")));
 
         // 3. Same subject, but written to somebody else — no link.
-        db.insert_message(1, &msg("in3", "carol@x.com", "geir@isene.com",
+        db.insert_message(1, &msg("in3", "carol@x.com", "me@example.com",
             "Budget", "Geir", t, "MID-5", None));
-        db.insert_message(1, &msg("out3", "geir@isene.com", "dave@x.com",
+        db.insert_message(1, &msg("out3", "me@example.com", "dave@x.com",
             "Re: Budget", "Sent.2026-08", t + 900, "MID-6", None));
         assert_eq!(link_of(&db, "in3").0, 0, "wrong recipient must not link");
         assert_eq!(link_of(&db, "out3").1, None);
 
         // 4. Same subject and person, but months apart — outside the window.
-        db.insert_message(1, &msg("in4", "erik@x.com", "geir@isene.com",
+        db.insert_message(1, &msg("in4", "erik@x.com", "me@example.com",
             "Old thread", "Geir", t, "MID-7", None));
-        db.insert_message(1, &msg("out4", "geir@isene.com", "erik@x.com",
+        db.insert_message(1, &msg("out4", "me@example.com", "erik@x.com",
             "Re: Old thread", "Sent.2026-08", t + 40 * 86400, "MID-8", None));
         assert_eq!(link_of(&db, "in4").0, 0, "stale match must not link");
 
         // 5. An incoming mail is never linked, however it looks.
-        db.insert_message(1, &msg("in5", "frank@x.com", "geir@isene.com",
+        db.insert_message(1, &msg("in5", "frank@x.com", "me@example.com",
             "Re: Project X", "Geir", t + 1200, "MID-9", Some("MID-3")));
         assert_eq!(link_of(&db, "in5").1, None, "only sent mail links");
 
