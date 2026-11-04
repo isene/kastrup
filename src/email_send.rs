@@ -505,8 +505,8 @@ mod tests {
 
     #[test]
     fn a_graph_value_names_its_login_file() {
-        let home = std::env::var("HOME").unwrap_or_default();
         assert!(matches!(transport_for("graph:/x/login.json"), Transport::Graph(p) if p == Path::new("/x/login.json")));
-        assert!(matches!(transport_for("graph: ~/m.json"), Transport::Graph(p) if p == PathBuf::from(format!("{}/m.json", home))));
+        // Other tests change HOME while this one runs, so check that ~ was expanded, not to what.
+        assert!(matches!(transport_for("graph: ~/m.json"), Transport::Graph(p) if !p.starts_with("~") && p.ends_with("m.json")));
     }
 }
