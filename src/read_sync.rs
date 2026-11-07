@@ -20,6 +20,12 @@
 //! Message-ID, the save key (as `s1` uses `1`) and a time per line. A
 //! mail already in that folder is left alone, so a line can stay.
 //!
+//! Sent mail goes both ways through `sent/`: each side writes its own as
+//! `<device>_<time>.eml`, in the drafts' plain format, and prunes its own
+//! past the window. kastrup files a phone's in the Sent maildir and
+//! renames it `….eml.filed`, so it is filed once and the phone still
+//! lists it. One more `stat()` per idle tick, of `sent/`.
+//!
 //! Storage is one file per device in a folder Syncthing carries, so
 //! there is never a second writer for it to leave a `.sync-conflict-`
 //! copy of. The merge itself is [`mail::read_state`], shared with the
@@ -62,6 +68,10 @@ pub struct ReadSync {
     /// Our delete list for the phone, and what we last wrote to it.
     deletes_file: PathBuf,
     deletes_last: String,
+    /// Sent mail from both sides, and its mtime when last read.
+    sent_dir: PathBuf,
+    sent_mtime: i64,
+    host: String,
 }
 
 fn mtime(p: &Path) -> i64 {
@@ -94,10 +104,12 @@ impl ReadSync {
         let views_last = std::fs::read_to_string(&views_file).unwrap_or_default();
         let deletes_file = dir.join(format!("mail-delete-{}.txt", host));
         let deletes_last = std::fs::read_to_string(&deletes_file).unwrap_or_default();
+        let sent_dir = dir.join("sent");
         let mut rs = Self {
             dir, mine, marks, others: Vec::new(), drops: Vec::new(), gone: Vec::new(),
             saves: Vec::new(), filed: Vec::new(), dir_mtime: 0,
             days: days.max(1), views_file, views_last, deletes_file, deletes_last,
+            sent_dir, sent_mtime: 0, host,
         };
         rs.rescan();
         Some(rs)
@@ -196,6 +208,35 @@ impl ReadSync {
         std::mem::take(&mut self.gone)
     }
 
+    /// Mail a phone sent that is not filed here yet, with its text. One
+    /// `stat()` when nothing came.
+    pub fn sent_from_phone(&mut self) -> Vec<(PathBuf, String)> {
+        let m = mtime(&self.sent_dir);
+        if m == self.sent_mtime { return Vec::new(); }
+        self.sent_mtime = m;
+        let Ok(entries) = std::fs::read_dir(&self.sent_dir) else { return Vec::new() };
+        entries.flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| to_file(n, &self.host)))
+            .filter_map(|p| std::fs::read_to_string(&p).ok().map(|t| (p, t)))
+            .collect()
+    }
+
+    /// Put a copy of a mail sent here where the phone lists it, and drop
+    /// our own copies past the window.
+    pub fn share_sent(&self, draft: &str) {
+        let _ = std::fs::create_dir_all(&self.sent_dir);
+        let now = now_secs();
+        let _ = std::fs::write(self.sent_dir.join(format!("{}_{}.eml", self.host, now)), draft);
+        let mine = format!("{}_", self.host);
+        if let Ok(entries) = std::fs::read_dir(&self.sent_dir) {
+            for p in entries.flatten().map(|e| e.path()) {
+                let ours = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&mine));
+                if ours && mtime(&p) < now - self.days * 86_400 { let _ = std::fs::remove_file(&p); }
+            }
+        }
+    }
+
     /// Rows a phone saved to a folder, with the save key, once.
     pub fn take_filed(&mut self) -> Vec<(i64, String)> {
         std::mem::take(&mut self.filed)
@@ -254,6 +295,23 @@ pub fn views_json(views: &[PhoneView], sources: &[(i64, String)], save: &[(Strin
         sources.iter().map(|(id, kind)| (id.to_string(), kind.as_str())).collect();
     let save: BTreeMap<&str, &str> = save.iter().map(|(k, n)| (k.as_str(), n.as_str())).collect();
     serde_json::json!({ "views": list, "sources": sources, "mail": mail, "save": save }).to_string()
+}
+
+/// Whether a file in `sent/` is another device's mail still to file:
+/// a `.eml`, not hidden, and not one of ours.
+fn to_file(name: &str, host: &str) -> bool {
+    name.ends_with(".eml") && !name.starts_with('.') && !name.starts_with(&format!("{host}_"))
+}
+
+/// The Message-ID a mail answers, from its `In-Reply-To` header.
+pub fn in_reply_to(text: &str) -> Option<String> {
+    text.lines()
+        .take_while(|l| !l.trim().is_empty())
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case("in-reply-to").then(|| v.trim().trim_matches(['<', '>']).to_string())
+        })
+        .filter(|m| !m.is_empty())
 }
 
 /// Our delete list: one Message-ID per line, sorted, so the same
@@ -492,6 +550,21 @@ mod tests {
     fn no_folder_means_no_feature() {
         assert!(ReadSync::new("", 30).is_none());
         assert!(ReadSync::new("/nonexistent/kastrup/sync", 30).is_none());
+    }
+
+    #[test]
+    fn only_another_devices_unfiled_sent_mail_is_filed() {
+        assert!(to_file("phone_100.eml", "juba"));
+        assert!(!to_file("juba_100.eml", "juba"), "our own");
+        assert!(!to_file("phone_100.eml.filed", "juba"), "filed already");
+        assert!(!to_file(".syncthing.phone_1.eml.tmp", "juba"));
+    }
+
+    #[test]
+    fn a_reply_names_what_it_answers() {
+        let text = "From: a@x\nin-reply-to: <q@x>\nSubject: Re: Hi\n\nIn-Reply-To: <not@x>\n";
+        assert_eq!(in_reply_to(text).as_deref(), Some("q@x"));
+        assert_eq!(in_reply_to("From: a@x\n\nBody\n"), None);
     }
 
     #[test]

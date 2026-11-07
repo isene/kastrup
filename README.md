@@ -273,6 +273,13 @@ Message-ID, the key and a time per line, and kastrup files each mail as
 goes to the phone in `mail-delete-<host>.txt`, one Message-ID per line,
 and the phone takes it off its list.
 
+Sent mail goes both ways through `sent/` in the same folder. Each side
+writes a copy of what it sends as `<device>_<time>.eml`, in the drafts'
+plain format, and removes its own past the window. kastrup files the
+phone's copies in its Sent maildir, marks the mail they answer as
+answered, and renames them `….eml.filed`. The phone lists both in Sent.
+The cost is one more `stat()` per idle tick, of `sent/`.
+
 ### Drafts sent from the phone
 
 Make the drafts drop folder a link into the shared folder, and the phone

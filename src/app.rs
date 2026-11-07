@@ -3334,6 +3334,21 @@ impl App {
                         }
                     }
                     if !filed.is_empty() { self.file_for_phone(&filed); }
+                    // Mail the phone sent: into our Sent folder, and its
+                    // original marked answered.
+                    let sent = self.read_sync.as_mut().map(|rs| rs.sent_from_phone()).unwrap_or_default();
+                    if !sent.is_empty() {
+                        let since = self.read_sync.as_ref().map_or(0, |rs| rs.since());
+                        for (path, text) in &sent {
+                            self.save_to_sent(text);
+                            if let Some(mid) = read_sync::in_reply_to(text) {
+                                self.db.mark_replied_by_message_id(&mid, since);
+                            }
+                            let _ = std::fs::rename(path, path.with_extension("eml.filed"));
+                        }
+                        log::info(&format!("filed {} mail(s) the phone sent", sent.len()));
+                        self.messages_dirty.store(true, Ordering::Relaxed);
+                    }
                     // Mail deleted on the phone goes the way `d` sends
                     // it, files and all. The user's own marks wait.
                     if !gone.is_empty() {
@@ -12819,6 +12834,9 @@ impl App {
         match outcome {
             Ok(()) => {
                 self.save_to_sent(&ps.rfc_msg);
+                if !ps.compose_draft.trim().is_empty() {
+                    if let Some(rs) = &self.read_sync { rs.share_sent(&ps.compose_draft); }
+                }
                 let _ = std::fs::remove_file(&ps.tmpfile);
                 // The wire said it went. Now, and not before, the draft
                 // stops existing.

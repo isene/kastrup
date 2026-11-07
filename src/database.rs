@@ -1284,6 +1284,16 @@ impl Database {
         let _ = conn.execute(&sql, param_refs.as_slice());
     }
 
+    /// Mark the mail with this Message-ID answered, looking only at mail
+    /// newer than `since`, which the timestamp index keeps quick.
+    pub fn mark_replied_by_message_id(&self, mid: &str, since: i64) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE messages SET replied = 1 WHERE timestamp > ? AND json_extract(metadata, '$.message_id') = ?",
+            params![since, mid],
+        );
+    }
+
     /// Delete messages by IDs
     pub fn delete_messages(&self, ids: &[i64]) {
         if ids.is_empty() { return; }
