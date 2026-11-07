@@ -254,6 +254,18 @@ machine would work; it is the phones that stay quiet.
 Idle cost is one atomic load plus a couple of `stat()`s every 5 s. The
 database is queried only when a mark has actually moved on one side.
 
+### Views shared with the phone
+
+kastrup also writes `mail-views-<device>.json` in the same folder: the
+views keyed 1 to 9 and 0, each with its name, colour and rules, and the
+Message-IDs of the recent mail each one takes. The phone's gluon files
+its mail under the same views, in the same colours. It reads the rules
+itself for chats and feeds, since the two sides give a relayed chat
+different ids.
+
+The file is rebuilt when a view changes or new mail lands, and written
+only when its content changed.
+
 ### Drafts sent from the phone
 
 Make the drafts drop folder a link into the shared folder, and the phone

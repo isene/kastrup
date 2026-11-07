@@ -849,6 +849,28 @@ fn apply_view_rules(rules: &[serde_json::Value], filters: &mut Filters) {
     }
 }
 
+/// The views keyed 1 to 9 and 0, in that order, as the phone gets them.
+fn phone_views(
+    db: &database::Database,
+    views: &[database::View],
+    since: i64,
+) -> Vec<read_sync::PhoneView> {
+    let mut out: Vec<read_sync::PhoneView> = views.iter().filter_map(|v| {
+        let key = v.key_binding.as_deref()?;
+        if key.len() != 1 || !key.as_bytes()[0].is_ascii_digit() { return None; }
+        let json: serde_json::Value = serde_json::from_str(&v.filters).unwrap_or_default();
+        let colour = match &json["top_bg"] {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            _ => String::new(),
+        };
+        let mail = db.view_message_ids(&parse_view_filters_json(&json), since);
+        Some(read_sync::PhoneView { key: key.to_string(), name: v.name.clone(), colour, filters: json, mail })
+    }).collect();
+    out.sort_by_key(|v| if v.key == "0" { 10 } else { v.key.parse::<u8>().unwrap_or(11) });
+    out
+}
+
 /// Parse a view's `filters` JSON into a Filters value. Honors both:
 ///
 /// * The legacy single-AND-group shape `{ "rules": [...] }`.
@@ -3204,11 +3226,20 @@ impl App {
                     if filters(&views) != filters(&self.views) {
                         self.messages_dirty.store(true, Ordering::Relaxed);
                     }
+                    let shape = |vs: &[crate::database::View]| vs.iter()
+                        .map(|v| (v.key_binding.clone(), v.name.clone(), v.filters.clone()))
+                        .collect::<Vec<_>>();
+                    let views_moved = shape(&views) != shape(&self.views);
                     self.views = views;
                     // A reply sent from here comes back from ws-bridge-listen
                     // stored as read, so no unread count below moves. A new
                     // newest id says a row landed: one seek on the key.
                     let top = self.db.max_message_id();
+                    // The phone's gluon files its own mail under these
+                    // views, so it hears of a new view and of new mail.
+                    if views_moved || top != self.last_max_id {
+                        self.publish_phone_views();
+                    }
                     if top != self.last_max_id {
                         if self.last_max_id > 0 {
                             self.notify_new(self.last_max_id);
@@ -10770,6 +10801,18 @@ impl App {
         for name in queue_phone_sends(&send, &conn, now) {
             log::info(&format!("phone send: {} queued", name));
         }
+    }
+
+    /// The digit views and which recent mail each takes, for the phone's
+    /// gluon. Ten small queries, run only when a view changed or new mail
+    /// landed; the file is written only when it would change.
+    fn publish_phone_views(&mut self) {
+        let Some(rs) = self.read_sync.as_mut() else { return };
+        let views = phone_views(&self.db, &self.views, rs.since());
+        let sources: Vec<(i64, String)> = self.db.get_sources(false).into_iter()
+            .map(|s| (s.id, s.plugin_type))
+            .collect();
+        rs.publish_views(&views, &sources);
     }
 
     /// Drop a draft from its backing store after the user loads it.

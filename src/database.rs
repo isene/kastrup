@@ -138,6 +138,50 @@ impl Drop for ReadConn<'_> {
     }
 }
 
+/// AND a view's filters onto `sql`. False when the view can match
+/// nothing (an empty branch list), so the caller returns no rows.
+///
+/// OR-of-AND-groups: when `branches` is set, each branch's single-AND
+/// fragment goes in parens, joined by `OR`. An empty branch matches
+/// everything and drops the whole OR. The top-level fields still apply
+/// on top: a branched view has to answer a search, and `/` sets
+/// content_pattern on the top-level struct. Dropping it turned a search
+/// in such a view into a plain re-list of the view.
+fn push_filters_where(
+    filters: &Filters,
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+) -> bool {
+    if let Some(branches) = &filters.branches {
+        if branches.is_empty() {
+            return false;
+        }
+        let mut parts: Vec<String> = Vec::with_capacity(branches.len());
+        let mut branch_params = Vec::new();
+        for b in branches {
+            let (frag, ps) = build_branch_where(b);
+            if frag.is_empty() {
+                parts.clear();
+                branch_params.clear();
+                break;
+            }
+            parts.push(format!("({})", frag));
+            branch_params.extend(ps);
+        }
+        if !parts.is_empty() {
+            sql.push_str(&format!(" AND ({})", parts.join(" OR ")));
+            params.extend(branch_params);
+        }
+    }
+    let (frag, ps) = build_branch_where(filters);
+    if !frag.is_empty() {
+        sql.push_str(" AND ");
+        sql.push_str(&frag);
+        params.extend(ps);
+    }
+    true
+}
+
 /// Build a single AND-group's WHERE fragment from a Filters (ignoring
 /// `branches`) plus its parameter list. Returns `(sql, params)` where
 /// `sql` is concatenated to a `WHERE ` prefix by the caller and the
@@ -691,47 +735,8 @@ impl Database {
             sql.push_str(&format!(" AND id NOT IN ({})", hidden));
         }
 
-        // OR-of-AND-groups: when `branches` is set, render each branch's
-        // single-AND WHERE fragment in parens, joined by `OR`. The
-        // unwrapped top-level Filters fields are ignored in this case —
-        // the rule parser places everything into `branches` instead.
-        if let Some(branches) = &filters.branches {
-            if branches.is_empty() {
-                return Vec::new();
-            }
-            let mut parts: Vec<String> = Vec::with_capacity(branches.len());
-            for b in branches {
-                let (frag, params) = build_branch_where(b);
-                if frag.is_empty() {
-                    // Empty branch matches everything — short-circuit
-                    // the whole OR.
-                    parts.clear();
-                    break;
-                }
-                parts.push(format!("({})", frag));
-                for p in params { param_values.push(p); }
-            }
-            if !parts.is_empty() {
-                sql.push_str(&format!(" AND ({})", parts.join(" OR ")));
-            }
-            // A branched view still has to answer a search. The view's own
-            // rules live in `branches`, but `/` sets content_pattern on the
-            // top-level struct, and dropping it turned a search in such a
-            // view into a plain re-list of the view — 500 rows and a
-            // match count that meant nothing. AND it onto the branch group.
-            let (frag, params) = build_branch_where(filters);
-            if !frag.is_empty() {
-                sql.push_str(" AND ");
-                sql.push_str(&frag);
-                for p in params { param_values.push(p); }
-            }
-        } else {
-            let (frag, params) = build_branch_where(filters);
-            if !frag.is_empty() {
-                sql.push_str(" AND ");
-                sql.push_str(&frag);
-                for p in params { param_values.push(p); }
-            }
+        if !push_filters_where(filters, &mut sql, &mut param_values) {
+            return Vec::new();
         }
 
         sql.push_str(if filters.sort_found {
@@ -991,6 +996,28 @@ impl Database {
                 .collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// The Message-IDs of recent mail a view takes, so the phone can show
+    /// the same mail under the same view. Archived and hidden mail count:
+    /// which view a mail is in does not change when it is put away.
+    pub fn view_message_ids(&self, filters: &Filters, since: i64) -> Vec<String> {
+        let mut sql = String::from(
+            "SELECT json_extract(metadata, '$.message_id') FROM messages \
+             WHERE timestamp > ? AND metadata LIKE '%\"message_id\"%'"
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(since)];
+        if !push_filters_where(filters, &mut sql, &mut params) {
+            return Vec::new();
+        }
+        let conn = self.read();
+        let Ok(mut stmt) = conn.prepare(&sql) else { return Vec::new() };
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        let ids: Vec<String> = match stmt.query_map(refs.as_slice(), |r| r.get::<_, Option<String>>(0)) {
+            Ok(it) => it.filter_map(|r| r.ok().flatten()).collect(),
+            Err(_) => Vec::new(),
+        };
+        ids
     }
 
     /// Message-IDs of mail deleted here recently. Deleting is the
@@ -2152,6 +2179,42 @@ pub(crate) mod tests {
         let conn = db.conn.lock().unwrap();
         conn.query_row("SELECT replied, parent_id FROM messages WHERE external_id = ?",
                        params![ext], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+    }
+
+    #[test]
+    fn a_view_names_its_recent_mail_for_the_phone() {
+        let _home = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join("kastrup-view-ids-test");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(tmp.join(".kastrup")).unwrap();
+        std::env::set_var("HOME", &tmp);
+        let db = Database::new().unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO sources (id, name, plugin_type, config, capabilities, \
+                 created_at, updated_at) VALUES (79, 'mail', 'maildir', '{}', '[]', 0, 0)", [],
+            ).unwrap();
+        }
+        let t = 1_787_000_000i64;
+        db.insert_message(79, &msg("a", "ann@x", "me@x", "Hi", "Work", t, "a@x", None));
+        db.insert_message(79, &msg("b", "bob@x", "me@x", "Hi", "Home", t, "b@x", None));
+        db.insert_message(79, &msg("c", "cat@x", "me@x", "Old", "Work", t - 100, "c@x", None));
+        let work = Filters { folder: Some("Work".into()), ..Default::default() };
+        assert_eq!(db.view_message_ids(&work, t - 50), ["a@x"], "the window cuts the old one");
+        // A view of two branches takes either, and an empty one nothing.
+        let either = Filters {
+            branches: Some(vec![
+                Filters { folder: Some("Work".into()), ..Default::default() },
+                Filters { folder: Some("Home".into()), ..Default::default() },
+            ]),
+            ..Default::default()
+        };
+        let mut got = db.view_message_ids(&either, t - 50);
+        got.sort();
+        assert_eq!(got, ["a@x", "b@x"]);
+        let none = Filters { branches: Some(vec![]), ..Default::default() };
+        assert!(db.view_message_ids(&none, t - 50).is_empty());
     }
 
     #[test]

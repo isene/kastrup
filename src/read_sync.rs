@@ -46,6 +46,9 @@ pub struct ReadSync {
     gone: Vec<i64>,
     dir_mtime: i64,
     days: i64,
+    /// Our views file for the phone, and what we last wrote to it.
+    views_file: PathBuf,
+    views_last: String,
 }
 
 fn mtime(p: &Path) -> i64 {
@@ -74,9 +77,11 @@ impl ReadSync {
         let marks = std::fs::read_to_string(&mine)
             .map(|s| read_state::parse(&s))
             .unwrap_or_default();
+        let views_file = dir.join(format!("mail-views-{}.json", host));
+        let views_last = std::fs::read_to_string(&views_file).unwrap_or_default();
         let mut rs = Self {
             dir, mine, marks, others: Vec::new(), drops: Vec::new(), gone: Vec::new(), dir_mtime: 0,
-            days: days.max(1),
+            days: days.max(1), views_file, views_last,
         };
         rs.rescan();
         Some(rs)
@@ -159,6 +164,59 @@ impl ReadSync {
     pub fn take_gone(&mut self) -> Vec<i64> {
         std::mem::take(&mut self.gone)
     }
+
+    /// The oldest timestamp the phone still holds mail for.
+    pub fn since(&self) -> i64 {
+        now_secs() - self.days * 86_400
+    }
+
+    /// Tell the phone the views and which recent mail each takes, in
+    /// `mail-views-<host>.json`. Writes only when the file would change,
+    /// so a new mail outside every view costs no Syncthing transfer.
+    pub fn publish_views(&mut self, views: &[PhoneView], sources: &[(i64, String)]) {
+        let text = views_json(views, sources);
+        if text == self.views_last { return; }
+        if std::fs::write(&self.views_file, &text).is_ok() {
+            self.views_last = text;
+        }
+    }
+}
+
+/// A view as the phone's gluon gets it.
+pub struct PhoneView {
+    pub key: String,
+    pub name: String,
+    /// The top bar's 256-colour number, as a string; empty for none.
+    pub colour: String,
+    /// The view's rules as kastrup keeps them. The phone reads them for
+    /// what it fetches itself (chats, feeds), which the laptop's list
+    /// below cannot name: the two sides give a relayed chat different ids.
+    pub filters: serde_json::Value,
+    /// Message-IDs of the recent mail the view takes here.
+    pub mail: Vec<String>,
+}
+
+/// The views file. Keys sorted, so the same views give the same bytes and
+/// [`ReadSync::publish_views`] can skip the write.
+///
+///   {"views":   [{"key":"1","name":"Geir","colour":"130","filters":{…}}],
+///    "sources": {"4":"rss","11":"gateway"},
+///    "mail":    {"<message-id>":["1","5"]}}
+pub fn views_json(views: &[PhoneView], sources: &[(i64, String)]) -> String {
+    use std::collections::BTreeMap;
+    let mut mail: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for v in views {
+        for mid in &v.mail {
+            let keys = mail.entry(mid.as_str()).or_default();
+            if !keys.contains(&v.key.as_str()) { keys.push(v.key.as_str()); }
+        }
+    }
+    let list: Vec<serde_json::Value> = views.iter().map(|v| serde_json::json!({
+        "key": v.key, "name": v.name, "colour": v.colour, "filters": v.filters,
+    })).collect();
+    let sources: BTreeMap<String, &str> =
+        sources.iter().map(|(id, kind)| (id.to_string(), kind.as_str())).collect();
+    serde_json::json!({ "views": list, "sources": sources, "mail": mail }).to_string()
 }
 
 /// The rows named in the phones' delete lists. A line is a Message-ID,
@@ -403,5 +461,33 @@ mod tests {
         let theirs = marks(&[("a@x", false, 200)]);
         let p = plan(&rows(&[(3, "a@x", true)]), &[], &theirs, &mut mine, 500);
         assert_eq!(p.apply, vec![(3, false)]);
+    }
+
+    fn view(key: &str, mail: &[&str]) -> PhoneView {
+        PhoneView {
+            key: key.into(), name: format!("View {key}"), colour: "130".into(),
+            filters: serde_json::json!({"rules": [{"field": "platform", "op": "=", "value": "sms"}]}),
+            mail: mail.iter().map(|m| m.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_views_file_names_each_mail_once_with_all_its_views() {
+        let text = views_json(&[view("1", &["a@x", "b@x"]), view("3", &["a@x"])], &[(11, "gateway".into())]);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["mail"]["a@x"], serde_json::json!(["1", "3"]));
+        assert_eq!(v["mail"]["b@x"], serde_json::json!(["1"]));
+        assert_eq!(v["views"][1]["key"], "3");
+        assert_eq!(v["views"][0]["filters"]["rules"][0]["value"], "sms");
+        assert_eq!(v["sources"]["11"], "gateway");
+    }
+
+    #[test]
+    fn the_same_views_give_the_same_bytes() {
+        // publish_views skips the write on equal text, so the text must
+        // not depend on the order mail was found in.
+        let a = views_json(&[view("1", &["b@x", "a@x"])], &[]);
+        let b = views_json(&[view("1", &["a@x", "b@x"])], &[]);
+        assert_eq!(a, b);
     }
 }
