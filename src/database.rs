@@ -1310,6 +1310,8 @@ impl Database {
         let _ = conn.execute(&select_sql, param_refs.as_slice());
         let del_sql = format!("DELETE FROM messages WHERE id IN ({})", placeholders.join(","));
         let _ = conn.execute(&del_sql, param_refs.as_slice());
+        // The phone hears of a deletion with the next read-state pass.
+        self.touch_read_state();
     }
 
     /// Get all sources, optionally enabled only

@@ -12,7 +12,13 @@
 //!
 //! A phone's deletions come in its own `mail-delete-<device>.txt`, one
 //! Message-ID per line. Applying one twice does nothing, so the phone
-//! keeps a line for its fetch window and nothing here keeps track.
+//! keeps a line for its fetch window and nothing here keeps track. Ours
+//! go the other way in `mail-delete-<host>.txt`, and the phone takes the
+//! mail off its list.
+//!
+//! A phone's "save to folder" comes in `mail-save-<device>.txt`: a
+//! Message-ID, the save key (as `s1` uses `1`) and a time per line. A
+//! mail already in that folder is left alone, so a line can stay.
 //!
 //! Storage is one file per device in a folder Syncthing carries, so
 //! there is never a second writer for it to leave a `.sync-conflict-`
@@ -44,11 +50,18 @@ pub struct ReadSync {
     /// Rows a phone deleted, found by the last sync, for the caller to
     /// delete with their files.
     gone: Vec<i64>,
+    /// The phones' save lists, watched the same way.
+    saves: Vec<(PathBuf, i64)>,
+    /// Rows a phone saved, with the save key, for the caller to file.
+    filed: Vec<(i64, String)>,
     dir_mtime: i64,
     days: i64,
     /// Our views file for the phone, and what we last wrote to it.
     views_file: PathBuf,
     views_last: String,
+    /// Our delete list for the phone, and what we last wrote to it.
+    deletes_file: PathBuf,
+    deletes_last: String,
 }
 
 fn mtime(p: &Path) -> i64 {
@@ -79,9 +92,12 @@ impl ReadSync {
             .unwrap_or_default();
         let views_file = dir.join(format!("mail-views-{}.json", host));
         let views_last = std::fs::read_to_string(&views_file).unwrap_or_default();
+        let deletes_file = dir.join(format!("mail-delete-{}.txt", host));
+        let deletes_last = std::fs::read_to_string(&deletes_file).unwrap_or_default();
         let mut rs = Self {
-            dir, mine, marks, others: Vec::new(), drops: Vec::new(), gone: Vec::new(), dir_mtime: 0,
-            days: days.max(1), views_file, views_last,
+            dir, mine, marks, others: Vec::new(), drops: Vec::new(), gone: Vec::new(),
+            saves: Vec::new(), filed: Vec::new(), dir_mtime: 0,
+            days: days.max(1), views_file, views_last, deletes_file, deletes_last,
         };
         rs.rescan();
         Some(rs)
@@ -93,16 +109,22 @@ impl ReadSync {
         self.dir_mtime = mtime(&self.dir);
         let mut found = Vec::new();
         let mut drops = Vec::new();
+        let mut saves = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for e in entries.flatten() {
                 let p = e.path();
-                if p == self.mine { continue; }
+                if p == self.mine || p == self.deletes_file { continue; }
                 let name = match p.file_name().and_then(|n| n.to_str()) {
                     Some(n) => n, None => continue,
                 };
                 if name.starts_with("mail-delete-") && name.ends_with(".txt") {
                     let seen = self.drops.iter().find(|(q, _)| *q == p).map(|(_, t)| *t);
                     drops.push((p, seen.unwrap_or(0)));
+                    continue;
+                }
+                if name.starts_with("mail-save-") && name.ends_with(".txt") {
+                    let seen = self.saves.iter().find(|(q, _)| *q == p).map(|(_, t)| *t);
+                    saves.push((p, seen.unwrap_or(0)));
                     continue;
                 }
                 if !name.starts_with("mail-read-") || !name.ends_with(".json") { continue; }
@@ -112,6 +134,7 @@ impl ReadSync {
         }
         self.others = found;
         self.drops = drops;
+        self.saves = saves;
     }
 
     /// Has another device said anything since we last looked? Three
@@ -120,7 +143,7 @@ impl ReadSync {
         let dm = mtime(&self.dir);
         if dm != self.dir_mtime { self.rescan(); }
         let mut changed = false;
-        for (p, seen) in self.others.iter_mut().chain(self.drops.iter_mut()) {
+        for (p, seen) in self.others.iter_mut().chain(self.drops.iter_mut()).chain(self.saves.iter_mut()) {
             let m = mtime(p);
             if m != *seen { *seen = m; changed = true; }
         }
@@ -137,6 +160,14 @@ impl ReadSync {
             &rows,
             &self.drops.iter().filter_map(|(p, _)| std::fs::read_to_string(p).ok()).collect::<Vec<_>>(),
         );
+        self.filed = phone_saves(
+            &rows,
+            &self.saves.iter().filter_map(|(p, _)| std::fs::read_to_string(p).ok()).collect::<Vec<_>>(),
+        );
+        let text = delete_list(&deleted);
+        if text != self.deletes_last && std::fs::write(&self.deletes_file, &text).is_ok() {
+            self.deletes_last = text;
+        }
         if rows.is_empty() && deleted.is_empty() { return 0; }
 
         let theirs = read_state::merge_all(
@@ -165,6 +196,11 @@ impl ReadSync {
         std::mem::take(&mut self.gone)
     }
 
+    /// Rows a phone saved to a folder, with the save key, once.
+    pub fn take_filed(&mut self) -> Vec<(i64, String)> {
+        std::mem::take(&mut self.filed)
+    }
+
     /// The oldest timestamp the phone still holds mail for.
     pub fn since(&self) -> i64 {
         now_secs() - self.days * 86_400
@@ -173,8 +209,8 @@ impl ReadSync {
     /// Tell the phone the views and which recent mail each takes, in
     /// `mail-views-<host>.json`. Writes only when the file would change,
     /// so a new mail outside every view costs no Syncthing transfer.
-    pub fn publish_views(&mut self, views: &[PhoneView], sources: &[(i64, String)]) {
-        let text = views_json(views, sources);
+    pub fn publish_views(&mut self, views: &[PhoneView], sources: &[(i64, String)], save: &[(String, String)]) {
+        let text = views_json(views, sources, save);
         if text == self.views_last { return; }
         if std::fs::write(&self.views_file, &text).is_ok() {
             self.views_last = text;
@@ -202,7 +238,7 @@ pub struct PhoneView {
 ///   {"views":   [{"key":"1","name":"Geir","colour":"130","filters":{…}}],
 ///    "sources": {"4":"rss","11":"gateway"},
 ///    "mail":    {"<message-id>":["1","5"]}}
-pub fn views_json(views: &[PhoneView], sources: &[(i64, String)]) -> String {
+pub fn views_json(views: &[PhoneView], sources: &[(i64, String)], save: &[(String, String)]) -> String {
     use std::collections::BTreeMap;
     let mut mail: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for v in views {
@@ -216,7 +252,34 @@ pub fn views_json(views: &[PhoneView], sources: &[(i64, String)]) -> String {
     })).collect();
     let sources: BTreeMap<String, &str> =
         sources.iter().map(|(id, kind)| (id.to_string(), kind.as_str())).collect();
-    serde_json::json!({ "views": list, "sources": sources, "mail": mail }).to_string()
+    let save: BTreeMap<&str, &str> = save.iter().map(|(k, n)| (k.as_str(), n.as_str())).collect();
+    serde_json::json!({ "views": list, "sources": sources, "mail": mail, "save": save }).to_string()
+}
+
+/// Our delete list: one Message-ID per line, sorted, so the same
+/// deletions give the same bytes and Syncthing has nothing to carry.
+pub fn delete_list(deleted: &[String]) -> String {
+    let mut d: Vec<&str> = deleted.iter().map(|m| m.as_str()).collect();
+    d.sort_unstable();
+    d.dedup();
+    d.iter().map(|m| format!("{m}\n")).collect()
+}
+
+/// The rows named in the phones' save lists, each with its save key. A
+/// line is a Message-ID, the key, then the phone's time; a later line
+/// for the same mail wins.
+pub fn phone_saves(rows: &[(i64, String, bool)], lists: &[String]) -> Vec<(i64, String)> {
+    let mut wanted: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for l in lists.iter().flat_map(|s| s.lines()) {
+        let mut parts = l.split_whitespace();
+        if let (Some(mid), Some(key)) = (parts.next(), parts.next()) {
+            wanted.insert(mid, key);
+        }
+    }
+    if wanted.is_empty() { return Vec::new(); }
+    rows.iter()
+        .filter_map(|(id, mid, _)| wanted.get(mid.as_str()).map(|k| (*id, k.to_string())))
+        .collect()
 }
 
 /// The rows named in the phones' delete lists. A line is a Message-ID,
@@ -432,6 +495,26 @@ mod tests {
     }
 
     #[test]
+    fn a_phone_save_names_the_row_and_its_key() {
+        let rows = vec![(1, "a@x".to_string(), true), (2, "b@x".to_string(), false)];
+        let list = "a@x\t1\t100\nc@x\t2\t100\nb@x\t3\t100\nb@x\t2\t200\nbroken\n".to_string();
+        let mut got = phone_saves(&rows, &[list]);
+        got.sort();
+        assert_eq!(got, [(1, "1".to_string()), (2, "2".to_string())], "the later line for b@x wins");
+        assert!(phone_saves(&rows, &[]).is_empty());
+    }
+
+    #[test]
+    fn our_delete_list_is_sorted_and_says_each_once() {
+        let d = vec!["b@x".to_string(), "a@x".to_string(), "b@x".to_string()];
+        assert_eq!(delete_list(&d), "a@x\nb@x\n");
+        assert_eq!(delete_list(&[]), "");
+        // The phone's parser reads ours: a Message-ID per line.
+        let rows = vec![(1, "a@x".to_string(), false), (2, "c@x".to_string(), false)];
+        assert_eq!(phone_deletes(&rows, &[delete_list(&d)]), [1]);
+    }
+
+    #[test]
     fn deleting_here_shows_read_on_the_phone() {
         let mut mine = Marks::new();
         let p = plan(&[], &["gone@x".to_string()], &Marks::new(), &mut mine, 500);
@@ -473,10 +556,11 @@ mod tests {
 
     #[test]
     fn the_views_file_names_each_mail_once_with_all_its_views() {
-        let text = views_json(&[view("1", &["a@x", "b@x"]), view("3", &["a@x"])], &[(11, "gateway".into())]);
+        let text = views_json(&[view("1", &["a@x", "b@x"]), view("3", &["a@x"])], &[(11, "gateway".into())], &[("1".into(), "Personal".into())]);
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["mail"]["a@x"], serde_json::json!(["1", "3"]));
         assert_eq!(v["mail"]["b@x"], serde_json::json!(["1"]));
+        assert_eq!(v["save"]["1"], "Personal");
         assert_eq!(v["views"][1]["key"], "3");
         assert_eq!(v["views"][0]["filters"]["rules"][0]["value"], "sms");
         assert_eq!(v["sources"]["11"], "gateway");
@@ -486,8 +570,8 @@ mod tests {
     fn the_same_views_give_the_same_bytes() {
         // publish_views skips the write on equal text, so the text must
         // not depend on the order mail was found in.
-        let a = views_json(&[view("1", &["b@x", "a@x"])], &[]);
-        let b = views_json(&[view("1", &["a@x", "b@x"])], &[]);
+        let a = views_json(&[view("1", &["b@x", "a@x"])], &[], &[]);
+        let b = views_json(&[view("1", &["a@x", "b@x"])], &[], &[]);
         assert_eq!(a, b);
     }
 }

@@ -332,6 +332,13 @@ fn park_row(conn: &rusqlite::Connection, id: i64, dir: &std::path::Path, now: i6
     conn.execute("DELETE FROM postponed WHERE id = ?", [id]).is_ok()
 }
 
+/// A save folder by its last two parts, so Customers.AcmeCo.Archive
+/// reads as AcmeCo.Archive and the several *.Archive folders stay apart.
+fn short_folder(v: &str) -> String {
+    let parts: Vec<&str> = v.split('.').collect();
+    if parts.len() > 2 { parts[parts.len() - 2..].join(".") } else { v.to_string() }
+}
+
 fn drafts_drop_dir() -> std::path::PathBuf {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
@@ -3312,6 +3319,7 @@ impl App {
                     self.last_read_sync = std::time::Instant::now();
                     let ours = self.db.take_read_dirty();
                     let mut gone = Vec::new();
+                    let mut filed = Vec::new();
                     if let Some(ref mut rs) = self.read_sync {
                         if ours || rs.others_changed() {
                             if rs.sync(&self.db) > 0 {
@@ -3322,8 +3330,10 @@ impl App {
                                 self.messages_dirty.store(true, Ordering::Relaxed);
                             }
                             gone = rs.take_gone();
+                            filed = rs.take_filed();
                         }
                     }
+                    if !filed.is_empty() { self.file_for_phone(&filed); }
                     // Mail deleted on the phone goes the way `d` sends
                     // it, files and all. The user's own marks wait.
                     if !gone.is_empty() {
@@ -7049,16 +7059,7 @@ impl App {
         let hint: String = keys.iter()
             .map(|k| {
                 let v = &shortcuts[*k];
-                // Show the last two path elements so e.g.
-                // Customers.AcmeCo.Archive reads as AcmeCo.Archive and the
-                // several *.Archive targets stay distinguishable.
-                let parts: Vec<&str> = v.split('.').collect();
-                let short = if parts.len() > 2 {
-                    parts[parts.len() - 2..].join(".")
-                } else {
-                    v.to_string()
-                };
-                format!("s{}:{}", k, short)
+                format!("s{}:{}", k, short_folder(v))
             })
             .collect::<Vec<_>>()
             .join(" ");
@@ -7159,6 +7160,9 @@ impl App {
                 Err(_) => failed += 1,
             }
         }
+
+        // The phone's views follow the mail to its folder.
+        if count > 0 { self.publish_phone_views(); }
 
         // Remove filed messages from view
         self.filtered_messages.retain(|m| !msg_ids.contains(&m.id));
@@ -10825,7 +10829,27 @@ impl App {
         let sources: Vec<(i64, String)> = self.db.get_sources(false).into_iter()
             .map(|s| (s.id, s.plugin_type))
             .collect();
-        rs.publish_views(&views, &sources);
+        // The save keys, named as the `s` hint names them.
+        let save: Vec<(String, String)> = self.config.save_folders.iter()
+            .map(|(k, v)| (k.clone(), short_folder(v)))
+            .collect();
+        rs.publish_views(&views, &sources, &save);
+    }
+
+    /// Mail the phone saved to a folder, filed as `s` files it. A mail
+    /// already there is left alone, so the phone's line can stay.
+    fn file_for_phone(&mut self, filed: &[(i64, String)]) {
+        let mut moved = 0;
+        for (id, key) in filed {
+            let Some(dest) = self.config.save_folders.get(key).cloned() else { continue };
+            if self.db.get_message(*id).and_then(|m| m.folder).as_deref() == Some(dest.as_str()) { continue; }
+            if self.file_single_message(*id, &dest).is_ok() { moved += 1; }
+        }
+        if moved > 0 {
+            log::info(&format!("phone saved {} message(s) to folders", moved));
+            self.messages_dirty.store(true, Ordering::Relaxed);
+            self.publish_phone_views();
+        }
     }
 
     /// Drop a draft from its backing store after the user loads it.

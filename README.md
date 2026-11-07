@@ -266,6 +266,13 @@ different ids.
 The file is rebuilt when a view changes or new mail lands, and written
 only when its content changed.
 
+The same file names the save folders (`s1`, `s2`, …) by the short names
+the `s` hint shows. The phone's Save writes `mail-save-<device>.txt`, a
+Message-ID, the key and a time per line, and kastrup files each mail as
+`s` would. A mail already in its folder is left alone. Mail deleted here
+goes to the phone in `mail-delete-<host>.txt`, one Message-ID per line,
+and the phone takes it off its list.
+
 ### Drafts sent from the phone
 
 Make the drafts drop folder a link into the shared folder, and the phone
