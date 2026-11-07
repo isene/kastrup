@@ -251,8 +251,9 @@ prefs, so clearing a phone's list can never cost you mail here. kastrup
 still merges every `mail-read-*.json` it finds, so a second authoritative
 machine would work; it is the phones that stay quiet.
 
-Idle cost is one atomic load plus a couple of `stat()`s every 5 s. The
-database is queried only when a mark has actually moved on one side.
+Idle cost is one atomic load plus a few `stat()`s once a minute, on a wake
+the main loop makes anyway. The database is queried only when a mark
+has actually moved on one side.
 
 ### Views shared with the phone
 

@@ -3311,11 +3311,12 @@ impl App {
                     let wtx = self.write_tx.clone();
                     std::thread::spawn(move || reconcile_stuck_maildir(&db, &wtx));
                 }
-                // Read state with the phone. Gated twice over: no folder
+                // Read state with the phone, once a minute on a wake the
+                // loop makes anyway. Gated twice over: no folder
                 // configured and this is a null check; folder configured
-                // and it is an atomic load plus a couple of stat()s. The
+                // and it is an atomic load plus a few stat()s. The
                 // database is only touched when a mark actually moved.
-                if self.last_read_sync.elapsed().as_secs() >= 5 {
+                if self.last_read_sync.elapsed().as_secs() >= 60 {
                     self.last_read_sync = std::time::Instant::now();
                     let ours = self.db.take_read_dirty();
                     let mut gone = Vec::new();
