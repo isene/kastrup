@@ -319,6 +319,19 @@ fn ids_to_file(tagged: &HashSet<i64>, cursor: Option<i64>) -> Vec<i64> {
     ids
 }
 
+/// Move postponed row `id` to a file in `dir`. False, with the row kept,
+/// when the file cannot be written.
+fn park_row(conn: &rusqlite::Connection, id: i64, dir: &std::path::Path, now: i64) -> bool {
+    let Ok(data) = conn.query_row("SELECT data FROM postponed WHERE id = ?", [id], |r| r.get::<_, String>(0)) else {
+        return false;
+    };
+    let path = dir.join(format!("postponed_{now}_{id}.eml"));
+    if std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&path, data)).is_err() {
+        return false;
+    }
+    conn.execute("DELETE FROM postponed WHERE id = ?", [id]).is_ok()
+}
+
 fn drafts_drop_dir() -> std::path::PathBuf {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
@@ -10880,6 +10893,15 @@ impl App {
         if new_id.is_some() { self.draft_row = new_id; }
     }
 
+    /// Move the compose's row to the drafts folder, where both gluons
+    /// list it. The row stays if the file cannot be written.
+    fn park_draft_row(&mut self) {
+        if let Some(id) = self.draft_row.take() {
+            let conn = self.db.conn.lock().unwrap();
+            park_row(&conn, id, &drafts_drop_dir(), database::now_secs());
+        }
+    }
+
     fn delete_postponed(&self, id: i64) {
         let conn = self.db.conn.lock().unwrap();
         let _ = conn.execute("DELETE FROM postponed WHERE id = ?", rusqlite::params![id]);
@@ -12523,9 +12545,10 @@ impl App {
                                         }
                                         DraftKind::Email => {
                                             // The compose already keeps a row; postponing
-                                            // is just letting go of it with the final text.
+                                            // moves it, with the final text, to the drafts
+                                            // folder the phone's gluon lists too.
                                             self.save_draft_row(&put_email_attach_headers(&content, &attachments));
-                                            self.draft_row = None;
+                                            self.park_draft_row();
                                             self.set_feedback("Message postponed", tc.feedback_ok);
                                         }
                                     }
@@ -12572,7 +12595,7 @@ impl App {
                                     // Esc here once lost a mail that had failed
                                     // to send. A new one is thrown away.
                                     if recalled {
-                                        self.draft_row = None;
+                                        self.park_draft_row();
                                         self.set_feedback("Kept in the drafts (+ to recall)", tc.feedback_info);
                                     } else {
                                         self.drop_draft_row();
@@ -17882,6 +17905,28 @@ fn the_top_line_counts_the_drafts_that_plus_lists() {
     conn.execute("UPDATE postponed SET failed = 'Alice' WHERE id = 2", []).unwrap();
     assert_eq!(count_drafts(&conn, &dir, &[]).1, vec!["Alice".to_string()]);
     assert!(count_drafts(&conn, &dir, &[2]).1.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(test)]
+#[test]
+fn a_postponed_mail_becomes_a_file_the_phone_lists() {
+    let dir = std::env::temp_dir().join(format!("kastrup-park-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE postponed (id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER,
+        data TEXT NOT NULL, created_at INTEGER NOT NULL, failed TEXT);
+        INSERT INTO postponed (data, created_at) VALUES ('To: a@example.com\n\nBody\n', 1);").unwrap();
+    assert!(park_row(&conn, 1, &dir, 50));
+    assert_eq!(std::fs::read_to_string(dir.join("postponed_50_1.eml")).unwrap(), "To: a@example.com\n\nBody\n");
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM postponed", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    // No row, no file.
+    assert!(!park_row(&conn, 7, &dir, 51));
+    // A folder that cannot be made keeps the row.
+    conn.execute("INSERT INTO postponed (data, created_at) VALUES ('x', 2)", []).unwrap();
+    std::fs::write(dir.join("blocked"), "").unwrap();
+    assert!(!park_row(&conn, 2, &dir.join("blocked"), 52));
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM postponed", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

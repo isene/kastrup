@@ -283,6 +283,11 @@ sends it, retries a failure every five minutes, and shows it in `+`
 meanwhile. kastrup must be running on the laptop for this. The cost is
 one `readdir` a minute, and none without `read_sync_dir`.
 
+A mail postponed with `p` goes to the drop folder as
+`postponed_<time>_<n>.eml`, so the phone lists it too. Recalled with `+`
+and left with Esc, it goes back there. A mail begun on the phone and left
+unsent comes the other way, as `phone_<time>.eml`.
+
 ### External fetch scripts (messenger / instagram)
 
 Both `messenger` and `instagram` source types shell out to a Python script that drives a Marionette-controlled Firefox. The default location is `~/.kastrup/plugins/<name>.py`. Override per-source with:
