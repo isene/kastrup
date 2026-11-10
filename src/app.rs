@@ -12093,6 +12093,8 @@ impl App {
                 None if !st_target.is_empty() => st_target.clone(),
                 None => continue,
             };
+            // The status line shows the result once; the log keeps it.
+            log::info(&format!("gateway reply to {}: {} ({})", label, status, reason));
             if status == "sent" {
                 let how = if reason == "manual" { "you sent it manually" } else { "as you, via phone" };
                 self.set_feedback(&format!("✓ Sent to {} ({})", label, how),
@@ -12136,6 +12138,7 @@ impl App {
             .collect();
         self.pending_gateway_replies.retain(|(_, _, queued, _)| now.duration_since(*queued).as_secs() < 300);
         for target in expired {
+            log::info(&format!("gateway reply to {}: not confirmed by the phone", target));
             self.set_feedback(
                 &format!("✗ NOT sent to {} — the phone never confirmed delivery. Resend, or reply in the app.", target),
                 self.config.theme_colors.feedback_warn);
