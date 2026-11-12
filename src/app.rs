@@ -15073,7 +15073,12 @@ impl App {
     /// The invite in the message under the cursor, if it asks for an answer.
     fn current_invite(&self) -> Option<mail::ical::Event> {
         let msg = self.current_filtered_index().and_then(|i| self.filtered_messages.get(i))?;
-        let file = msg.metadata.get("maildir_file")?.as_str()?;
+        Self::invite_in(&msg.metadata)
+    }
+
+    /// The invite in a message, from the mail file its metadata names.
+    fn invite_in(metadata: &serde_json::Value) -> Option<mail::ical::Event> {
+        let file = metadata.get("maildir_file")?.as_str()?;
         let raw = std::fs::read_to_string(file).ok()?;
         let ical = std::cell::RefCell::new(String::new());
         mail::mime::extract_mime_text_with(&raw, &|c| { ical.borrow_mut().push_str(c); String::new() });
@@ -15082,27 +15087,36 @@ impl App {
     }
 
     /// Run `invite_accept` with the UID as its last word. No shell: the
-    /// UID comes from whoever sent the mail.
-    fn accept_invite(&mut self, e: &mail::ical::Event) {
+    /// UID comes from whoever sent the mail. The line to show, and whether
+    /// it went well.
+    fn run_accept(&self, e: &mail::ical::Event) -> (String, bool) {
         let mut words = self.config.invite_accept.split_whitespace();
-        let Some(cmd) = words.next() else { return };
-        self.bottom.say(&style::fg(&format!(" Accepting {}...", e.summary), 226));
-        let out = std::process::Command::new(cmd).args(words).arg(&e.uid).output();
-        let tc = &self.config.theme_colors;
-        match out {
-            Ok(o) if o.status.success() => {
-                let (msg, c) = (format!("Accepted: {}", e.summary), tc.feedback_ok);
-                self.set_feedback(&msg, c);
-            }
+        let Some(cmd) = words.next() else { return ("No invite_accept command in the config".into(), false) };
+        match std::process::Command::new(cmd).args(words).arg(&e.uid).output() {
+            Ok(o) if o.status.success() => (format!("Accepted: {}", e.summary), true),
             Ok(o) => {
                 let err = String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or("failed").to_string();
-                let c = tc.feedback_warn;
-                self.set_feedback(&format!("Accept failed: {err}"), c);
+                (format!("Accept failed: {err}"), false)
             }
-            Err(err) => {
-                let c = tc.feedback_warn;
-                self.set_feedback(&format!("Accept failed: {cmd}: {err}"), c);
-            }
+            Err(err) => (format!("Accept failed: {cmd}: {err}"), false),
+        }
+    }
+
+    fn accept_invite(&mut self, e: &mail::ical::Event) {
+        self.bottom.say(&style::fg(&format!(" Accepting {}...", e.summary), 226));
+        let (msg, ok) = self.run_accept(e);
+        let tc = &self.config.theme_colors;
+        let c = if ok { tc.feedback_ok } else { tc.feedback_warn };
+        self.set_feedback(&msg, c);
+    }
+
+    /// Accept the invite in message `id` and answer with the line to show.
+    /// gluon calls it for `a` on a mail at Home; nothing here is drawn.
+    pub fn accept_invite_id(&mut self, id: i64) -> String {
+        let invite = self.db.get_message_metadata(id).and_then(|m| Self::invite_in(&m));
+        match invite {
+            Some(e) => self.run_accept(&e).0,
+            None => "No invite in this mail".into(),
         }
     }
 
