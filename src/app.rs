@@ -3069,6 +3069,11 @@ impl App {
         self.tagged.contains(&id)
     }
 
+    /// The theme's colour for a tagged row, so gluon draws its own the same.
+    pub fn tag_colour(&self) -> u8 {
+        self.config.theme_colors.tag
+    }
+
     pub fn tag(&mut self, id: i64, on: bool) {
         if on {
             self.tagged.insert(id);
