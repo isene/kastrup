@@ -308,6 +308,9 @@ fn count_drafts(conn: &rusqlite::Connection, dir: &std::path::Path, in_flight: &
     (n, unsent)
 }
 
+/// The dark grey a tagged row stands on, here and at gluon's Home.
+pub const TAG_BG: u8 = 236;
+
 /// The messages `s` files: every tagged one, shown or not (gluon shows
 /// one message at a time), or else the one under the cursor.
 fn ids_to_file(tagged: &HashSet<i64>, cursor: Option<i64>) -> Vec<i64> {
@@ -4236,6 +4239,18 @@ impl App {
         };
         let full_content = format!("{}{}", content, padding);
 
+        // A tagged row stands on a dark grey band as well as in the tag
+        // colour, which alone is too near the colours of the kinds.
+        if self.tagged.contains(&msg.id) && !self.delete_marked.contains(&msg.id) && !fold_collapsed {
+            let body = if selected {
+                format!("{}{}", style::underline(&style::bold(&style::fg(&content, color))), style::bold(&style::fg(&padding, color)))
+            } else if !msg.read {
+                style::bold(&style::fg(&full_content, color))
+            } else {
+                style::fg(&full_content, color)
+            };
+            return format!("{}{}{}{}", flags, style::set_bg(TAG_BG), body, style::reset_bg());
+        }
         if selected {
             format!("{}{}{}", flags, style::underline(&style::bold(&style::fg(&content, color))), style::bold(&style::fg(&padding, color)))
         } else if fold_collapsed {
