@@ -13823,6 +13823,18 @@ sys.exit(2)
 
 // --- Inline Image Display ---
 
+/// What to say when a source refused to hand an image over. A 404 means
+/// the file is gone there: the sender deleted the message after it was
+/// fetched. "No images found" was said for that, under a line that
+/// counted one image.
+fn image_fetch_failure(err: &str) -> String {
+    if err.contains("404") {
+        return "The image is gone from the server: its message was deleted after it came in".into();
+    }
+    let first: String = err.lines().next().unwrap_or("").chars().take(120).collect();
+    format!("The image could not be fetched: {first}")
+}
+
 impl App {
     fn toggle_inline_image(&mut self) {
         if self.showing_image {
@@ -13880,6 +13892,8 @@ impl App {
         let plugin_type = msg.source_type.clone();
         let has_open = self.config.senders.get(&plugin_type)
             .map(|m| m.contains_key("open_attachment")).unwrap_or(false);
+        // Why the source would not hand an image over, if it would not.
+        let mut fetch_failed: Option<String> = None;
         if has_open {
             let cache_dir = home_dir().join(".kastrup/image_cache");
             let _ = std::fs::create_dir_all(&cache_dir);
@@ -13897,8 +13911,10 @@ impl App {
             }
             for (fid, name, dest) in jobs {
                 if !std::path::Path::new(&dest).exists() {
-                    let _ = self.dispatch_external_action(&plugin_type, "open_attachment",
-                        &[("file_id", &fid), ("name", &name), ("dest", &dest)], None);
+                    if let Err(e) = self.dispatch_external_action(&plugin_type, "open_attachment",
+                        &[("file_id", &fid), ("name", &name), ("dest", &dest)], None) {
+                        fetch_failed.get_or_insert(e);
+                    }
                 }
                 if std::path::Path::new(&dest).exists() {
                     urls.push(format!("file://{}", dest));
@@ -13932,7 +13948,8 @@ impl App {
         urls.dedup();
 
         if urls.is_empty() {
-            self.set_feedback("No images found", self.config.theme_colors.feedback_info);
+            let why = fetch_failed.as_deref().map(image_fetch_failure).unwrap_or_else(|| "No images found".into());
+            self.set_feedback(&why, self.config.theme_colors.feedback_info);
             return;
         }
 
@@ -18037,4 +18054,12 @@ fn a_draft_the_phone_sends_is_scheduled_now() {
     // No send folder: nothing happens.
     assert!(queue_phone_sends(&send.join("none"), &conn, 1000).is_empty());
     let _ = std::fs::remove_dir_all(&send);
+}
+
+#[cfg(test)]
+#[test]
+fn a_deleted_image_is_not_called_no_images() {
+    let gone = image_fetch_failure("download-file failed: download_file HTTP 404: {\"title\":\"NotFound\"}");
+    assert!(gone.starts_with("The image is gone from the server"));
+    assert_eq!(image_fetch_failure("no login\nmore"), "The image could not be fetched: no login");
 }
