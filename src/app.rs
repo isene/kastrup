@@ -4124,11 +4124,16 @@ impl App {
         // search: a clock mark, and the day it comes back as its date.
         let wake = self.db.snoozed_until(msg.id);
 
-        // Indicator: D > tag > hidden > star > attachment > space
+        // Taken back by its sender: the row stays, grey, with a cross.
+        let gone = msg.deleted_by_sender();
+
+        // Indicator: D > tag > gone > hidden > star > attachment > space
         let ind = if self.delete_marked.contains(&msg.id) {
             style::fg("D", self.config.theme_colors.delete_mark)
         } else if self.tagged.contains(&msg.id) {
             style::fg("\u{2022}", self.config.theme_colors.tag)
+        } else if gone {
+            style::fg("\u{2717}", self.config.theme_colors.hint_fg)
         } else if wake.is_some() {
             style::fg("\u{25F7}", self.config.theme_colors.attach_ind)
         } else if msg.starred {
@@ -4155,6 +4160,8 @@ impl App {
             self.config.theme_colors.delete_mark
         } else if self.tagged.contains(&msg.id) {
             self.config.theme_colors.tag
+        } else if gone {
+            self.config.theme_colors.hint_fg
         } else if msg.starred {
             self.config.theme_colors.star
         } else {
@@ -4386,6 +4393,9 @@ impl App {
                 .collect::<Vec<_>>()
                 .join(" ");
             lines.push(header_row("Labels:", &label_str, tc.header_label));
+        }
+        if msg.deleted_by_sender() {
+            lines.push(header_row("Deleted:", "its sender took this message back", tc.delete_mark));
         }
 
         // Separator
@@ -13947,6 +13957,18 @@ impl App {
 
         urls.dedup();
 
+        // A 404 on its image is how a message deleted while kastrup was
+        // not listening shows itself. Mark it then, as ws-bridge does
+        // when it hears the delete, so the row says so from now on.
+        if urls.is_empty() && fetch_failed.as_deref().is_some_and(|e| e.contains("404")) {
+            let msg = &mut self.filtered_messages[fidx];
+            if msg.source_type == "workspace" && !msg.deleted_by_sender() {
+                msg.labels.push("deleted".into());
+                let json = serde_json::to_string(&msg.labels).unwrap_or_default();
+                let _ = self.write_tx.send(DbWriteOp::UpdateLabels(msg.id, json));
+            }
+        }
+
         if urls.is_empty() {
             let why = fetch_failed.as_deref().map(image_fetch_failure).unwrap_or_else(|| "No images found".into());
             self.set_feedback(&why, self.config.theme_colors.feedback_info);
@@ -18054,6 +18076,18 @@ fn a_draft_the_phone_sends_is_scheduled_now() {
     // No send folder: nothing happens.
     assert!(queue_phone_sends(&send.join("none"), &conn, 1000).is_empty());
     let _ = std::fs::remove_dir_all(&send);
+}
+
+#[cfg(test)]
+#[test]
+fn only_a_workspace_message_with_the_label_counts_as_deleted() {
+    let mut m = Message::default();
+    m.labels = vec!["workspace".into(), "deleted".into()];
+    assert!(!m.deleted_by_sender());
+    m.source_type = "workspace".into();
+    assert!(m.deleted_by_sender());
+    m.labels.pop();
+    assert!(!m.deleted_by_sender());
 }
 
 #[cfg(test)]

@@ -35,6 +35,7 @@ Unified terminal messaging client. All your email, chat, and feeds in one TUI. B
 - **Per-view settings**: independent sort, thread mode, and section order per view
 - **SQLite database**: messages and metadata at `~/.kastrup/kastrup.db`
 - **New build notice**: once a new build replaces the program, the version in the status bar turns orange and reads "is old: restart"
+- **Deleted chat messages stay**: a chat message its sender took back stays in the list, grey with a `✗`
 - **Attachments** decoded by [fe2o3-mail](https://github.com/isene/mail), the same walk the phone uses
 - **Read state shared with the phone**: mail marked read here shows read in the [nomad mail app](https://github.com/isene/nomad/tree/master/apps/mail), and an explicit *Mark READ* there reaches back. See [Read state](#read-state-shared-with-the-phone)
 - **Read state passed to an indexer**: with a `token_file` in the `push:` block, mail and chats read here are marked read in the indexer too (Corporate Intelligence, or anything with its `/api/items/seen` route). Reads made while it is down wait in the database until it answers

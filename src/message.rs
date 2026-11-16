@@ -57,6 +57,13 @@ impl Message {
         }
     }
 
+    /// The sender took this message back after it came in. ws-bridge
+    /// marks that with the label "deleted" and leaves the row, so the
+    /// reader still sees what was said and that it is gone on the server.
+    pub fn deleted_by_sender(&self) -> bool {
+        self.source_type == "workspace" && self.labels.iter().any(|l| l == "deleted")
+    }
+
     /// Create a default header message (used as section separator in threaded view).
     pub fn default_header() -> Self {
         Self {
