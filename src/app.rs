@@ -8589,7 +8589,9 @@ impl App {
                 match unsubscribe_post(&url) {
                     Ok(code) => {
                         log::info(&format!("unsubscribe: {} answered {}", url_host(&url), code));
-                        self.set_feedback(&format!("Unsubscribed from {}", sender), tc.feedback_ok);
+                        // Gmail and Yahoo give a list two days to act, and mail
+                        // already on its way still comes.
+                        self.set_feedback(&format!("Unsubscribed from {}; mail may still come for two days", sender), tc.feedback_ok);
                     }
                     Err(why) => self.set_feedback_sticky(
                         &format!("Could not unsubscribe from {}: {}", sender, why), tc.feedback_warn),
@@ -15766,6 +15768,48 @@ fn a_name_from_another_user_never_runs_in_the_shell() {
 
 #[cfg(test)]
 #[test]
+fn a_list_that_moves_the_unsubscribe_gets_the_same_post_there() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for answer in ["HTTP/1.1 307 Temporary Redirect\r\nLocation: /done?id=7\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                       "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                       "HTTP/1.1 307 Temporary Redirect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"] {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !String::from_utf8_lossy(&req).contains("List-Unsubscribe=One-Click") {
+                let n = sock.read(&mut buf).unwrap();
+                if n == 0 { break; }
+                req.extend_from_slice(&buf[..n]);
+            }
+            sock.write_all(answer.as_bytes()).unwrap();
+            seen.push(String::from_utf8_lossy(&req).to_string());
+        }
+        seen
+    });
+    let url = format!("http://127.0.0.1:{}/u?id=7", port);
+    assert_eq!(unsubscribe_post(&url), Ok(200));
+    assert_eq!(unsubscribe_post(&url), Err("the list answered 307 with no new address".to_string()));
+    let seen = server.join().unwrap();
+    assert!(seen[1].starts_with("POST /done?id=7 HTTP/1.1"), "{}", seen[1]);
+    assert!(seen[1].ends_with("List-Unsubscribe=One-Click"));
+}
+
+#[cfg(test)]
+#[test]
+fn a_moved_address_is_read_from_the_page_it_came_from() {
+    assert_eq!(moved_to("https://a.com/x/u?id=1", "https://b.com/v"), "https://b.com/v");
+    assert_eq!(moved_to("https://a.com/x/u?id=1", "//b.com/v"), "https://b.com/v");
+    assert_eq!(moved_to("https://a.com/x/u?id=1", "/v?k=2"), "https://a.com/v?k=2");
+    assert_eq!(moved_to("https://a.com/x/u?id=1", "v"), "https://a.com/x/v");
+    assert_eq!(moved_to("https://a.com", "v"), "https://a.com/v");
+}
+
+#[cfg(test)]
+#[test]
 fn one_click_unsubscribe_is_one_post() {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -16924,16 +16968,44 @@ fn url_host(url: &str) -> String {
 /// One-click unsubscribe as RFC 8058 has it: one POST with this body.
 /// It carries no cookie and nothing about the reader but the address
 /// the list wrote into its own link.
+/// A list that answers 307 or 308 wants the same POST at the address it
+/// names. ureq repeats only a GET there, so that step is done here; before,
+/// such a list was reported as done when it was not.
 fn unsubscribe_post(url: &str) -> Result<u16, String> {
-    let sent = ureq::post(url)
-        .timeout(std::time::Duration::from_secs(15))
-        .set("Content-Type", "application/x-www-form-urlencoded")
-        .send_string("List-Unsubscribe=One-Click");
-    match sent {
-        Ok(r) => Ok(r.status()),
-        Err(ureq::Error::Status(code, _)) => Err(format!("the list answered {}", code)),
-        Err(e) => Err(e.to_string()),
+    let mut url = url.to_string();
+    for _ in 0..5 {
+        let sent = ureq::post(&url)
+            .timeout(std::time::Duration::from_secs(15))
+            .set("Content-Type", "application/x-www-form-urlencoded")
+            .send_string("List-Unsubscribe=One-Click");
+        let answer = match sent {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, _)) => return Err(format!("the list answered {}", code)),
+            Err(e) => return Err(e.to_string()),
+        };
+        match answer.status() {
+            307 | 308 => match answer.header("location") {
+                Some(to) => url = moved_to(&url, to),
+                None => return Err(format!("the list answered {} with no new address", answer.status())),
+            },
+            code @ 200..=299 => return Ok(code),
+            code => return Err(format!("the list answered {}", code)),
+        }
     }
+    Err("the list moved the request more than five times".to_string())
+}
+
+/// The address a Location header points at, read from the page it came from.
+fn moved_to(from: &str, to: &str) -> String {
+    let lower = to.to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") { return to.to_string(); }
+    let (scheme, rest) = from.split_once("://").unwrap_or(("https", from));
+    if let Some(net) = to.strip_prefix("//") { return format!("{scheme}://{net}"); }
+    let host = rest.split('/').next().unwrap_or(rest);
+    if to.starts_with('/') { return format!("{scheme}://{host}{to}"); }
+    let path = rest.split('?').next().unwrap_or(rest);
+    let dir = path.rsplit_once('/').map_or(host, |(d, _)| d);
+    format!("{scheme}://{dir}/{to}")
 }
 
 fn fmt_send_at(ts: i64) -> String {
