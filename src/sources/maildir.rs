@@ -177,6 +177,24 @@ fn parse_maildir_file(path: &Path, folder: &str, filename: &str) -> Option<Messa
     }
 
     let body = body_lines.join("\n");
+    let lower_ct = content_type.to_ascii_lowercase();
+    let lower_cte = content_transfer_encoding.to_ascii_lowercase();
+
+    // A one-part plain-text mail is decoded here, by its own header, so
+    // the reader never has to guess from the text. The guess wants 20
+    // characters of base64, and a short body ("🦒" is "8J+mkg==") was
+    // shown raw.
+    let plain = lower_ct.is_empty() || lower_ct.starts_with("text/plain");
+    let body = if plain && (lower_cte.contains("base64") || lower_cte.contains("quoted-printable")) {
+        let bytes = if lower_cte.contains("base64") {
+            base64_decode(body.trim()).unwrap_or_else(|| body.as_bytes().to_vec())
+        } else {
+            decode_qp_body_bytes(&body)
+        };
+        mail::decode_body_bytes(&bytes, mail::charset_of(&lower_ct).as_deref())
+    } else {
+        body
+    };
 
     // Single-part text/html message: decode the body at parse time
     // and stash it as html_content so the renderer and the
@@ -184,9 +202,7 @@ fn parse_maildir_file(path: &Path, folder: &str, filename: &str) -> Option<Messa
     // having to undo Content-Transfer-Encoding on every render.
     // Multipart messages are left alone — extract_mime_html /
     // extract_mime_text handle those lazily.
-    let lower_ct = content_type.to_ascii_lowercase();
     let html_content = if lower_ct.starts_with("text/html") && !lower_ct.contains("multipart/") {
-        let lower_cte = content_transfer_encoding.to_ascii_lowercase();
         let bytes = if lower_cte.contains("quoted-printable") {
             decode_qp_body_bytes(&body)
         } else if lower_cte.contains("base64") {
@@ -477,6 +493,36 @@ mod tests {
     fn basename_none_when_no_epoch_anchor() {
         let s = "not-a-maildir-name";
         assert_eq!(extract_maildir_basename(s), None);
+    }
+
+    /// A body too short for the base64 guess is decoded by its header.
+    #[test]
+    fn a_short_base64_body_is_decoded_by_its_header() {
+        let mail = "From: Alice <alice@example.com>\r\nSubject: Test\r\n\
+                    Content-Type: text/plain; charset=\"utf-8\"\r\n\
+                    Content-Transfer-Encoding: base64\r\n\r\n8J+mkg==\r\n";
+        let dir = std::env::temp_dir().join("kastrup_short_b64_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let fp = dir.join("1782571313.test_1.host:2,");
+        std::fs::write(&fp, mail).unwrap();
+        let msg = parse_maildir_file(&fp, "Geir", "1782571313.test_1.host:2,");
+        let _ = std::fs::remove_file(&fp);
+        assert_eq!(msg.unwrap().content, "🦒");
+    }
+
+    /// One quoted-printable letter is too few for the QP guess.
+    #[test]
+    fn a_short_quoted_printable_body_is_decoded_by_its_header() {
+        let mail = "From: Alice <alice@example.com>\r\nSubject: Hei\r\n\
+                    Content-Type: text/plain; charset=utf-8\r\n\
+                    Content-Transfer-Encoding: quoted-printable\r\n\r\nHei p=C3=A5 deg\r\n";
+        let dir = std::env::temp_dir().join("kastrup_short_qp_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let fp = dir.join("1782571314.test_1.host:2,");
+        std::fs::write(&fp, mail).unwrap();
+        let msg = parse_maildir_file(&fp, "Geir", "1782571314.test_1.host:2,");
+        let _ = std::fs::remove_file(&fp);
+        assert_eq!(msg.unwrap().content.trim_end(), "Hei på deg");
     }
 
     #[test]
